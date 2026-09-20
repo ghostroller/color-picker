@@ -24,12 +24,13 @@ use color_picker::{
 use pixel_fixture::ScopedPmv2;
 use windows::{
     Win32::{
-        Foundation::{HWND, WPARAM},
+        Foundation::{HWND, LPARAM, WPARAM},
         Graphics::Gdi::UpdateWindow,
         UI::WindowsAndMessaging::{
-            BM_SETCHECK, CB_GETCOUNT, CreateWindowExW, DestroyWindow, ES_READONLY, GWL_STYLE,
-            GetDlgItem, GetWindowLongW, GetWindowTextW, IsWindow, SendMessageW, WINDOW_EX_STYLE,
-            WM_CLOSE, WM_COMMAND, WS_OVERLAPPED,
+            BM_CLICK, BM_SETCHECK, CB_GETCOUNT, CreateWindowExW, DestroyWindow, ES_READONLY,
+            GWL_STYLE, GetDlgItem, GetWindowLongW, GetWindowTextW, IsDialogMessageW, IsWindow, MSG,
+            SendMessageW, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND, WM_GETDLGCODE, WM_KEYDOWN,
+            WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_OVERLAPPED,
         },
     },
     core::w,
@@ -170,18 +171,136 @@ fn cached_selection_and_native_result_controls_smoke() {
         SettingsWindow::new(&config, owner.0, Some("控件测试；不会保存配置"), true).unwrap();
     let settings_hwnd = settings.hwnd();
     assert_eq!(settings.process_pending().unwrap(), None);
-    for (id, count) in [(104, 47), (105, 4)] {
-        let combo = unsafe { GetDlgItem(Some(settings_hwnd), id) }.unwrap();
-        assert_eq!(
-            unsafe { SendMessageW(combo, CB_GETCOUNT, None, None) }.0,
-            count
-        );
-    }
+    let format_combo = unsafe { GetDlgItem(Some(settings_hwnd), 105) }.unwrap();
+    assert_eq!(
+        unsafe { SendMessageW(format_combo, CB_GETCOUNT, None, None) }.0,
+        4
+    );
     unsafe { SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None) };
     assert_eq!(
         settings.process_pending().unwrap(),
         Some(SettingsAction::Apply(config.clone()))
     );
+    // Exercise the native key control, including the dialog message path.
+    // These messages target only this fixture; no global input is generated.
+    let key = unsafe { GetDlgItem(Some(settings_hwnd), 104) }.unwrap();
+    assert!(window_text(key).contains("F11"));
+    unsafe { SendMessageW(key, BM_CLICK, None, None) };
+    settings.process_pending().unwrap();
+    press_key(key, 0x7b, false); // F12 is reserved; keep listening.
+    assert_eq!(settings.process_pending().unwrap(), None);
+    unsafe { SendMessageW(key, WM_KEYDOWN, Some(WPARAM(0x0d)), Some(LPARAM(1))) };
+    press_key(key, 0x4b, false); // K replaces F11.
+    settings.process_pending().unwrap();
+    assert!(window_text(key).contains('K'));
+    let held_enter = MSG {
+        hwnd: key,
+        message: WM_KEYDOWN,
+        wParam: WPARAM(0x0d),
+        lParam: LPARAM(0x4000_0001),
+        ..Default::default()
+    };
+    let wants_repeat = unsafe {
+        SendMessageW(
+            key,
+            WM_GETDLGCODE,
+            Some(held_enter.wParam),
+            Some(LPARAM((&raw const held_enter) as isize)),
+        )
+    }
+    .0;
+    assert_ne!(
+        wants_repeat & 4,
+        0,
+        "accepting K must not release a still-held Enter"
+    );
+    assert!(unsafe { IsDialogMessageW(settings_hwnd, &held_enter) }.as_bool());
+    assert_eq!(settings.process_pending().unwrap(), None);
+    unsafe { SendMessageW(key, WM_KEYUP, Some(WPARAM(0x0d)), Some(LPARAM(0xc000_0001))) };
+    let mut edited = config.clone();
+    edited.hotkey.key = "K".into();
+    unsafe { SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None) };
+    assert_eq!(
+        settings.process_pending().unwrap(),
+        Some(SettingsAction::Apply(edited.clone()))
+    );
+
+    unsafe { SendMessageW(key, BM_CLICK, None, None) };
+    settings.process_pending().unwrap();
+    let enter = MSG {
+        hwnd: key,
+        message: WM_KEYDOWN,
+        wParam: WPARAM(0x0d),
+        lParam: LPARAM(1),
+        ..Default::default()
+    };
+    let wants_enter = unsafe {
+        SendMessageW(
+            key,
+            WM_GETDLGCODE,
+            Some(enter.wParam),
+            Some(LPARAM((&raw const enter) as isize)),
+        )
+    }
+    .0;
+    assert_ne!(
+        wants_enter & 4,
+        0,
+        "recording must claim Enter before the dialog applies settings"
+    );
+    assert!(unsafe { IsDialogMessageW(settings_hwnd, &enter) }.as_bool());
+    unsafe { SendMessageW(key, WM_KEYUP, Some(WPARAM(0x0d)), Some(LPARAM(0xc000_0001))) };
+    assert_eq!(settings.process_pending().unwrap(), None);
+    press_key(key, 0x1b, false); // Esc cancels recording, not the settings window.
+    assert_eq!(settings.process_pending().unwrap(), None);
+    assert!(window_text(key).contains('K'));
+
+    unsafe { SendMessageW(key, BM_CLICK, None, None) };
+    settings.process_pending().unwrap();
+    press_key(key, 0x79, true); // F10 arrives as a system-key message.
+    settings.process_pending().unwrap();
+    edited.hotkey.key = "F10".into();
+    unsafe { SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None) };
+    assert_eq!(
+        settings.process_pending().unwrap(),
+        Some(SettingsAction::Apply(edited))
+    );
+
+    unsafe { SendMessageW(key, BM_CLICK, None, None) };
+    settings.process_pending().unwrap();
+    unsafe { SendMessageW(key, WM_KEYDOWN, Some(WPARAM(0x0d)), Some(LPARAM(1))) };
+    let tab = MSG {
+        hwnd: key,
+        message: WM_KEYDOWN,
+        wParam: WPARAM(0x09),
+        lParam: LPARAM(1),
+        ..Default::default()
+    };
+    assert!(unsafe { IsDialogMessageW(settings_hwnd, &tab) }.as_bool());
+    settings.process_pending().unwrap();
+    assert!(
+        window_text(key).contains("F10"),
+        "Tab cancels recording and retains the old value"
+    );
+    let repeat_after_tab = MSG {
+        hwnd: format_combo,
+        ..held_enter
+    };
+    assert!(
+        settings.filter_key_message(&repeat_after_tab),
+        "held Enter must not activate the newly focused control"
+    );
+    let released = MSG {
+        message: WM_KEYUP,
+        lParam: LPARAM(0xc000_0001),
+        ..repeat_after_tab
+    };
+    assert!(settings.filter_key_message(&released));
+    let fresh = MSG {
+        lParam: LPARAM(1),
+        ..repeat_after_tab
+    };
+    assert!(!settings.filter_key_message(&fresh));
     // Removing both Ctrl and Alt is invalid; no draft may reach persistence.
     let alt = unsafe { GetDlgItem(Some(settings_hwnd), 102) }.unwrap();
     unsafe {
@@ -211,6 +330,23 @@ fn window_text(hwnd: HWND) -> String {
     let mut text = [0_u16; 256];
     let length = unsafe { GetWindowTextW(hwnd, &mut text) };
     String::from_utf16(&text[..length as usize]).unwrap()
+}
+
+fn press_key(hwnd: HWND, key: usize, system: bool) {
+    unsafe {
+        SendMessageW(
+            hwnd,
+            if system { WM_SYSKEYDOWN } else { WM_KEYDOWN },
+            Some(WPARAM(key)),
+            Some(LPARAM(1)),
+        );
+        SendMessageW(
+            hwnd,
+            if system { WM_SYSKEYUP } else { WM_KEYUP },
+            Some(WPARAM(key)),
+            Some(LPARAM(0xc000_0001)),
+        );
+    }
 }
 
 struct TestOwner(HWND);

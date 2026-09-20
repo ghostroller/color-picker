@@ -467,7 +467,8 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime)
             continue;
         }
         if let Some(window) = settings_window.as_ref()
-            && unsafe { IsDialogMessageW(window.hwnd(), &message) }.as_bool()
+            && (window.filter_key_message(&message)
+                || unsafe { IsDialogMessageW(window.hwnd(), &message) }.as_bool())
         {
             continue;
         }

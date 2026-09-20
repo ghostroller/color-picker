@@ -23,7 +23,10 @@ use windows::{
         UI::{
             Controls::{EM_GETLINECOUNT, ShowScrollBar},
             HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
-            Input::KeyboardAndMouse::{EnableWindow, SetFocus},
+            Input::KeyboardAndMouse::{
+                EnableWindow, SetFocus, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT, VK_TAB,
+            },
+            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::*,
         },
     },
@@ -52,13 +55,16 @@ const AUTO_COPY: usize = 106;
 const TITLE: usize = 15;
 const SUBTITLE: usize = 16;
 const COPY_HEADING: usize = 17;
+const USAGE_HEADING: usize = 18;
+const USAGE_HINT: usize = 19;
 const STATUS: usize = 14;
 const CLIENT_WIDTH: i32 = 480;
-const CLIENT_HEIGHT: i32 = 480;
+const CLIENT_HEIGHT: i32 = 588;
+const KEY_SUBCLASS: usize = 1;
 const STYLE: WINDOW_STYLE =
     WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0);
 const EX_STYLE: WINDOW_EX_STYLE = WINDOW_EX_STYLE(WS_EX_APPWINDOW.0 | WS_EX_CONTROLPARENT.0);
-const PANELS: [RECT; 2] = [
+const PANELS: [RECT; 3] = [
     RECT {
         left: 24,
         top: 88,
@@ -70,6 +76,12 @@ const PANELS: [RECT; 2] = [
         top: 244,
         right: 456,
         bottom: 364,
+    },
+    RECT {
+        left: 24,
+        top: 376,
+        right: 456,
+        bottom: 472,
     },
 ];
 
@@ -86,6 +98,17 @@ struct Pending {
     layout: bool,
     dpi_rect: Option<RECT>,
     default_style: bool,
+    capture: bool,
+    focus_key: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CaptureHint {
+    Ready,
+    Listening,
+    Invalid,
+    Accepted,
+    Cancelled,
 }
 
 struct CallbackState {
@@ -97,9 +120,46 @@ struct CallbackState {
     wake_failed: Cell<bool>,
     closing: Cell<bool>,
     default_id: Cell<usize>,
+    selected_key: Cell<u32>,
+    recording: Cell<bool>,
+    capture_hint: Cell<CaptureHint>,
+    suppressed_keys: Cell<[u64; 4]>,
 }
 
 impl CallbackState {
+    fn suppresses(&self, key: u32) -> bool {
+        key < 256 && self.suppressed_keys.get()[key as usize / 64] & (1 << (key % 64)) != 0
+    }
+
+    fn suppress(&self, key: u32, pressed: bool) {
+        if key < 256 {
+            let mut keys = self.suppressed_keys.get();
+            let mask = 1 << (key % 64);
+            if pressed {
+                keys[key as usize / 64] |= mask;
+            } else {
+                keys[key as usize / 64] &= !mask;
+            }
+            self.suppressed_keys.set(keys);
+        }
+    }
+
+    fn begin_capture(&self) {
+        self.recording.set(true);
+        self.capture_hint.set(CaptureHint::Listening);
+        self.queue(|pending| {
+            pending.capture = true;
+            pending.focus_key = true;
+        });
+    }
+
+    fn cancel_capture(&self) {
+        if self.recording.replace(false) {
+            self.capture_hint.set(CaptureHint::Cancelled);
+            self.queue(|pending| pending.capture = true);
+        }
+    }
+
     fn queue(&self, update: impl FnOnce(&mut Pending)) {
         if self.closing.get() {
             return;
@@ -132,13 +192,15 @@ struct Controls {
     format_label: HWND,
     format: HWND,
     auto_copy: HWND,
+    usage_heading: HWND,
+    usage_hint: HWND,
     apply: HWND,
     close: HWND,
     status: HWND,
 }
 
 impl Controls {
-    fn handles(&self) -> [HWND; 16] {
+    fn handles(&self) -> [HWND; 18] {
         [
             self.title,
             self.subtitle,
@@ -153,6 +215,8 @@ impl Controls {
             self.format_label,
             self.format,
             self.auto_copy,
+            self.usage_heading,
+            self.usage_hint,
             self.apply,
             self.close,
             self.status,
@@ -174,7 +238,6 @@ pub struct SettingsWindow {
     font: RefCell<FontState>,
     schema_version: u32,
     save_allowed: bool,
-    keys: Vec<String>,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
@@ -185,6 +248,15 @@ impl SettingsWindow {
         notice: Option<&str>,
         save_allowed: bool,
     ) -> Result<Self> {
+        let selected_key = (0x30..=0x5a)
+            .chain(0x70..=0x7a)
+            .find(|key| key_name(*key).as_deref() == Some(config.hotkey.key.as_str()))
+            .ok_or_else(|| {
+                Error::new(
+                    E_FAIL,
+                    "Configured hotkey is outside the supported key list",
+                )
+            })?;
         let instance = unsafe { GetModuleHandleW(None)? }.into();
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
@@ -207,6 +279,10 @@ impl SettingsWindow {
             wake_failed: Cell::new(false),
             closing: Cell::new(false),
             default_id: Cell::new(if save_allowed { APPLY } else { CLOSE }),
+            selected_key: Cell::new(selected_key),
+            recording: Cell::new(false),
+            capture_hint: Cell::new(CaptureHint::Ready),
+            suppressed_keys: Cell::new([0; 4]),
         });
         let pointer = callback.as_ref() as *const CallbackState;
         let mut cursor = POINT::default();
@@ -234,7 +310,6 @@ impl SettingsWindow {
             font: RefCell::new(FontState::default()),
             schema_version: config.schema_version,
             save_allowed,
-            keys: key_choices(),
             _thread_affinity: PhantomData,
         };
         let disable_transitions = BOOL::from(true);
@@ -282,6 +357,36 @@ impl SettingsWindow {
         self.hwnd
     }
 
+    /// Run before IsDialogMessage: a key consumed during recording stays owned
+    /// until release, including after Tab/click moves focus to another control.
+    /// This is window-local message filtering, not a global keyboard hook.
+    pub fn filter_key_message(&self, message: &MSG) -> bool {
+        if message.hwnd != self.hwnd && !unsafe { IsChild(self.hwnd, message.hwnd) }.as_bool() {
+            return false;
+        }
+        let key = message.wParam.0 as u32;
+        if !self.callback.suppresses(key) {
+            return false;
+        }
+        match message.message {
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                if message.lParam.0 & (1 << 30) == 0 {
+                    // Release may have gone to a different app. A fresh press
+                    // is a new gesture and must never be lost to stale state.
+                    self.callback.suppress(key, false);
+                    false
+                } else {
+                    true
+                }
+            }
+            WM_KEYUP | WM_SYSKEYUP => {
+                self.callback.suppress(key, false);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn show_status(&self, text: &str, success: bool) -> Result<()> {
         self.set_status(text, if success { Tone::Success } else { Tone::Error })
     }
@@ -304,6 +409,7 @@ impl SettingsWindow {
         }
         let pending = self.callback.pending.take();
         if pending.close {
+            self.callback.recording.set(false);
             self.callback.closing.set(true);
             return Ok(Some(SettingsAction::Close));
         }
@@ -325,6 +431,12 @@ impl SettingsWindow {
         }
         if pending.default_style {
             self.update_default_style();
+        }
+        if pending.capture {
+            self.update_capture_text()?;
+        }
+        if pending.focus_key && self.callback.recording.get() {
+            unsafe { SetFocus(Some(self.controls.key))? };
         }
         if pending.apply && self.save_allowed {
             match self.read_config() {
@@ -351,17 +463,35 @@ impl SettingsWindow {
         self.controls.alt = self.control(w!("BUTTON"), "Alt", ALT, check)?;
         self.controls.shift = self.control(w!("BUTTON"), "Shift", SHIFT, check)?;
         self.controls.key_label = self.control(w!("STATIC"), "主键", 11, label)?;
-        self.controls.key = self.control(w!("COMBOBOX"), "", KEY, combo)?;
-        self.controls.hint = self.control(
-            w!("STATIC"),
-            "至少选择 Ctrl 或 Alt\r\n支持字母、数字和 F1–F11",
-            12,
-            label,
-        )?;
+        self.controls.key = self.control(w!("BUTTON"), "", KEY, button)?;
+        if !unsafe {
+            SetWindowSubclass(
+                self.controls.key,
+                Some(key_button_proc),
+                KEY_SUBCLASS,
+                self.callback.as_ref() as *const CallbackState as usize,
+            )
+        }
+        .as_bool()
+        {
+            return Err(Error::new(
+                E_FAIL,
+                "Could not prepare hotkey recording button",
+            ));
+        }
+        self.controls.hint = self.control(w!("STATIC"), "", 12, label)?;
         self.controls.copy_heading = self.control(w!("STATIC"), "复制行为", COPY_HEADING, label)?;
         self.controls.format_label = self.control(w!("STATIC"), "默认格式", 13, label)?;
         self.controls.format = self.control(w!("COMBOBOX"), "", FORMAT, combo)?;
         self.controls.auto_copy = self.control(w!("BUTTON"), "取色后自动复制", AUTO_COPY, check)?;
+        self.controls.usage_heading =
+            self.control(w!("STATIC"), "取色操作", USAGE_HEADING, label)?;
+        self.controls.usage_hint = self.control(
+            w!("STATIC"),
+            "左键确认 · 右键 / Esc 取消\r\n上滚轮冻结并放大 · 下滚轮缩小\r\n缩放取色窗外左键取消",
+            USAGE_HINT,
+            label,
+        )?;
         self.controls.status = self.control(
             w!("EDIT"),
             "",
@@ -370,27 +500,14 @@ impl SettingsWindow {
         )?;
         self.controls.close = self.control(w!("BUTTON"), "关闭", CLOSE, button)?;
         self.controls.apply = self.control(w!("BUTTON"), "应用", APPLY, button)?;
-        for key in &self.keys {
-            append_choice(self.controls.key, key)?;
-        }
         for format in ColorFormat::ALL {
             append_choice(self.controls.format, format.label())?;
         }
-        let key_index = self
-            .keys
-            .iter()
-            .position(|key| key == &config.hotkey.key)
-            .ok_or_else(|| {
-                Error::new(
-                    E_FAIL,
-                    "Configured hotkey is outside the supported key list",
-                )
-            })?;
         let format_index = ColorFormat::ALL
             .iter()
             .position(|format| *format == config.default_format)
             .ok_or_else(|| Error::new(E_FAIL, "Configured color format is not supported"))?;
-        set_choice(self.controls.key, key_index)?;
+        self.update_capture_text()?;
         set_choice(self.controls.format, format_index)?;
         set_checked(self.controls.ctrl, config.hotkey.ctrl);
         set_checked(self.controls.alt, config.hotkey.alt);
@@ -420,13 +537,9 @@ impl SettingsWindow {
     }
 
     fn read_config(&self) -> Result<Config> {
-        let key_index = selected_choice(self.controls.key)?;
         let format_index = selected_choice(self.controls.format)?;
-        let key = self
-            .keys
-            .get(key_index)
-            .ok_or_else(|| Error::new(E_FAIL, "请选择有效的主键"))?
-            .clone();
+        let key = key_name(self.callback.selected_key.get())
+            .ok_or_else(|| Error::new(E_FAIL, "请选择有效的主键"))?;
         let default_format = *ColorFormat::ALL
             .get(format_index)
             .ok_or_else(|| Error::new(E_FAIL, "请选择有效的颜色格式"))?;
@@ -441,6 +554,30 @@ impl SettingsWindow {
             default_format,
             auto_copy_on_pick: checked(self.controls.auto_copy),
         })
+    }
+
+    fn update_capture_text(&self) -> Result<()> {
+        let button = if self.callback.recording.get() {
+            "按下主键…".to_owned()
+        } else {
+            format!(
+                "{} · 点击修改",
+                key_name(self.callback.selected_key.get())
+                    .ok_or_else(|| Error::new(E_FAIL, "请选择有效的主键"))?
+            )
+        };
+        let hint = match self.callback.capture_hint.get() {
+            CaptureHint::Ready => "点击按钮后按下新主键\r\n至少选择 Ctrl 或 Alt",
+            CaptureHint::Listening => "字母、数字或 F1–F11\r\nEsc 取消 · Tab 离开",
+            CaptureHint::Invalid => "仅支持字母、数字和 F1–F11\r\n请重试 · Esc 取消",
+            CaptureHint::Accepted => "主键已更新，应用后生效\r\n点击按钮可再次修改",
+            CaptureHint::Cancelled => "已保留原主键\r\n点击按钮后重新录制",
+        };
+        unsafe {
+            SetWindowTextW(self.controls.key, PCWSTR(wide(&button).as_ptr()))?;
+            SetWindowTextW(self.controls.hint, PCWSTR(wide(hint).as_ptr()))?;
+        }
+        Ok(())
     }
 
     fn dpi(&self) -> Result<u32> {
@@ -530,8 +667,10 @@ impl SettingsWindow {
                 (self.controls.title, title.0),
                 (self.controls.hotkey_label, heading.0),
                 (self.controls.copy_heading, heading.0),
+                (self.controls.usage_heading, heading.0),
                 (self.controls.subtitle, small.0),
                 (self.controls.hint, small.0),
+                (self.controls.usage_hint, small.0),
                 (self.controls.status, small.0),
             ] {
                 unsafe {
@@ -567,30 +706,30 @@ impl SettingsWindow {
         place(self.controls.alt, 140, 136, 88, 26)?;
         place(self.controls.shift, 240, 136, 100, 26)?;
         place(self.controls.key_label, 40, 183, 48, 24)?;
-        place(self.controls.key, 92, 176, 120, 210)?;
+        place(self.controls.key, 88, 176, 132, 36)?;
         place(self.controls.hint, 228, 176, 212, 40)?;
         place(self.controls.copy_heading, 40, 260, 396, 24)?;
         place(self.controls.format_label, 40, 297, 108, 24)?;
         place(self.controls.format, 156, 290, 180, 160)?;
         place(self.controls.auto_copy, 40, 330, 396, 26)?;
-        place(self.controls.status, 24, 376, 432, 32)?;
-        place(self.controls.close, 264, 420, 88, 36)?;
-        place(self.controls.apply, 364, 420, 92, 36)?;
-        for hwnd in [self.controls.key, self.controls.format] {
-            unsafe {
-                SendMessageW(
-                    hwnd,
-                    CB_SETITEMHEIGHT,
-                    Some(WPARAM(usize::MAX)),
-                    Some(LPARAM(dip(24, dpi) as isize)),
-                );
-                SendMessageW(
-                    hwnd,
-                    CB_SETITEMHEIGHT,
-                    Some(WPARAM(0)),
-                    Some(LPARAM(dip(24, dpi) as isize)),
-                );
-            }
+        place(self.controls.usage_heading, 40, 388, 396, 24)?;
+        place(self.controls.usage_hint, 40, 417, 396, 48)?;
+        place(self.controls.status, 24, 484, 432, 32)?;
+        place(self.controls.close, 264, 528, 88, 36)?;
+        place(self.controls.apply, 364, 528, 92, 36)?;
+        unsafe {
+            SendMessageW(
+                self.controls.format,
+                CB_SETITEMHEIGHT,
+                Some(WPARAM(usize::MAX)),
+                Some(LPARAM(dip(24, dpi) as isize)),
+            );
+            SendMessageW(
+                self.controls.format,
+                CB_SETITEMHEIGHT,
+                Some(WPARAM(0)),
+                Some(LPARAM(dip(24, dpi) as isize)),
+            );
         }
         self.update_status_scrollbar()?;
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
@@ -619,7 +758,11 @@ impl SettingsWindow {
     }
 
     fn update_default_style(&self) {
-        for (id, hwnd) in [(APPLY, self.controls.apply), (CLOSE, self.controls.close)] {
+        for (id, hwnd) in [
+            (APPLY, self.controls.apply),
+            (CLOSE, self.controls.close),
+            (KEY, self.controls.key),
+        ] {
             let style = if id == self.callback.default_id.get() {
                 BS_DEFPUSHBUTTON
             } else {
@@ -673,12 +816,12 @@ fn font_line_height(hwnd: HWND, font: HFONT, dpi: u32) -> i32 {
     }
 }
 
-fn key_choices() -> Vec<String> {
-    ('A'..='Z')
-        .chain('0'..='9')
-        .map(|key| key.to_string())
-        .chain((1..=11).map(|key| format!("F{key}")))
-        .collect()
+fn key_name(key: u32) -> Option<String> {
+    match key {
+        0x30..=0x39 | 0x41..=0x5a => char::from_u32(key).map(|key| key.to_string()),
+        0x70..=0x7a => Some(format!("F{}", key - 0x70 + 1)),
+        _ => None,
+    }
 }
 
 fn append_choice(hwnd: HWND, text: &str) -> Result<()> {
@@ -721,6 +864,86 @@ fn checked(hwnd: HWND) -> bool {
     unsafe { SendMessageW(hwnd, BM_GETCHECK, None, None) }.0 == 1
 }
 
+unsafe extern "system" fn key_button_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    subclass: usize,
+    reference: usize,
+) -> LRESULT {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        key_button_dispatch(hwnd, message, wparam, lparam, subclass, reference)
+    }))
+    .unwrap_or_else(|_| std::process::abort())
+}
+
+unsafe fn key_button_dispatch(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    subclass: usize,
+    reference: usize,
+) -> LRESULT {
+    // The owner destroys all child windows before dropping this stable Box.
+    let state = unsafe { &*(reference as *const CallbackState) };
+    let key = wparam.0 as u32;
+    match message {
+        WM_NCDESTROY => {
+            let _ = unsafe { RemoveWindowSubclass(hwnd, Some(key_button_proc), subclass) };
+        }
+        WM_GETDLGCODE => {
+            let native = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+            // IsDialogMessage must dispatch Enter/Esc to the recording button,
+            // while Tab keeps its normal navigation and cancels on focus loss.
+            if (state.recording.get() && key != u32::from(VK_TAB.0)) || state.suppresses(key) {
+                return LRESULT(native.0 | DLGC_WANTALLKEYS as isize);
+            }
+            return native;
+        }
+        WM_KILLFOCUS => {
+            state.cancel_capture();
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN if state.suppresses(key) => {
+            return LRESULT(0);
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN if state.recording.get() => {
+            if key == u32::from(VK_TAB.0) {
+                state.cancel_capture();
+            } else {
+                // Track every consumed key until its release. A held invalid
+                // Enter must stay suppressed even if a later key is accepted.
+                state.suppress(key, true);
+                if key == u32::from(VK_ESCAPE.0) {
+                    state.cancel_capture();
+                } else if key_name(key).is_some() {
+                    state.selected_key.set(key);
+                    state.recording.set(false);
+                    state.capture_hint.set(CaptureHint::Accepted);
+                    state.queue(|pending| pending.capture = true);
+                } else if ![VK_CONTROL, VK_MENU, VK_SHIFT]
+                    .iter()
+                    .any(|modifier| key == u32::from(modifier.0))
+                {
+                    state.capture_hint.set(CaptureHint::Invalid);
+                    state.queue(|pending| pending.capture = true);
+                }
+                return LRESULT(0);
+            }
+        }
+        WM_KEYUP | WM_SYSKEYUP if state.recording.get() || state.suppresses(key) => {
+            state.suppress(key, false);
+            return LRESULT(0);
+        }
+        // TranslateMessage may already have queued the character when its key
+        // was accepted. The button has no text-input or mnemonic behavior.
+        WM_CHAR | WM_SYSCHAR => return LRESULT(0),
+        _ => {}
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -758,7 +981,15 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                 SUBTITLE => (false, Tone::Muted),
                 STATUS => (false, state.status_tone.get()),
                 10 => (true, Tone::Accent),
-                12 => (true, Tone::Muted),
+                12 => (
+                    true,
+                    if matches!(state.capture_hint.get(), CaptureHint::Invalid) {
+                        Tone::Error
+                    } else {
+                        Tone::Muted
+                    },
+                ),
+                USAGE_HINT => (true, Tone::Muted),
                 APPLY | CLOSE => (false, Tone::Text),
                 _ => (true, Tone::Text),
             };
@@ -776,9 +1007,14 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             match wparam.0 & 0xffff {
                 CLOSE => state.queue(|pending| pending.close = true),
                 APPLY => state.queue(|pending| pending.apply = true),
+                KEY => state.begin_capture(),
                 _ => {}
             }
             LRESULT(0)
+        }
+        WM_ACTIVATE if wparam.0 as u32 & 0xffff == WA_INACTIVE => {
+            state.cancel_capture();
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_DPICHANGED => {
             if let Some(rect) = unsafe { (lparam.0 as *const RECT).as_ref() } {

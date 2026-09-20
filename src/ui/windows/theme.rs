@@ -222,10 +222,10 @@ pub(super) fn custom_draw(lparam: LPARAM, primary_id: usize) -> Option<LRESULT> 
     unsafe {
         SelectObject(hdc, GetStockObject(DC_BRUSH));
         SelectObject(hdc, GetStockObject(DC_PEN));
-        // Row copy buttons sit inside white cards; footer buttons on canvas.
+        // Row copy / key-capture buttons sit on white cards; footer on canvas.
         SetDCBrushColor(
             hdc,
-            if (100..104).contains(&header.idFrom) {
+            if (100..=104).contains(&header.idFrom) {
                 PANEL
             } else {
                 CANVAS

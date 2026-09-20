@@ -4,7 +4,7 @@
 use crate::{
     app::diagnostics,
     core::{
-        geometry::{ScreenPointPx, freeze_rect},
+        geometry::{ScreenPointPx, ScreenRectPx, freeze_rect},
         state::{AppState, Event, PickedColor, SampleKind, StateMachine},
     },
     platform::windows::{
@@ -318,20 +318,32 @@ impl PreviewController {
             InputEvent::Candidate { session, point }
                 if self.machine.session_id() == Some(session) =>
             {
-                let picked = match self.state() {
-                    AppState::Live { .. } => self.sample_at(point)?,
+                let action = match self.state() {
+                    AppState::Live { .. } => self
+                        .sample_at(point)?
+                        .map_or(CandidateAction::Reject, CandidateAction::Pick),
                     AppState::Frozen { .. } => self
                         .session
                         .as_ref()
                         .and_then(|resources| resources.magnifier.as_ref())
-                        .and_then(|magnifier| magnifier.hit_test(point)),
-                    _ => None,
+                        .map_or(CandidateAction::Reject, |magnifier| {
+                            frozen_candidate(point, magnifier.rect(), magnifier.hit_test(point))
+                        }),
+                    _ => CandidateAction::Reject,
                 };
-                if let Some(picked) = picked {
-                    self.transition(Event::Confirm { session, picked })?;
-                    self.begin_finish("confirmed");
-                } else if let Some(resources) = self.session.as_ref() {
-                    resources.input.reject_candidate()?;
+                match action {
+                    CandidateAction::Pick(picked) => {
+                        self.transition(Event::Confirm { session, picked })?;
+                        self.begin_finish("confirmed");
+                    }
+                    // The input worker has already consumed the complete click.
+                    // Keep it alive to drain any other owned button releases.
+                    CandidateAction::Cancel => self.stop("frozen_outside_click"),
+                    CandidateAction::Reject => {
+                        if let Some(resources) = self.session.as_ref() {
+                            resources.input.reject_candidate()?;
+                        }
+                    }
                 }
             }
             InputEvent::Cancel { session } if self.machine.session_id() == Some(session) => {
@@ -549,6 +561,27 @@ fn platform_error(error: impl std::fmt::Display) -> Error {
     Error::new(E_FAIL, error.to_string())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CandidateAction {
+    Pick(PickedColor),
+    Cancel,
+    Reject,
+}
+
+fn frozen_candidate(
+    point: ScreenPointPx,
+    bounds: Option<ScreenRectPx>,
+    picked: Option<PickedColor>,
+) -> CandidateAction {
+    match bounds {
+        Some(bounds) if !bounds.contains(point) => CandidateAction::Cancel,
+        // A border, clipped image margin or information bar is still inside
+        // the window. Missing pixel data alone must not cancel the session.
+        Some(_) => picked.map_or(CandidateAction::Reject, CandidateAction::Pick),
+        None => CandidateAction::Reject,
+    }
+}
+
 #[derive(Default)]
 struct WheelAccumulator(i32);
 impl WheelAccumulator {
@@ -562,7 +595,56 @@ impl WheelAccumulator {
 
 #[cfg(test)]
 mod tests {
-    use super::WheelAccumulator;
+    use super::*;
+    use crate::core::color::Rgb8;
+
+    #[test]
+    fn frozen_click_cancels_only_outside_the_window() {
+        let bounds = ScreenRectPx {
+            left: -200,
+            top: 100,
+            right: 100,
+            bottom: 450,
+        };
+        // The left/top border and the bottom information area have no pixel,
+        // but remain inside; right/bottom coordinates are exclusive.
+        for point in [
+            ScreenPointPx { x: -200, y: 100 },
+            ScreenPointPx { x: 0, y: 440 },
+        ] {
+            assert_eq!(
+                frozen_candidate(point, Some(bounds), None),
+                CandidateAction::Reject
+            );
+        }
+        for point in [
+            ScreenPointPx { x: -201, y: 200 },
+            ScreenPointPx { x: 100, y: 200 },
+            ScreenPointPx { x: 0, y: 99 },
+            ScreenPointPx { x: 0, y: 450 },
+        ] {
+            assert_eq!(
+                frozen_candidate(point, Some(bounds), None),
+                CandidateAction::Cancel
+            );
+        }
+        let point = ScreenPointPx { x: 0, y: 200 };
+        let picked = PickedColor {
+            rgb: Rgb8 {
+                r: 17,
+                g: 34,
+                b: 51,
+            },
+            source: point,
+            kind: SampleKind::Frozen,
+        };
+        assert_eq!(
+            frozen_candidate(point, Some(bounds), Some(picked)),
+            CandidateAction::Pick(picked)
+        );
+        assert_eq!(frozen_candidate(point, None, None), CandidateAction::Reject);
+    }
+
     #[test]
     fn partial_wheel_ticks_accumulate_and_extreme_deltas_are_bounded() {
         let mut wheel = WheelAccumulator::default();

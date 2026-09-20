@@ -201,7 +201,13 @@ mod fixture {
                 break;
             }
             let dialog = matches!(scene, Scene::Result(_) | Scene::Settings(_));
-            if !dialog || !unsafe { IsDialogMessageW(scene.hwnd(), &message) }.as_bool() {
+            let recorded_key = match &scene {
+                Scene::Settings(window) => window.filter_key_message(&message),
+                _ => false,
+            };
+            if !recorded_key
+                && (!dialog || !unsafe { IsDialogMessageW(scene.hwnd(), &message) }.as_bool())
+            {
                 unsafe {
                     let _ = TranslateMessage(&message);
                     DispatchMessageW(&message);
