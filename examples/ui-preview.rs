@@ -146,7 +146,19 @@ mod fixture {
                 None,
             )?
         });
-        let rgb = Rgb8::new(143, 185, 158);
+        let mut rgb = Rgb8::new(143, 185, 158);
+        for argument in std::env::args().skip(2) {
+            if let Some(hex) = argument.strip_prefix("--color=") {
+                if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(Error::new(
+                        windows::Win32::Foundation::E_INVALIDARG,
+                        "--color requires six hexadecimal digits, e.g. --color=498BA7",
+                    ));
+                }
+                let color = u32::from_str_radix(hex, 16).expect("validated six hex digits");
+                rgb = Rgb8::new((color >> 16) as u8, (color >> 8) as u8, color as u8);
+            }
+        }
         let scene = match mode.as_str() {
             "result" => Scene::Result(ResultWindow::new(
                 PickedColor {

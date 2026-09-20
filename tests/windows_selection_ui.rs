@@ -25,15 +25,17 @@ use pixel_fixture::ScopedPmv2;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, WPARAM},
-        Graphics::Gdi::UpdateWindow,
+        Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
+        Graphics::Gdi::{ClientToScreen, UpdateWindow},
         UI::Controls::{TBM_GETRANGEMAX, TBM_GETRANGEMIN, TBM_SETPOS},
         UI::WindowsAndMessaging::{
             BM_CLICK, BM_SETCHECK, CB_GETCOUNT, CreateWindowExW, DestroyWindow, ES_READONLY,
-            GWL_EXSTYLE, GWL_STYLE, GetDlgItem, GetNextDlgTabItem, GetWindowLongW, GetWindowTextW,
-            IsDialogMessageW, IsWindow, MSG, SendMessageW, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND,
-            WM_GETDLGCODE, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
-            WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_OVERLAPPED, WS_TABSTOP,
+            GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetDlgItem, GetNextDlgTabItem, GetWindowLongW,
+            GetWindowRect, GetWindowTextW, HTCAPTION, HTCLIENT, IsDialogMessageW, IsIconic,
+            IsWindow, MSG, SW_RESTORE, SendMessageW, ShowWindow, WINDOW_EX_STYLE, WM_CLOSE,
+            WM_COMMAND, WM_GETDLGCODE, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_NCHITTEST,
+            WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_OVERLAPPED,
+            WS_TABSTOP,
         },
     },
     core::w,
@@ -147,6 +149,42 @@ fn cached_selection_and_native_result_controls_smoke() {
     assert_eq!(result.process_pending().unwrap(), None);
     let default_copy = unsafe { GetDlgItem(Some(result_hwnd), 1) }.unwrap();
     assert!(window_text(default_copy).contains("HSL"));
+    let minimize = unsafe { GetDlgItem(Some(result_hwnd), 40) }.unwrap();
+    let caption_close = unsafe { GetDlgItem(Some(result_hwnd), 41) }.unwrap();
+    assert_eq!(window_text(minimize), "最小化");
+    assert_eq!(window_text(caption_close), "关闭窗口");
+    let mut client = RECT::default();
+    let mut window = RECT::default();
+    unsafe {
+        GetClientRect(result_hwnd, &mut client).unwrap();
+        GetWindowRect(result_hwnd, &mut window).unwrap();
+    }
+    assert_eq!(
+        (client.right - client.left, client.bottom - client.top),
+        (window.right - window.left, window.bottom - window.top),
+        "the custom caption must not leave a native nonclient frame"
+    );
+    let hit_test = |point: POINT| {
+        // WM_NCHITTEST packs signed screen coordinates into two 16-bit words.
+        // Keep the bit patterns for monitors left of or above the primary one.
+        let packed = u32::from(point.x as u16) | (u32::from(point.y as u16) << 16);
+        unsafe {
+            SendMessageW(
+                result_hwnd,
+                WM_NCHITTEST,
+                None,
+                Some(LPARAM(packed as isize)),
+            )
+        }
+        .0
+    };
+    let caption_inset = ((16 * unsafe { GetDpiForWindow(result_hwnd) } + 48) / 96) as i32;
+    let mut caption_point = POINT {
+        x: caption_inset,
+        y: caption_inset,
+    };
+    assert!(unsafe { ClientToScreen(result_hwnd, &mut caption_point) }.as_bool());
+    assert_eq!(hit_test(caption_point), HTCAPTION as isize);
     for (index, format) in ColorFormat::ALL.into_iter().enumerate() {
         let edit = unsafe { GetDlgItem(Some(result_hwnd), 30 + index as i32) }.unwrap();
         let mut text = [0_u16; 128];
@@ -157,10 +195,27 @@ fn cached_selection_and_native_result_controls_smoke() {
             format_color(picked.rgb, format)
         );
         assert_ne!(unsafe { GetWindowLongW(edit, GWL_STYLE) } & ES_READONLY, 0);
+        if index == 0 {
+            let mut edit_rect = RECT::default();
+            unsafe { GetWindowRect(edit, &mut edit_rect) }.unwrap();
+            assert_eq!(
+                hit_test(POINT {
+                    x: edit_rect.left + (edit_rect.right - edit_rect.left) / 2,
+                    y: edit_rect.top + (edit_rect.bottom - edit_rect.top) / 2,
+                }),
+                HTCLIENT as isize,
+                "the value area must remain client input, not caption dragging"
+            );
+        }
     }
-    // Send only this test's own close intention. Do not pump external messages
-    // or click any copy control: the user's clipboard is never touched.
-    unsafe { SendMessageW(result_hwnd, WM_CLOSE, None, None) };
+    // Exercise only this fixture's caption controls; no system input or copy.
+    unsafe { SendMessageW(minimize, BM_CLICK, None, None) };
+    assert_eq!(result.process_pending().unwrap(), None);
+    assert!(unsafe { IsIconic(result_hwnd) }.as_bool());
+    let _ = unsafe { ShowWindow(result_hwnd, SW_RESTORE) };
+    assert_eq!(result.process_pending().unwrap(), None);
+    assert!(!unsafe { IsIconic(result_hwnd) }.as_bool());
+    unsafe { SendMessageW(caption_close, BM_CLICK, None, None) };
     assert_eq!(result.process_pending().unwrap(), Some(ResultAction::Close));
     drop(result);
     assert!(!unsafe { IsWindow(Some(result_hwnd)) }.as_bool());

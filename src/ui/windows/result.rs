@@ -17,7 +17,7 @@ use windows::{
             LPARAM, LRESULT, POINT, RECT, SetLastError, WPARAM,
         },
         Graphics::{
-            Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute},
+            Dwm::{DWMWA_BORDER_COLOR, DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute},
             Gdi::*,
         },
         System::{
@@ -25,8 +25,11 @@ use windows::{
             SystemServices::{SS_NOPREFIX, SS_OWNERDRAW},
         },
         UI::{
-            Controls::DRAWITEMSTRUCT,
-            HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
+            Controls::{
+                CDDS_PREPAINT, CDIS_DISABLED, CDIS_FOCUS, CDIS_HOT, CDIS_SELECTED,
+                CDRF_SKIPDEFAULT, DRAWITEMSTRUCT, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR,
+            },
+            HiDpi::GetDpiForWindow,
             Input::KeyboardAndMouse::SetFocus,
             WindowsAndMessaging::*,
         },
@@ -52,6 +55,8 @@ const COPY_DEFAULT: usize = 1;
 const CLOSE: usize = 2;
 const PICK_AGAIN: usize = 200;
 const COPY_ROW: usize = 100;
+const CAPTION_MINIMIZE: usize = 40;
+const CAPTION_CLOSE: usize = 41;
 const RETRY_MS: u32 = 50;
 const MAX_RETRIES: u8 = 3;
 const CLIENT_WIDTH: i32 = 420;
@@ -78,6 +83,7 @@ struct Pending {
     dpi_rect: Option<RECT>,
     layout: bool,
     default_style: bool,
+    minimize: bool,
 }
 
 struct CallbackState {
@@ -122,6 +128,8 @@ struct Row {
 #[derive(Default)]
 struct Controls {
     swatch: HWND,
+    minimize: HWND,
+    caption_close: HWND,
     source: HWND,
     rows: [Row; 4],
     default_copy: HWND,
@@ -134,6 +142,8 @@ impl Controls {
     fn handles(&self) -> impl Iterator<Item = HWND> + '_ {
         [
             self.swatch,
+            self.minimize,
+            self.caption_close,
             self.source,
             self.default_copy,
             self.pick_again,
@@ -273,6 +283,17 @@ impl ResultWindow {
             _thread_affinity: PhantomData,
         };
         theme::configure_window(hwnd);
+        // Keep the window's native title for taskbar/accessibility, while the
+        // client area replaces the visible frame. DWM rounding is best effort.
+        let no_border = 0xffff_fffe_u32; // DWMWA_COLOR_NONE
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                (&no_border as *const u32).cast(),
+                size_of::<u32>() as u32,
+            )
+        };
         // Pick Again can start sampling immediately after this owner is
         // dropped. Do not leave animated result-window pixels in composition.
         let disable_transitions = BOOL::from(true);
@@ -338,6 +359,9 @@ impl ResultWindow {
         if pending.default_style {
             self.update_default_style();
         }
+        if pending.minimize {
+            let _ = unsafe { ShowWindow(self.hwnd, SW_MINIMIZE) };
+        }
         if let Some(format) = pending.copy {
             self.cancel_copy();
             let token = next_copy_token()?;
@@ -360,7 +384,7 @@ impl ResultWindow {
             w!("STATIC"),
             "已选颜色色块",
             10,
-            WINDOW_STYLE(SS_OWNERDRAW.0),
+            WINDOW_STYLE(SS_OWNERDRAW.0) | WS_CLIPSIBLINGS,
             WINDOW_EX_STYLE::default(),
         )?;
         let source = match self.picked.kind {
@@ -430,6 +454,33 @@ impl ResultWindow {
             WINDOW_STYLE(SS_NOPREFIX.0),
             WINDOW_EX_STYLE::default(),
         )?;
+        self.controls.minimize = self.control(
+            w!("BUTTON"),
+            "最小化",
+            CAPTION_MINIMIZE,
+            WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            WINDOW_EX_STYLE::default(),
+        )?;
+        self.controls.caption_close = self.control(
+            w!("BUTTON"),
+            "关闭窗口",
+            CAPTION_CLOSE,
+            WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            WINDOW_EX_STYLE::default(),
+        )?;
+        // The color STATIC overlaps the caption buttons. Keep it behind every
+        // sibling, and clip its paint so hover/focus on the buttons stays visible.
+        unsafe {
+            SetWindowPos(
+                self.controls.swatch,
+                Some(HWND_BOTTOM),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )?
+        };
         Ok(())
     }
 
@@ -470,9 +521,7 @@ impl ResultWindow {
     }
 
     fn place_initially(&self) -> Result<()> {
-        // Captioned windows have a system-enforced minimum size. At a monitor
-        // edge the initial rectangle can belong to the neighbor. Move inside
-        // the source monitor while hidden before querying the actual window DPI.
+        // Move inside the source monitor while hidden before querying its DPI.
         let monitor = unsafe {
             MonitorFromPoint(
                 POINT {
@@ -504,14 +553,10 @@ impl ResultWindow {
             )?;
         }
         let dpi = self.dpi()?;
-        let mut outer = RECT {
-            right: dip(CLIENT_WIDTH, dpi),
-            bottom: dip(CLIENT_HEIGHT, dpi),
-            ..Default::default()
-        };
-        unsafe { AdjustWindowRectExForDpi(&mut outer, STYLE, false, EX_STYLE, dpi)? };
-        let width = outer.right - outer.left;
-        let height = outer.bottom - outer.top;
+        // WM_NCCALCSIZE makes the whole window client space: do not add the
+        // former native caption/border dimensions back into the layout.
+        let width = dip(CLIENT_WIDTH, dpi);
+        let height = dip(CLIENT_HEIGHT, dpi);
         let x = i64::from(self.picked.source.x).clamp(
             i64::from(work.left),
             (i64::from(work.right) - i64::from(width)).max(i64::from(work.left)),
@@ -528,7 +573,7 @@ impl ResultWindow {
                 y,
                 width,
                 height,
-                SWP_NOZORDER | SWP_NOACTIVATE,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             )?
         };
         // Final placement supersedes synchronous DPI suggestions produced by
@@ -567,6 +612,22 @@ impl ResultWindow {
                 dip(SWATCH_HEIGHT, dpi),
                 true,
             )?;
+        }
+        for (id, button) in [
+            (CAPTION_MINIMIZE, self.controls.minimize),
+            (CAPTION_CLOSE, self.controls.caption_close),
+        ] {
+            let rect = caption_button_rect(id, client.right, dpi);
+            unsafe {
+                MoveWindow(
+                    button,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    true,
+                )?
+            };
         }
         place(self.controls.source, 20, 128, 380, 18)?;
         for (index, row) in self.controls.rows.iter().enumerate() {
@@ -626,6 +687,8 @@ impl ResultWindow {
             (COPY_DEFAULT, self.controls.default_copy),
             (PICK_AGAIN, self.controls.pick_again),
             (CLOSE, self.controls.close),
+            (CAPTION_MINIMIZE, self.controls.minimize),
+            (CAPTION_CLOSE, self.controls.caption_close),
         ]
         .into_iter()
         .chain(
@@ -730,6 +793,163 @@ fn next_copy_token() -> Result<usize> {
         .map_err(|_| Error::new(E_FAIL, "Clipboard retry token exhausted"))
 }
 
+fn caption_button_rect(id: usize, width: i32, dpi: u32) -> RECT {
+    let offset = if id == CAPTION_MINIMIZE { 38 } else { 0 };
+    let right = width - dip(6 + offset, dpi);
+    RECT {
+        left: right - dip(36, dpi),
+        top: dip(6, dpi),
+        right,
+        bottom: dip(36, dpi),
+    }
+}
+
+fn caption_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    // Screen coordinates can be negative on monitors left/above the primary.
+    let mut point = POINT {
+        x: (lparam.0 as u16 as i16) as i32,
+        y: ((lparam.0 >> 16) as u16 as i16) as i32,
+    };
+    let mut client = RECT::default();
+    if !unsafe { ScreenToClient(hwnd, &mut point) }.as_bool()
+        || unsafe { GetClientRect(hwnd, &mut client) }.is_err()
+    {
+        return LRESULT(HTCLIENT as isize);
+    }
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let inside = |rect: RECT| {
+        point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
+    };
+    if [CAPTION_MINIMIZE, CAPTION_CLOSE]
+        .into_iter()
+        .any(|id| inside(caption_button_rect(id, client.right, dpi)))
+    {
+        return LRESULT(HTCLIENT as isize);
+    }
+    if inside(client) && point.y < dip(SWATCH_HEIGHT, dpi) {
+        LRESULT(HTCAPTION as isize)
+    } else {
+        LRESULT(HTCLIENT as isize)
+    }
+}
+
+fn caption_ink(color: COLORREF) -> COLORREF {
+    let linear = |shift: u32| {
+        let channel = f64::from((color.0 >> shift) & 0xff_u32) / 255.0;
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * linear(0) + 0.7152 * linear(8) + 0.0722 * linear(16);
+    if luminance > 0.179 {
+        COLORREF(0)
+    } else {
+        COLORREF(0x00ffffff)
+    }
+}
+
+fn caption_tint(base: COLORREF, ink: COLORREF, percent: u32) -> COLORREF {
+    let channel = |shift: u32| {
+        ((((base.0 >> shift) & 0xff_u32) * (100 - percent)
+            + ((ink.0 >> shift) & 0xff_u32) * percent)
+            / 100)
+            << shift
+    };
+    COLORREF(channel(0) | channel(8) | channel(16))
+}
+
+fn draw_caption_button(lparam: LPARAM, background: COLORREF) -> Option<LRESULT> {
+    if lparam.0 == 0 {
+        return None;
+    }
+    let header = unsafe { &*(lparam.0 as *const NMHDR) };
+    if header.code != NM_CUSTOMDRAW || ![CAPTION_MINIMIZE, CAPTION_CLOSE].contains(&header.idFrom) {
+        return None;
+    }
+    let draw = unsafe { &*(lparam.0 as *const NMCUSTOMDRAW) };
+    if draw.dwDrawStage != CDDS_PREPAINT {
+        return None;
+    }
+    let hdc = draw.hdc;
+    let saved = unsafe { SaveDC(hdc) };
+    if saved == 0 {
+        return None;
+    }
+    let dpi = unsafe { GetDpiForWindow(header.hwndFrom) }.max(96);
+    let hot = draw.uItemState.contains(CDIS_HOT);
+    let pressed = draw.uItemState.contains(CDIS_SELECTED);
+    let disabled = draw.uItemState.contains(CDIS_DISABLED);
+    let mut ink = caption_ink(background);
+    let fill = if disabled {
+        ink = caption_tint(background, ink, 40);
+        background
+    } else if header.idFrom == CAPTION_CLOSE && (hot || pressed) {
+        ink = COLORREF(0x00ffffff);
+        if pressed {
+            COLORREF(0x001f0fc5)
+        } else {
+            COLORREF(0x002311e8)
+        }
+    } else if pressed || hot {
+        caption_tint(background, ink, if pressed { 20 } else { 10 })
+    } else {
+        background
+    };
+    let pen = unsafe { CreatePen(PS_SOLID, dip(1, dpi).max(1), ink) };
+    if pen.is_invalid() {
+        let _ = unsafe { RestoreDC(hdc, saved) };
+        return None;
+    }
+    unsafe {
+        SetDCBrushColor(hdc, background);
+        FillRect(hdc, &draw.rc, HBRUSH(GetStockObject(DC_BRUSH).0));
+        SelectObject(hdc, GetStockObject(DC_BRUSH));
+        SelectObject(hdc, GetStockObject(DC_PEN));
+        SetDCBrushColor(hdc, fill);
+        SetDCPenColor(hdc, fill);
+        let _ = RoundRect(
+            hdc,
+            draw.rc.left,
+            draw.rc.top,
+            draw.rc.right,
+            draw.rc.bottom,
+            dip(8, dpi),
+            dip(8, dpi),
+        );
+        SelectObject(hdc, HGDIOBJ(pen.0));
+        let x = (draw.rc.left + draw.rc.right) / 2;
+        let y = (draw.rc.top + draw.rc.bottom) / 2;
+        let radius = dip(4, dpi);
+        if header.idFrom == CAPTION_MINIMIZE {
+            let _ = MoveToEx(hdc, x - radius, y, None);
+            let _ = LineTo(hdc, x + radius + 1, y);
+        } else {
+            let _ = MoveToEx(hdc, x - radius, y - radius, None);
+            let _ = LineTo(hdc, x + radius + 1, y + radius + 1);
+            let _ = MoveToEx(hdc, x + radius, y - radius, None);
+            let _ = LineTo(hdc, x - radius - 1, y + radius + 1);
+        }
+        if draw.uItemState.contains(CDIS_FOCUS) && !disabled {
+            SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            let inset = dip(2, dpi);
+            let _ = RoundRect(
+                hdc,
+                draw.rc.left + inset,
+                draw.rc.top + inset,
+                draw.rc.right - inset,
+                draw.rc.bottom - inset,
+                dip(6, dpi),
+                dip(6, dpi),
+            );
+        }
+        let _ = RestoreDC(hdc, saved);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+    Some(LRESULT(CDRF_SKIPDEFAULT as isize))
+}
+
 fn draw_swatch(lparam: LPARAM, color: COLORREF) -> LRESULT {
     let Some(draw) = (unsafe { (lparam.0 as *const DRAWITEMSTRUCT).as_ref() }) else {
         return LRESULT(0);
@@ -804,6 +1024,12 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     };
     match message {
+        WM_NCCALCSIZE => LRESULT(0),
+        WM_NCHITTEST => caption_hit_test(hwnd, lparam),
+        // A fixed-size results sheet has no maximize/resize mode, even when
+        // invoked through the system menu or a double click on its color field.
+        WM_NCLBUTTONDBLCLK if wparam.0 == HTCAPTION as usize => LRESULT(0),
+        WM_SYSCOMMAND if matches!((wparam.0 & 0xfff0) as u32, SC_MAXIMIZE | SC_SIZE) => LRESULT(0),
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => paint_result(hwnd),
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {
@@ -819,7 +1045,8 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                 .theme
                 .control_color(HDC(wparam.0 as *mut _), true, tone)
         }
-        WM_NOTIFY => theme::custom_draw_minimal(lparam, COPY_DEFAULT)
+        WM_NOTIFY => draw_caption_button(lparam, state.swatch_color)
+            .or_else(|| theme::custom_draw_minimal(lparam, COPY_DEFAULT))
             .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }),
         WM_DRAWITEM if wparam.0 == 10 => draw_swatch(lparam, state.swatch_color),
         WM_CLOSE => {
@@ -828,7 +1055,10 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         }
         WM_COMMAND if (wparam.0 >> 16) as u32 == BN_CLICKED => {
             match wparam.0 & 0xffff {
-                CLOSE => state.queue(|pending| pending.action = Some(ResultAction::Close)),
+                CLOSE | CAPTION_CLOSE => {
+                    state.queue(|pending| pending.action = Some(ResultAction::Close))
+                }
+                CAPTION_MINIMIZE => state.queue(|pending| pending.minimize = true),
                 PICK_AGAIN => state.queue(|pending| pending.action = Some(ResultAction::PickAgain)),
                 COPY_DEFAULT => state.queue(|pending| pending.copy = Some(state.default_format)),
                 id if (COPY_ROW..COPY_ROW + 4).contains(&id) => {
@@ -853,7 +1083,9 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             LRESULT(0)
         }
         WM_SIZE => {
-            state.queue(|pending| pending.layout = true);
+            if wparam.0 != SIZE_MINIMIZED as usize {
+                state.queue(|pending| pending.layout = true);
+            }
             LRESULT(0)
         }
         DM_GETDEFID => LRESULT(((DC_HASDEFID as usize) << 16 | state.default_id.get()) as isize),
