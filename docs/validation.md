@@ -55,9 +55,13 @@ cargo test --locked --test windows_shell -- --ignored --test-threads=1 --nocaptu
 在当前用户交互桌面执行后，2 项均 PASS。测试已正常关闭自己的全部临时进程；
 没有操作用户已有的 color-picker、重启 Explorer、生成键鼠输入或改变剪贴板。
 
-进入 M2 前剩余人工验证：启动 Release EXE，确认托盘出现；按 Ctrl+Alt+C 显示阶段提示，
-按住不重复触发；通过托盘“开始取色”激活、“设置”查看阶段说明、“退出”结束进程。
-系统允许显示通知时检查可见效果，再记录 PASS/FAIL。此处不把尚未执行的步骤记为完成。
+2026-09-20 用户补充实测：日志 `color-picker-20260920-213810-fdaa2d1e81304c9bb11c4877854535fe.log`
+与用户“正常触发了”的反馈确认实际快捷键和通知显示 PASS。进程 34612 的 elapsed_ms=8930/12464
+均有 hotkey.received → activation.handled → tray.notification_accepted → tray.balloon_show；
+48916 有 tray.activation_received，52365 有设置通知和 Shell 显示回调。无错误事件。
+因此实际入口的可见效果、托盘激活、设置菜单 PASS；长按不重复触发、菜单退出和真实 Explorer
+重启仍为 NOT TESTED（正常进程退出已有单独自动化 PASS）。这些剩余项继续留在发布前回归中，
+M1 阶段表的进入下一阶段条件已经满足，可进入 M2。
 
 ## 发布前实机矩阵
 
