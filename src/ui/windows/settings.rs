@@ -21,6 +21,7 @@ use windows::{
         },
         System::{LibraryLoader::GetModuleHandleW, SystemServices::SS_NOPREFIX},
         UI::{
+            Controls::{EM_GETLINECOUNT, ShowScrollBar},
             HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
             Input::KeyboardAndMouse::{EnableWindow, SetFocus},
             WindowsAndMessaging::*,
@@ -29,7 +30,10 @@ use windows::{
     core::{BOOL, Error, PCWSTR, Result, w},
 };
 
-use super::drawing::dip;
+use super::{
+    drawing::dip,
+    theme::{self, Font, Theme, Tone},
+};
 use crate::{
     app::config::{Config, HotkeyConfig},
     core::format::ColorFormat,
@@ -45,10 +49,29 @@ const SHIFT: usize = 103;
 const KEY: usize = 104;
 const FORMAT: usize = 105;
 const AUTO_COPY: usize = 106;
-const CLIENT_WIDTH: i32 = 560;
-const CLIENT_HEIGHT: i32 = 408;
-const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
+const TITLE: usize = 15;
+const SUBTITLE: usize = 16;
+const COPY_HEADING: usize = 17;
+const STATUS: usize = 14;
+const CLIENT_WIDTH: i32 = 480;
+const CLIENT_HEIGHT: i32 = 480;
+const STYLE: WINDOW_STYLE =
+    WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0);
 const EX_STYLE: WINDOW_EX_STYLE = WINDOW_EX_STYLE(WS_EX_APPWINDOW.0 | WS_EX_CONTROLPARENT.0);
+const PANELS: [RECT; 2] = [
+    RECT {
+        left: 24,
+        top: 88,
+        right: 456,
+        bottom: 232,
+    },
+    RECT {
+        left: 24,
+        top: 244,
+        right: 456,
+        bottom: 364,
+    },
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsAction {
@@ -67,6 +90,8 @@ struct Pending {
 
 struct CallbackState {
     notify: HWND,
+    theme: Theme,
+    status_tone: Cell<Tone>,
     pending: Cell<Pending>,
     wake_posted: Cell<bool>,
     wake_failed: Cell<bool>,
@@ -94,6 +119,8 @@ impl CallbackState {
 
 #[derive(Default)]
 struct Controls {
+    title: HWND,
+    subtitle: HWND,
     hotkey_label: HWND,
     ctrl: HWND,
     alt: HWND,
@@ -101,6 +128,7 @@ struct Controls {
     key_label: HWND,
     key: HWND,
     hint: HWND,
+    copy_heading: HWND,
     format_label: HWND,
     format: HWND,
     auto_copy: HWND,
@@ -110,8 +138,10 @@ struct Controls {
 }
 
 impl Controls {
-    fn handles(&self) -> [HWND; 13] {
+    fn handles(&self) -> [HWND; 16] {
         [
+            self.title,
+            self.subtitle,
             self.hotkey_label,
             self.ctrl,
             self.alt,
@@ -119,6 +149,7 @@ impl Controls {
             self.key_label,
             self.key,
             self.hint,
+            self.copy_heading,
             self.format_label,
             self.format,
             self.auto_copy,
@@ -129,17 +160,11 @@ impl Controls {
     }
 }
 
-struct Font(HFONT);
-impl Drop for Font {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteObject(HGDIOBJ(self.0.0)) };
-    }
-}
-
 #[derive(Default)]
 struct FontState {
     dpi: u32,
-    _font: Option<Font>,
+    small_line_height: i32,
+    _fonts: Vec<Font>,
 }
 
 pub struct SettingsWindow {
@@ -165,7 +190,6 @@ impl SettingsWindow {
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
             hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
-            hbrBackground: unsafe { GetSysColorBrush(COLOR_WINDOW) },
             lpszClassName: CLASS,
             ..Default::default()
         };
@@ -176,6 +200,8 @@ impl SettingsWindow {
         }
         let callback = Box::new(CallbackState {
             notify,
+            theme: Theme::new()?,
+            status_tone: Cell::new(Tone::Muted),
             pending: Cell::new(Pending::default()),
             wake_posted: Cell::new(false),
             wake_failed: Cell::new(false),
@@ -220,12 +246,13 @@ impl SettingsWindow {
                 size_of::<BOOL>() as u32,
             )?;
         }
+        theme::configure_window(hwnd);
         window.create_controls(config)?;
         window.place_initially(cursor)?;
         window.layout()?;
         window.update_default_style();
         let default_notice = if save_allowed {
-            "更改仅在点击“应用”后保存。关闭窗口会放弃尚未应用的更改。"
+            "点击“应用”保存更改。"
         } else {
             "当前配置只读，无法应用更改。"
         };
@@ -234,7 +261,14 @@ impl SettingsWindow {
             (Some(notice), true) => notice.to_owned(),
             (None, _) => default_notice.to_owned(),
         };
-        window.show_status(&status, false)?;
+        window.set_status(
+            &status,
+            if notice.is_some() || !save_allowed {
+                Tone::Error
+            } else {
+                Tone::Muted
+            },
+        )?;
         unsafe {
             let _ = EnableWindow(window.controls.apply, save_allowed);
             let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
@@ -249,13 +283,16 @@ impl SettingsWindow {
     }
 
     pub fn show_status(&self, text: &str, success: bool) -> Result<()> {
-        let message = if success {
-            format!("已应用：{text}")
-        } else {
-            text.to_owned()
-        };
-        let text = wide(&message);
-        unsafe { SetWindowTextW(self.controls.status, PCWSTR(text.as_ptr())) }
+        self.set_status(text, if success { Tone::Success } else { Tone::Error })
+    }
+
+    fn set_status(&self, text: &str, tone: Tone) -> Result<()> {
+        self.callback.status_tone.set(tone);
+        let text = wide(text);
+        unsafe {
+            SetWindowTextW(self.controls.status, PCWSTR(text.as_ptr()))?;
+        }
+        self.update_status_scrollbar()
     }
 
     /// The host commits Apply transactionally, then calls show_status. A failed
@@ -306,38 +343,33 @@ impl SettingsWindow {
         let check = WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32);
         let combo = WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32);
         let button = WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32);
+        self.controls.title = self.control(w!("STATIC"), "偏好设置", TITLE, label)?;
+        self.controls.subtitle =
+            self.control(w!("STATIC"), "自定义取色快捷键和复制方式", SUBTITLE, label)?;
         self.controls.hotkey_label = self.control(w!("STATIC"), "取色快捷键", 10, label)?;
-        self.controls.ctrl = self.control(w!("BUTTON"), "Ctrl(&T)", CTRL, check)?;
-        self.controls.alt = self.control(w!("BUTTON"), "Alt(&L)", ALT, check)?;
-        self.controls.shift = self.control(w!("BUTTON"), "Shift(&S)", SHIFT, check)?;
-        self.controls.key_label =
-            self.control(w!("STATIC"), "主键(&K)", 11, WINDOW_STYLE::default())?;
+        self.controls.ctrl = self.control(w!("BUTTON"), "Ctrl", CTRL, check)?;
+        self.controls.alt = self.control(w!("BUTTON"), "Alt", ALT, check)?;
+        self.controls.shift = self.control(w!("BUTTON"), "Shift", SHIFT, check)?;
+        self.controls.key_label = self.control(w!("STATIC"), "主键", 11, label)?;
         self.controls.key = self.control(w!("COMBOBOX"), "", KEY, combo)?;
         self.controls.hint = self.control(
             w!("STATIC"),
-            "至少选择 Ctrl 或 Alt。\r\n支持字母、数字和 F1–F11。",
+            "至少选择 Ctrl 或 Alt\r\n支持字母、数字和 F1–F11",
             12,
             label,
         )?;
-        self.controls.format_label = self.control(
-            w!("STATIC"),
-            "默认复制格式(&F)",
-            13,
-            WINDOW_STYLE::default(),
-        )?;
+        self.controls.copy_heading = self.control(w!("STATIC"), "复制行为", COPY_HEADING, label)?;
+        self.controls.format_label = self.control(w!("STATIC"), "默认格式", 13, label)?;
         self.controls.format = self.control(w!("COMBOBOX"), "", FORMAT, combo)?;
-        self.controls.auto_copy =
-            self.control(w!("BUTTON"), "取色后自动复制默认格式(&A)", AUTO_COPY, check)?;
-        self.controls.apply = self.control(w!("BUTTON"), "应用(&Y)", APPLY, button)?;
-        self.controls.close = self.control(w!("BUTTON"), "关闭(&C)", CLOSE, button)?;
+        self.controls.auto_copy = self.control(w!("BUTTON"), "取色后自动复制", AUTO_COPY, check)?;
         self.controls.status = self.control(
             w!("EDIT"),
             "",
-            14,
-            WS_TABSTOP
-                | WS_VSCROLL
-                | WINDOW_STYLE((ES_READONLY | ES_MULTILINE | ES_AUTOVSCROLL) as u32),
+            STATUS,
+            WS_TABSTOP | WINDOW_STYLE((ES_READONLY | ES_MULTILINE | ES_AUTOVSCROLL) as u32),
         )?;
+        self.controls.close = self.control(w!("BUTTON"), "关闭", CLOSE, button)?;
+        self.controls.apply = self.control(w!("BUTTON"), "应用", APPLY, button)?;
         for key in &self.keys {
             append_choice(self.controls.key, key)?;
         }
@@ -479,40 +511,42 @@ impl SettingsWindow {
     fn layout(&self) -> Result<()> {
         let dpi = self.dpi()?;
         if self.font.borrow().dpi != dpi {
-            let font = Font(unsafe {
-                CreateFontW(
-                    -dip(14, dpi),
-                    0,
-                    0,
-                    0,
-                    400,
-                    0,
-                    0,
-                    0,
-                    DEFAULT_CHARSET,
-                    OUT_DEFAULT_PRECIS,
-                    CLIP_DEFAULT_PRECIS,
-                    CLEARTYPE_QUALITY,
-                    0,
-                    w!("Segoe UI"),
-                )
-            });
-            if font.0.0.is_null() {
-                return Err(Error::new(E_FAIL, "Could not create settings font"));
-            }
+            let body = Font::new(14, dpi, 400, false)?;
+            let title = Font::new(20, dpi, 600, false)?;
+            let heading = Font::new(14, dpi, 600, false)?;
+            let small = Font::new(12, dpi, 400, false)?;
+            let small_line_height = font_line_height(self.controls.status, small.0, dpi);
             for hwnd in self.controls.handles() {
                 unsafe {
                     SendMessageW(
                         hwnd,
                         WM_SETFONT,
-                        Some(WPARAM(font.0.0 as usize)),
+                        Some(WPARAM(body.0.0 as usize)),
+                        Some(LPARAM(1)),
+                    );
+                }
+            }
+            for (hwnd, font) in [
+                (self.controls.title, title.0),
+                (self.controls.hotkey_label, heading.0),
+                (self.controls.copy_heading, heading.0),
+                (self.controls.subtitle, small.0),
+                (self.controls.hint, small.0),
+                (self.controls.status, small.0),
+            ] {
+                unsafe {
+                    SendMessageW(
+                        hwnd,
+                        WM_SETFONT,
+                        Some(WPARAM(font.0 as usize)),
                         Some(LPARAM(1)),
                     );
                 }
             }
             let old = self.font.replace(FontState {
                 dpi,
-                _font: Some(font),
+                small_line_height,
+                _fonts: vec![body, title, heading, small],
             });
             drop(old);
         }
@@ -526,19 +560,61 @@ impl SettingsWindow {
                 true,
             )
         };
-        place(self.controls.hotkey_label, 20, 20, 500, 24)?;
-        place(self.controls.ctrl, 20, 54, 92, 28)?;
-        place(self.controls.alt, 124, 54, 92, 28)?;
-        place(self.controls.shift, 228, 54, 104, 28)?;
-        place(self.controls.key_label, 20, 106, 76, 26)?;
-        place(self.controls.key, 100, 100, 180, 230)?;
-        place(self.controls.hint, 300, 100, 240, 48)?;
-        place(self.controls.format_label, 20, 166, 170, 26)?;
-        place(self.controls.format, 200, 160, 180, 160)?;
-        place(self.controls.auto_copy, 20, 214, 520, 28)?;
-        place(self.controls.apply, 20, 264, 120, 34)?;
-        place(self.controls.close, 154, 264, 120, 34)?;
-        place(self.controls.status, 20, 316, 520, 72)?;
+        place(self.controls.title, 24, 22, 432, 30)?;
+        place(self.controls.subtitle, 24, 58, 432, 20)?;
+        place(self.controls.hotkey_label, 40, 104, 396, 24)?;
+        place(self.controls.ctrl, 40, 136, 88, 26)?;
+        place(self.controls.alt, 140, 136, 88, 26)?;
+        place(self.controls.shift, 240, 136, 100, 26)?;
+        place(self.controls.key_label, 40, 183, 48, 24)?;
+        place(self.controls.key, 92, 176, 120, 210)?;
+        place(self.controls.hint, 228, 176, 212, 40)?;
+        place(self.controls.copy_heading, 40, 260, 396, 24)?;
+        place(self.controls.format_label, 40, 297, 108, 24)?;
+        place(self.controls.format, 156, 290, 180, 160)?;
+        place(self.controls.auto_copy, 40, 330, 396, 26)?;
+        place(self.controls.status, 24, 376, 432, 32)?;
+        place(self.controls.close, 264, 420, 88, 36)?;
+        place(self.controls.apply, 364, 420, 92, 36)?;
+        for hwnd in [self.controls.key, self.controls.format] {
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    CB_SETITEMHEIGHT,
+                    Some(WPARAM(usize::MAX)),
+                    Some(LPARAM(dip(24, dpi) as isize)),
+                );
+                SendMessageW(
+                    hwnd,
+                    CB_SETITEMHEIGHT,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(dip(24, dpi) as isize)),
+                );
+            }
+        }
+        self.update_status_scrollbar()?;
+        let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+        Ok(())
+    }
+
+    fn update_status_scrollbar(&self) -> Result<()> {
+        let line_height = self.font.borrow().small_line_height.max(1);
+        // Measure wrapping at the full width. Long errors can scroll, while the
+        // usual short hint remains a quiet, borderless line without a scrollbar.
+        unsafe {
+            ShowScrollBar(self.controls.status, SB_VERT, false)?;
+        }
+        let mut client = RECT::default();
+        unsafe {
+            GetClientRect(self.controls.status, &mut client)?;
+        }
+        let lines = unsafe { SendMessageW(self.controls.status, EM_GETLINECOUNT, None, None) }.0;
+        let visible_lines = ((client.bottom - client.top) / line_height).max(1);
+        if lines > visible_lines as isize {
+            unsafe {
+                ShowScrollBar(self.controls.status, SB_VERT, true)?;
+            }
+        }
         Ok(())
     }
 
@@ -570,6 +646,31 @@ impl Drop for SettingsWindow {
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
+}
+
+fn font_line_height(hwnd: HWND, font: HFONT, dpi: u32) -> i32 {
+    let dc = unsafe { GetDC(Some(hwnd)) };
+    if dc.is_invalid() {
+        return dip(16, dpi).max(1);
+    }
+    let old = unsafe { SelectObject(dc, HGDIOBJ(font.0)) };
+    if old.is_invalid() {
+        unsafe {
+            ReleaseDC(Some(hwnd), dc);
+        }
+        return dip(16, dpi).max(1);
+    }
+    let mut metric = TEXTMETRICW::default();
+    let measured = unsafe { GetTextMetricsW(dc, &mut metric) }.as_bool();
+    unsafe {
+        SelectObject(dc, old);
+        ReleaseDC(Some(hwnd), dc);
+    }
+    if measured {
+        metric.tmHeight.max(1)
+    } else {
+        dip(16, dpi).max(1)
+    }
 }
 
 fn key_choices() -> Vec<String> {
@@ -648,6 +749,25 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     };
     match message {
+        WM_PAINT => state.theme.paint(hwnd, &PANELS),
+        WM_ERASEBKGND => LRESULT(1),
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
+            let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut _)) } as usize;
+            let (panel, tone) = match id {
+                TITLE => (false, Tone::Text),
+                SUBTITLE => (false, Tone::Muted),
+                STATUS => (false, state.status_tone.get()),
+                10 => (true, Tone::Accent),
+                12 => (true, Tone::Muted),
+                APPLY | CLOSE => (false, Tone::Text),
+                _ => (true, Tone::Text),
+            };
+            state
+                .theme
+                .control_color(HDC(wparam.0 as *mut _), panel, tone)
+        }
+        WM_NOTIFY => theme::custom_draw(lparam, APPLY)
+            .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }),
         WM_CLOSE => {
             state.queue(|pending| pending.close = true);
             LRESULT(0)

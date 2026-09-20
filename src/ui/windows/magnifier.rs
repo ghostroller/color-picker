@@ -23,10 +23,11 @@ use windows::{
     core::{BOOL, Error, Result, w},
 };
 
-use super::drawing::{PaintSession, dip};
+use super::drawing::{OwnedFont, PaintSession, dip, draw_text, palette};
 use crate::{
     app::diagnostics,
     core::{
+        color::Rgb8,
         format::{ColorFormat, format_color},
         geometry::{ScreenPointPx, ScreenRectPx},
         state::{PickedColor, SampleKind},
@@ -43,31 +44,39 @@ struct State {
     bounds: Option<ScreenRectPx>,
     visible: bool,
     hover: Option<SourcePixel>,
-    lines: [Vec<u16>; 2],
+    footer: Footer,
     paint_error: Option<Error>,
     layout_invalidated: bool,
+}
+
+#[derive(Default)]
+struct Footer {
+    rgb: Option<Rgb8>,
+    hex: Vec<u16>,
+    coordinates: Vec<u16>,
+    help: Vec<u16>,
+    scale: Vec<u16>,
 }
 
 impl State {
     fn refresh_text(&mut self) {
         let factor = self.view.as_ref().map_or(4, |view| view.scale().factor());
-        let detail = self.hover.map_or_else(
-            || "移动到像素格内选择".to_owned(),
+        let (hex, coordinates) = self.hover.map_or_else(
+            || ("选择像素".to_owned(), "移动到像素格内".to_owned()),
             |pixel| {
-                format!(
-                    "{}  X: {}  Y: {}",
+                (
                     format_color(pixel.rgb, ColorFormat::Hex),
-                    pixel.source.x,
-                    pixel.source.y
+                    format!("X {}   Y {}", pixel.source.x, pixel.source.y),
                 )
             },
         );
-        self.lines = [
-            detail.encode_utf16().collect(),
-            format!("{factor}×  滚轮缩放 · Esc / 右键取消")
-                .encode_utf16()
-                .collect(),
-        ];
+        self.footer = Footer {
+            rgb: self.hover.map(|pixel| pixel.rgb),
+            hex: hex.encode_utf16().collect(),
+            coordinates: coordinates.encode_utf16().collect(),
+            help: "左键取色 · 滚轮缩放 · Esc 取消".encode_utf16().collect(),
+            scale: format!("{factor}×").encode_utf16().collect(),
+        };
     }
 
     fn check(&mut self) -> Result<()> {
@@ -406,7 +415,7 @@ fn window_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> L
                 if let Ok(mut state) = state.try_borrow_mut()
                     && let (Some(surface), Some(view), Some(bounds)) =
                         (&state.surface, &state.view, state.bounds)
-                    && let Err(error) = surface.draw(paint.dc, view, bounds, &state.lines)
+                    && let Err(error) = surface.draw(paint.dc, view, bounds, &state.footer)
                 {
                     state.paint_error = Some(error);
                 }
@@ -439,12 +448,6 @@ impl Drop for OwnedBitmap {
         let _ = unsafe { DeleteObject(self.0.into()) };
     }
 }
-struct OwnedFont(HFONT);
-impl Drop for OwnedFont {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteObject(self.0.into()) };
-    }
-}
 struct ScreenDc(HDC);
 impl Drop for ScreenDc {
     fn drop(&mut self) {
@@ -455,9 +458,10 @@ impl Drop for ScreenDc {
 struct Surface {
     dc: MemoryDc,
     _bitmap: OwnedBitmap,
-    _font: OwnedFont,
+    heading_font: OwnedFont,
+    body_font: OwnedFont,
+    help_font: OwnedFont,
     old_bitmap: HGDIOBJ,
-    old_font: HGDIOBJ,
     width: i32,
     height: i32,
     dpi: u32,
@@ -477,42 +481,20 @@ impl Surface {
         if bitmap.0.is_invalid() {
             return Err(failure("Could not create magnifier buffer"));
         }
-        let font = OwnedFont(unsafe {
-            CreateFontW(
-                -dip(14, dpi),
-                0,
-                0,
-                0,
-                400,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                0,
-                w!("Segoe UI"),
-            )
-        });
-        if font.0.is_invalid() {
-            return Err(failure("Could not create magnifier font"));
-        }
+        let heading_font = OwnedFont::new(18, 600, dpi)?;
+        let body_font = OwnedFont::new(12, 400, dpi)?;
+        let help_font = OwnedFont::new(11, 400, dpi)?;
         let old_bitmap = unsafe { SelectObject(dc.0, bitmap.0.into()) };
         if old_bitmap.is_invalid() {
             return Err(failure("Could not select magnifier bitmap"));
         }
-        let old_font = unsafe { SelectObject(dc.0, font.0.into()) };
-        if old_font.is_invalid() {
-            let _ = unsafe { SelectObject(dc.0, old_bitmap) };
-            return Err(failure("Could not select magnifier font"));
-        }
         Ok(Self {
             dc,
             _bitmap: bitmap,
-            _font: font,
+            heading_font,
+            body_font,
+            help_font,
             old_bitmap,
-            old_font,
             width,
             height,
             dpi,
@@ -524,7 +506,7 @@ impl Surface {
         target: HDC,
         view: &ZoomView,
         bounds: ScreenRectPx,
-        lines: &[Vec<u16>; 2],
+        footer: &Footer,
     ) -> Result<()> {
         self.fill(
             RECT {
@@ -533,11 +515,32 @@ impl Surface {
                 right: self.width,
                 bottom: self.height,
             },
-            COLORREF(0x00202020),
+            palette::BACKGROUND,
         )?;
         let image = view.image();
         let source = view.source_view();
         let drawn = local_rect(view.drawn_rect(), bounds);
+        let viewport = local_rect(view.viewport(), bounds);
+        // Borders stay outside the viewport. Snapshot scaling, the integer grid
+        // and the contrasting selection frame below retain their exact geometry.
+        self.frame(
+            RECT {
+                left: 0,
+                top: 0,
+                right: self.width,
+                bottom: self.height,
+            },
+            palette::BORDER,
+        )?;
+        self.frame(
+            RECT {
+                left: viewport.left - 1,
+                top: viewport.top - 1,
+                right: viewport.right + 1,
+                bottom: viewport.bottom + 1,
+            },
+            palette::BORDER,
+        )?;
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -623,26 +626,7 @@ impl Surface {
                 COLORREF(0x00ffffff),
             )?;
         }
-        if unsafe { SetBkMode(self.dc.0, TRANSPARENT) } == 0
-            || unsafe { SetTextColor(self.dc.0, COLORREF(0x00ffffff)) }.0 == CLR_INVALID
-        {
-            return Err(failure("Could not configure magnifier text"));
-        }
-        let footer_top = view.viewport().bottom - bounds.top + dip(8, self.dpi);
-        for (index, text) in lines.iter().enumerate() {
-            if !unsafe {
-                TextOutW(
-                    self.dc.0,
-                    dip(8, self.dpi),
-                    footer_top + dip(index as i32 * 22, self.dpi),
-                    text,
-                )
-            }
-            .as_bool()
-            {
-                return Err(failure("Could not draw magnifier text"));
-            }
-        }
+        self.draw_footer(viewport.bottom, footer)?;
         unsafe {
             BitBlt(
                 target,
@@ -658,6 +642,106 @@ impl Surface {
         }
     }
 
+    fn draw_footer(&self, top: i32, footer: &Footer) -> Result<()> {
+        let pad = dip(12, self.dpi);
+        self.fill(
+            RECT {
+                left: 1,
+                top: top + dip(7, self.dpi),
+                right: self.width - 1,
+                bottom: self.height - 1,
+            },
+            palette::PANEL,
+        )?;
+        self.fill(
+            RECT {
+                left: pad,
+                top: top + dip(7, self.dpi),
+                right: self.width - pad,
+                bottom: top + dip(8, self.dpi),
+            },
+            palette::BORDER,
+        )?;
+        let swatch = RECT {
+            left: pad,
+            top: top + dip(15, self.dpi),
+            right: dip(48, self.dpi).min(self.width - pad),
+            bottom: top + dip(51, self.dpi),
+        };
+        if swatch.right > swatch.left {
+            self.fill(swatch, palette::SWATCH_BORDER)?;
+            let inset = dip(2, self.dpi).max(1);
+            let interior = RECT {
+                left: swatch.left + inset,
+                top: swatch.top + inset,
+                right: swatch.right - inset,
+                bottom: swatch.bottom - inset,
+            };
+            if interior.right > interior.left {
+                self.fill(
+                    interior,
+                    footer.rgb.map_or(palette::EMPTY, |rgb| {
+                        COLORREF(
+                            u32::from(rgb.r) | (u32::from(rgb.g) << 8) | (u32::from(rgb.b) << 16),
+                        )
+                    }),
+                )?;
+            }
+        }
+        let right = self.width - pad;
+        draw_text(
+            self.dc.0,
+            &self.heading_font,
+            RECT {
+                left: dip(60, self.dpi),
+                top: top + dip(12, self.dpi),
+                right: dip(152, self.dpi).min(right),
+                bottom: top + dip(36, self.dpi),
+            },
+            palette::TEXT,
+            &footer.hex,
+        )?;
+        draw_text(
+            self.dc.0,
+            &self.body_font,
+            RECT {
+                left: dip(160, self.dpi),
+                top: top + dip(17, self.dpi),
+                right,
+                bottom: top + dip(35, self.dpi),
+            },
+            palette::SECONDARY,
+            &footer.coordinates,
+        )?;
+        let badge_width = dip(38, self.dpi);
+        let badge_left = (right - badge_width).max(dip(60, self.dpi));
+        draw_text(
+            self.dc.0,
+            &self.help_font,
+            RECT {
+                left: dip(60, self.dpi),
+                top: top + dip(39, self.dpi),
+                right: badge_left - dip(6, self.dpi),
+                bottom: top + dip(55, self.dpi),
+            },
+            palette::MUTED,
+            &footer.help,
+        )?;
+        draw_text(
+            self.dc.0,
+            &self.body_font,
+            RECT {
+                left: badge_left,
+                top: top + dip(38, self.dpi),
+                right,
+                bottom: top + dip(56, self.dpi),
+            },
+            palette::ACCENT,
+            &footer.scale,
+        )?;
+        Ok(())
+    }
+
     fn brush(&self, color: COLORREF) -> Result<HBRUSH> {
         let brush = HBRUSH(unsafe { GetStockObject(DC_BRUSH) }.0);
         if brush.is_invalid() || unsafe { SetDCBrushColor(self.dc.0, color) }.0 == CLR_INVALID {
@@ -666,6 +750,11 @@ impl Surface {
         Ok(brush)
     }
     fn fill(&self, rect: RECT, color: COLORREF) -> Result<()> {
+        // Very small work areas keep the existing minimum pixel viewport; its
+        // footer may have no room for decoration or text.
+        if rect.right <= rect.left || rect.bottom <= rect.top {
+            return Ok(());
+        }
         if unsafe { FillRect(self.dc.0, &rect, self.brush(color)?) } == 0 {
             Err(failure("Could not fill magnifier buffer"))
         } else {
@@ -684,7 +773,6 @@ impl Surface {
 impl Drop for Surface {
     fn drop(&mut self) {
         unsafe {
-            SelectObject(self.dc.0, self.old_font);
             SelectObject(self.dc.0, self.old_bitmap);
         }
     }

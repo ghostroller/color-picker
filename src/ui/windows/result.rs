@@ -13,8 +13,8 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{
-            E_FAIL, ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT,
-            POINT, RECT, SetLastError, WPARAM,
+            COLORREF, E_FAIL, ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND,
+            LPARAM, LRESULT, POINT, RECT, SetLastError, WPARAM,
         },
         Graphics::{
             Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute},
@@ -22,9 +22,10 @@ use windows::{
         },
         System::{
             LibraryLoader::GetModuleHandleW,
-            SystemServices::{SS_BITMAP, SS_CENTERIMAGE, SS_NOPREFIX},
+            SystemServices::{SS_NOPREFIX, SS_OWNERDRAW},
         },
         UI::{
+            Controls::DRAWITEMSTRUCT,
             HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
             Input::KeyboardAndMouse::SetFocus,
             WindowsAndMessaging::*,
@@ -33,7 +34,10 @@ use windows::{
     core::{BOOL, Error, PCWSTR, Result, w},
 };
 
-use super::drawing::dip;
+use super::{
+    drawing::dip,
+    theme::{self, Font, Theme, Tone},
+};
 use crate::{
     core::{
         format::{ColorFormat, format_color},
@@ -50,10 +54,43 @@ const PICK_AGAIN: usize = 200;
 const COPY_ROW: usize = 100;
 const RETRY_MS: u32 = 50;
 const MAX_RETRIES: u8 = 3;
-const CLIENT_WIDTH: i32 = 624;
-const CLIENT_HEIGHT: i32 = 366;
-const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
+const CLIENT_WIDTH: i32 = 500;
+const CLIENT_HEIGHT: i32 = 416;
+const STYLE: WINDOW_STYLE =
+    WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0);
 const EX_STYLE: WINDOW_EX_STYLE = WINDOW_EX_STYLE(WS_EX_APPWINDOW.0 | WS_EX_CONTROLPARENT.0);
+const PANELS: [RECT; 5] = [
+    RECT {
+        left: 24,
+        top: 24,
+        right: 476,
+        bottom: 120,
+    },
+    RECT {
+        left: 24,
+        top: 136,
+        right: 476,
+        bottom: 174,
+    },
+    RECT {
+        left: 24,
+        top: 180,
+        right: 476,
+        bottom: 218,
+    },
+    RECT {
+        left: 24,
+        top: 224,
+        right: 476,
+        bottom: 262,
+    },
+    RECT {
+        left: 24,
+        top: 268,
+        right: 476,
+        bottom: 306,
+    },
+];
 static NEXT_COPY_TOKEN: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +112,9 @@ struct Pending {
 struct CallbackState {
     notify_hwnd: HWND,
     default_format: ColorFormat,
+    theme: Theme,
+    swatch_color: COLORREF,
+    status_tone: Cell<Tone>,
     pending: Cell<Pending>,
     wake_posted: Cell<bool>,
     wake_failed: Cell<bool>,
@@ -111,6 +151,8 @@ struct Row {
 #[derive(Default)]
 struct Controls {
     swatch: HWND,
+    hero_caption: HWND,
+    hero_hex: HWND,
     source: HWND,
     rows: [Row; 4],
     default_copy: HWND,
@@ -123,6 +165,8 @@ impl Controls {
     fn handles(&self) -> impl Iterator<Item = HWND> + '_ {
         [
             self.swatch,
+            self.hero_caption,
+            self.hero_hex,
             self.source,
             self.default_copy,
             self.pick_again,
@@ -142,21 +186,9 @@ impl Controls {
 struct Resources {
     dpi: u32,
     _font: Option<Font>,
-    _bitmap: Option<Bitmap>,
-}
-
-struct Font(HFONT);
-impl Drop for Font {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteObject(HGDIOBJ(self.0.0)) };
-    }
-}
-
-struct Bitmap(HBITMAP);
-impl Drop for Bitmap {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteObject(HGDIOBJ(self.0.0)) };
-    }
+    _small_font: Option<Font>,
+    _value_font: Option<Font>,
+    _hero_font: Option<Font>,
 }
 
 #[derive(Clone, Copy)]
@@ -221,7 +253,6 @@ impl ResultWindow {
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
             hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
-            hbrBackground: unsafe { GetSysColorBrush(COLOR_WINDOW) },
             lpszClassName: CLASS,
             ..Default::default()
         };
@@ -233,6 +264,13 @@ impl ResultWindow {
         let callback = Box::new(CallbackState {
             notify_hwnd,
             default_format,
+            theme: Theme::new()?,
+            swatch_color: COLORREF(
+                u32::from(picked.rgb.r)
+                    | (u32::from(picked.rgb.g) << 8)
+                    | (u32::from(picked.rgb.b) << 16),
+            ),
+            status_tone: Cell::new(Tone::Muted),
             pending: Cell::new(Pending::default()),
             wake_posted: Cell::new(false),
             wake_failed: Cell::new(false),
@@ -268,6 +306,7 @@ impl ResultWindow {
             copy: RefCell::new(CopyState::default()),
             _thread_affinity: PhantomData,
         };
+        theme::configure_window(hwnd);
         // Pick Again can start sampling immediately after this owner is
         // dropped. Do not leave animated result-window pixels in composition.
         let disable_transitions = BOOL::from(true);
@@ -353,9 +392,23 @@ impl ResultWindow {
     fn create_controls(&mut self) -> Result<()> {
         self.controls.swatch = self.control(
             w!("STATIC"),
-            "",
+            "已选颜色色块",
             10,
-            WINDOW_STYLE(SS_BITMAP.0 | SS_CENTERIMAGE.0),
+            WINDOW_STYLE(SS_OWNERDRAW.0),
+            WINDOW_EX_STYLE::default(),
+        )?;
+        self.controls.hero_caption = self.control(
+            w!("STATIC"),
+            "已选颜色",
+            13,
+            WINDOW_STYLE(SS_NOPREFIX.0),
+            WINDOW_EX_STYLE::default(),
+        )?;
+        self.controls.hero_hex = self.control(
+            w!("STATIC"),
+            &format_color(self.picked.rgb, ColorFormat::Hex),
+            14,
+            WINDOW_STYLE(SS_NOPREFIX.0),
             WINDOW_EX_STYLE::default(),
         )?;
         let source = match self.picked.kind {
@@ -365,7 +418,7 @@ impl ResultWindow {
         self.controls.source = self.control(
             w!("STATIC"),
             &format!(
-                "来源：{source}\r\n原始坐标：X {}，Y {}",
+                "{source}  ·  X {}  Y {}",
                 self.picked.source.x, self.picked.source.y
             ),
             11,
@@ -386,7 +439,7 @@ impl ResultWindow {
                     &format_color(self.picked.rgb, format),
                     30 + index,
                     WS_TABSTOP | WINDOW_STYLE((ES_READONLY | ES_AUTOHSCROLL | ES_NOHIDESEL) as u32),
-                    WS_EX_CLIENTEDGE,
+                    WINDOW_EX_STYLE::default(),
                 )?,
                 copy: self.control(
                     w!("BUTTON"),
@@ -399,28 +452,28 @@ impl ResultWindow {
         }
         self.controls.default_copy = self.control(
             w!("BUTTON"),
-            &format!("复制默认格式（{}）", self.callback.default_format.label()),
+            &format!("复制 {}", self.callback.default_format.label()),
             COPY_DEFAULT,
             WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
             WINDOW_EX_STYLE::default(),
         )?;
         self.controls.pick_again = self.control(
             w!("BUTTON"),
-            "重新取色(&P)",
+            "重新取色",
             PICK_AGAIN,
             WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
             WINDOW_EX_STYLE::default(),
         )?;
         self.controls.close = self.control(
             w!("BUTTON"),
-            "关闭(&C)",
+            "关闭",
             CLOSE,
             WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
             WINDOW_EX_STYLE::default(),
         )?;
         self.controls.status = self.control(
             w!("STATIC"),
-            "点击复制按钮，或选中文本后按 Ctrl+C。",
+            "点击复制，或选中文本按 Ctrl+C。",
             12,
             WINDOW_STYLE(SS_NOPREFIX.0),
             WINDOW_EX_STYLE::default(),
@@ -549,54 +602,30 @@ impl ResultWindow {
                 true,
             )
         };
-        place(self.controls.swatch, 20, 20, 56, 56)?;
-        place(self.controls.source, 92, 24, 510, 48)?;
+        place(self.controls.swatch, 40, 40, 64, 64)?;
+        place(self.controls.hero_caption, 128, 38, 328, 17)?;
+        place(self.controls.hero_hex, 126, 54, 330, 35)?;
+        place(self.controls.source, 128, 91, 328, 18)?;
         for (index, row) in self.controls.rows.iter().enumerate() {
-            let y = 98 + index as i32 * 42;
-            place(row.label, 20, y + 6, 76, 26)?;
-            place(row.edit, 100, y, 374, 30)?;
-            place(row.copy, 488, y, 116, 30)?;
+            let y = 136 + index as i32 * 44;
+            place(row.label, 40, y + 11, 68, 18)?;
+            place(row.edit, 118, y + 9, 264, 22)?;
+            place(row.copy, 394, y + 6, 68, 26)?;
         }
-        place(self.controls.default_copy, 20, 278, 184, 34)?;
-        place(self.controls.pick_again, 218, 278, 150, 34)?;
-        place(self.controls.close, 382, 278, 104, 34)?;
-        place(self.controls.status, 20, 326, 584, 32)?;
+        place(self.controls.default_copy, 24, 320, 192, 38)?;
+        place(self.controls.pick_again, 228, 320, 146, 38)?;
+        place(self.controls.close, 386, 320, 90, 38)?;
+        place(self.controls.status, 24, 370, 452, 30)?;
+        let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
         Ok(())
     }
 
     fn update_resources(&self, dpi: u32) -> Result<()> {
-        let font = Font(unsafe {
-            CreateFontW(
-                -dip(14, dpi),
-                0,
-                0,
-                0,
-                400,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                0,
-                w!("Segoe UI"),
-            )
-        });
-        if font.0.0.is_null() {
-            return Err(Error::new(E_FAIL, "Could not create result font"));
-        }
-        let size = dip(56, dpi);
-        let rgb = self.picked.rgb;
-        // Zero alpha avoids the STATIC control making an alpha-converted copy.
-        let pixel = u32::from(rgb.b) | (u32::from(rgb.g) << 8) | (u32::from(rgb.r) << 16);
-        let pixels = vec![pixel; size as usize * size as usize];
-        let bitmap =
-            Bitmap(unsafe { CreateBitmap(size, size, 1, 32, Some(pixels.as_ptr().cast())) });
-        if bitmap.0.0.is_null() {
-            return Err(Error::new(E_FAIL, "Could not create result swatch"));
-        }
-        for hwnd in self.controls.handles() {
+        let font = Font::new(14, dpi, 400, false)?;
+        let small_font = Font::new(12, dpi, 400, false)?;
+        let value_font = Font::new(14, dpi, 400, true)?;
+        let hero_font = Font::new(28, dpi, 600, true)?;
+        let set_font = |hwnd, font: &Font| {
             unsafe {
                 SendMessageW(
                     hwnd,
@@ -605,19 +634,30 @@ impl ResultWindow {
                     Some(LPARAM(1)),
                 )
             };
+        };
+        for hwnd in self.controls.handles() {
+            set_font(hwnd, &font);
         }
-        unsafe {
-            SendMessageW(
-                self.controls.swatch,
-                STM_SETIMAGE,
-                Some(WPARAM(IMAGE_BITMAP.0 as usize)),
-                Some(LPARAM(bitmap.0.0 as isize)),
-            );
+        for hwnd in [
+            self.controls.hero_caption,
+            self.controls.source,
+            self.controls.status,
+        ] {
+            set_font(hwnd, &small_font);
         }
+        for row in self.controls.rows {
+            set_font(row.label, &small_font);
+            set_font(row.edit, &value_font);
+        }
+        set_font(self.controls.hero_hex, &hero_font);
+        // All controls now borrow the new handles, so previous DPI fonts can
+        // be released without retaining a RefCell borrow across window messages.
         let old = self.resources.replace(Resources {
             dpi,
             _font: Some(font),
-            _bitmap: Some(bitmap),
+            _small_font: Some(small_font),
+            _value_font: Some(value_font),
+            _hero_font: Some(hero_font),
         });
         drop(old);
         Ok(())
@@ -654,7 +694,8 @@ impl ResultWindow {
         }
     }
 
-    fn status(&self, text: &str) -> Result<()> {
+    fn status(&self, text: &str, tone: Tone) -> Result<()> {
+        self.callback.status_tone.set(tone);
         let text = wide(text);
         unsafe { SetWindowTextW(self.controls.status, PCWSTR(text.as_ptr())) }
     }
@@ -679,7 +720,10 @@ impl ResultWindow {
         match Clipboard::copy_text(self.hwnd, &text) {
             Ok(()) => {
                 self.copy.borrow_mut().0 = None;
-                self.status(&format!("已复制 {}：{text}", request.format.label()))
+                self.status(
+                    &format!("已复制 {}：{text}", request.format.label()),
+                    Tone::Success,
+                )
             }
             Err(ClipboardError::Busy) => {
                 let retry = self.copy.borrow_mut().reserve_retry(token);
@@ -690,17 +734,18 @@ impl ResultWindow {
                     let timer = next_copy_token()?;
                     if unsafe { SetTimer(Some(self.hwnd), timer, RETRY_MS, None) } == 0 {
                         self.copy.borrow_mut().0 = None;
-                        return self.status("剪贴板被占用，无法安排重试。请再次点击复制。");
+                        return self
+                            .status("剪贴板被占用，无法安排重试。请再次点击复制。", Tone::Error);
                     }
                     self.callback.active_timer.set(timer);
-                    self.status("剪贴板被占用，正在重试…")
+                    self.status("剪贴板被占用，正在重试…", Tone::Muted)
                 } else {
-                    self.status("复制失败：剪贴板仍被占用。请再次点击复制。")
+                    self.status("复制失败：剪贴板仍被占用。请再次点击复制。", Tone::Error)
                 }
             }
             Err(ClipboardError::Other(error)) => {
                 self.copy.borrow_mut().0 = None;
-                self.status(&format!("复制失败：{error}"))
+                self.status(&format!("复制失败：{error}"), Tone::Error)
             }
         }
     }
@@ -710,7 +755,7 @@ impl Drop for ResultWindow {
     fn drop(&mut self) {
         self.callback.closing.set(true);
         self.cancel_copy();
-        // Child controls release their borrowed font/bitmap before these fields
+        // Child controls release their borrowed fonts before these fields
         // and callback userdata are dropped. Only the owner destroys the HWND.
         let _ = unsafe { DestroyWindow(self.hwnd) };
     }
@@ -726,6 +771,36 @@ fn next_copy_token() -> Result<usize> {
             value.checked_add(1)
         })
         .map_err(|_| Error::new(E_FAIL, "Clipboard retry token exhausted"))
+}
+
+fn draw_swatch(lparam: LPARAM, color: COLORREF) -> LRESULT {
+    let Some(draw) = (unsafe { (lparam.0 as *const DRAWITEMSTRUCT).as_ref() }) else {
+        return LRESULT(0);
+    };
+    let hdc = draw.hDC;
+    let saved = unsafe { SaveDC(hdc) };
+    if saved == 0 {
+        return LRESULT(0);
+    }
+    let dpi = unsafe { GetDpiForWindow(draw.hwndItem) }.max(96);
+    unsafe {
+        FillRect(hdc, &draw.rcItem, HBRUSH(GetStockObject(WHITE_BRUSH).0));
+        SelectObject(hdc, GetStockObject(DC_BRUSH));
+        SelectObject(hdc, GetStockObject(DC_PEN));
+        SetDCBrushColor(hdc, color);
+        SetDCPenColor(hdc, COLORREF(0x00f0e8e2));
+        let _ = RoundRect(
+            hdc,
+            draw.rcItem.left,
+            draw.rcItem.top,
+            draw.rcItem.right,
+            draw.rcItem.bottom,
+            dip(12, dpi),
+            dip(12, dpi),
+        );
+        let _ = RestoreDC(hdc, saved);
+    }
+    LRESULT(1)
 }
 
 unsafe extern "system" fn window_proc(
@@ -756,6 +831,28 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     };
     match message {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => state.theme.paint(hwnd, &PANELS),
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {
+            let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut _)) } as usize;
+            let panel = matches!(id, 10 | 11 | 13 | 14)
+                || (20..24).contains(&id)
+                || (30..34).contains(&id)
+                || (COPY_ROW..COPY_ROW + 4).contains(&id);
+            let tone = if id == 12 {
+                state.status_tone.get()
+            } else if matches!(id, 11 | 13) || (20..24).contains(&id) {
+                Tone::Muted
+            } else {
+                Tone::Text
+            };
+            state
+                .theme
+                .control_color(HDC(wparam.0 as *mut _), panel, tone)
+        }
+        WM_NOTIFY => theme::custom_draw(lparam, COPY_DEFAULT)
+            .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }),
+        WM_DRAWITEM if wparam.0 == 10 => draw_swatch(lparam, state.swatch_color),
         WM_CLOSE => {
             state.queue(|pending| pending.action = Some(ResultAction::Close));
             LRESULT(0)
