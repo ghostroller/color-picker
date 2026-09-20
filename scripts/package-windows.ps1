@@ -1,13 +1,16 @@
 [CmdletBinding()]
 param(
     # Use only after verify-windows.ps1 passed for these same sources/toolchain.
-    [switch] $SkipChecks
+    [switch] $SkipChecks,
+    # Optional machine-readable output for the installer and CI; never scrape console text.
+    [string] $OutputManifestPath
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if ($env:OS -ne 'Windows_NT') { throw 'Packaging requires Windows x64 and the MSVC toolchain.' }
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+if ($OutputManifestPath) { $OutputManifestPath = [IO.Path]::GetFullPath($OutputManifestPath) }
 Push-Location -LiteralPath $repositoryRoot
 try {
     if (-not $SkipChecks) { & (Join-Path $PSScriptRoot 'verify-windows.ps1') }
@@ -34,13 +37,13 @@ try {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'LICENSE-STATUS.md') -Destination $package
     $docs = Join-Path $package 'docs'
     New-Item -ItemType Directory -Path $docs | Out-Null
-    foreach ($name in @('validation.md', 'known-limitations.md', 'resource-probe.md', 'performance-running-app.md', 'ui-preview.md')) {
+    foreach ($name in @('validation.md', 'known-limitations.md', 'resource-probe.md', 'performance-running-app.md', 'ui-preview.md', 'windows-installer.md', 'ci-packaging.md')) {
         Copy-Item -LiteralPath (Join-Path $repositoryRoot "docs/$name") -Destination $docs
     }
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'docs/measurements') -Destination $docs -Recurse
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'docs/images') -Destination $docs -Recurse
     $readme = @'
-# color-picker 0.1.0 本地预览版（Windows x64）
+# color-picker __VERSION__ 预览版（Windows x64）
 
 解压后双击 color-picker.exe；默认 Ctrl + Alt + C 或托盘开始取色。
 左键确认，右键 / Esc 取消，滚轮向上冻结放大、向下缩小；缩出 4× 返回实时。
@@ -50,7 +53,8 @@ try {
 主键点击后按 A–Z / 0–9 / F1–F11 录入；Esc 或离开该控件取消监听。
 “取色外观”可调节边框粗细（0–6 DIP）与背景透明度（0–80%），默认 2 DIP / 35%。
 点击“应用”后，下次取色生效并在重启后保留；0 DIP 隐藏边框，0% 为不透明背景。
-退出请使用托盘菜单。应用无需管理员权限，不包含开机启动或后台网络功能。
+退出请使用托盘菜单。应用无需管理员权限，没有后台网络功能。
+便携 ZIP 不注册启动项；安装版可选择登录 Windows 时自动启动，详见 docs/windows-installer.md。
 
 日志：先退出旧实例，在 PowerShell 中运行：
 `.\color-picker.exe --log-file .\color-picker.log`
@@ -63,6 +67,7 @@ try {
 build-info.json 记录源码、工具链和 EXE 校验值，包外 .sha256 校验 ZIP。
 licenses/ 与 THIRD-PARTY-NOTICES.md 提供依赖许可；项目许可状态见 LICENSE-STATUS.md。
 '@
+    $readme = $readme.Replace('__VERSION__', $project.version)
     Set-Content -LiteralPath (Join-Path $package 'README.md') -Value $readme -Encoding UTF8
     $licenses = Join-Path $package 'licenses'
     New-Item -ItemType Directory -Path $licenses | Out-Null
@@ -118,5 +123,15 @@ licenses/ 与 THIRD-PARTY-NOTICES.md 提供依赖许可；项目许可状态见 
     Set-Content -LiteralPath "$zip.sha256" -Value "$hash  $packageName.zip" -Encoding ASCII
     Write-Host "Package: $zip"
     Write-Host "SHA256:  $hash"
+    if ($OutputManifestPath) {
+        [ordered]@{
+            version = $project.version
+            source_commit = $commit
+            source_dirty = ($changes.Count -ne 0)
+            package_directory = $package
+            archive_path = $zip
+            archive_sha256_path = "$zip.sha256"
+        } | ConvertTo-Json | Set-Content -LiteralPath $OutputManifestPath -Encoding UTF8
+    }
 }
 finally { Pop-Location }

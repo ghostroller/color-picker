@@ -114,5 +114,16 @@ cargo test --locked --test windows_capture --test windows_preview --test windows
 脚本先执行必要检查，再构建 x64 Release，在 `dist/` 下生成独立的预览 ZIP、SHA256。
 包中包含 EXE、使用说明、已知限制、验证记录、依赖许可和源码/编译器信息。
 刚完成同一源码检查时可加 `-SkipChecks`，仍会重新确认 Release 构建。
-无安装器、自动升级或管理员权限要求；许可状态与发布边界见
+另提供当前用户安装版：支持可选登录启动、覆盖升级、阻止降级和保留配置的卸载。
+
+```powershell
+winget install --id JRSoftware.InnoSetup -e --version 6.7.3 --source winget --scope user
+.\scripts\package-installer.ps1
+```
+
+详见 [Windows 安装与维护](docs/windows-installer.md)。GitHub 的 **Package Windows** 和
+**Verify** 工作流都只允许手动运行：Actions → 选择工作流 → Run workflow。
+打包工作流输出安装 EXE、便携 ZIP 和 SHA256，见 [CI 打包说明](docs/ci-packaging.md)。
+
+无需管理员权限，不包含后台自动更新。许可状态与发布边界见
 [LICENSE-STATUS.md](LICENSE-STATUS.md) 和 [已知限制](docs/known-limitations.md)。

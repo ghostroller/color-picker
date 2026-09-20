@@ -1,8 +1,7 @@
 name: Verify
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -10,9 +9,11 @@ permissions:
 jobs:
   windows:
     name: Windows native build and tests
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned Rust components and target
         shell: pwsh
         run: |
@@ -27,8 +28,10 @@ jobs:
 
   core:
     name: Pure Rust core on Linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Test core without Windows APIs or an interactive desktop
         run: cargo test --lib --tests --locked

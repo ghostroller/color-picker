@@ -1,0 +1,119 @@
+name: Package Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Windows x64 installer and portable package
+    runs-on: windows-2022
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PACKAGE_MANIFEST: ${{ runner.temp }}/color-picker-package.json
+      INNO_COMPILER: ${{ runner.temp }}/Inno Setup 6/ISCC.exe
+    steps:
+      - name: Check out selected commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install pinned Rust components and x64 target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $channels = @(Select-String -LiteralPath rust-toolchain.toml -Pattern '^\s*channel\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$')
+          if ($channels.Count -ne 1) { throw 'Expected one pinned Rust version in rust-toolchain.toml.' }
+          $toolchain = $channels[0].Matches[0].Groups[1].Value
+          rustup toolchain install $toolchain --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed: $LASTEXITCODE" }
+          rustc -Vv
+          if ($LASTEXITCODE -ne 0) { throw "rustc -Vv failed: $LASTEXITCODE" }
+
+      # Only the disposable runner downloads tools; local packaging never does.
+      - name: Download official pinned Inno Setup package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pin = Get-Content -LiteralPath installer/toolchain.json -Raw | ConvertFrom-Json
+          if ($pin.version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Expected a pinned numeric Inno Setup version.' }
+          curl.exe --fail --location --retry 3 --output "$env:RUNNER_TEMP/innosetup.exe" $pin.url
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup download failed: $LASTEXITCODE" }
+
+      - name: Verify compiler package SHA256
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pin = Get-Content -LiteralPath installer/toolchain.json -Raw | ConvertFrom-Json
+          $actual = (Get-FileHash -LiteralPath "$env:RUNNER_TEMP/innosetup.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -cne $pin.sha256) { throw 'Official Inno Setup package checksum mismatch.' }
+
+      - name: Prepare verified compiler in runner temporary directory
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $directory = Split-Path -Parent $env:INNO_COMPILER
+          $arguments = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /PORTABLE=1 /NOICONS /TASKS="" /DIR="{0}"' -f $directory
+          $process = Start-Process -FilePath "$env:RUNNER_TEMP/innosetup.exe" -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Inno Setup extraction failed: $($process.ExitCode)" }
+
+      - name: Verify and build packages
+        id: package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/package-installer.ps1 -OutputManifestPath $env:PACKAGE_MANIFEST -CompilerPath $env:INNO_COMPILER
+          $manifest = Get-Content -LiteralPath $env:PACKAGE_MANIFEST -Raw | ConvertFrom-Json
+          if ($manifest.source_commit -ne $env:GITHUB_SHA) { throw 'Packaged commit differs from the selected workflow commit.' }
+          foreach ($field in @('installer_path', 'installer_sha256_path', 'archive_path', 'archive_sha256_path')) {
+            $path = $manifest.$field
+            if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Package output is missing: $field"
+            }
+            "$field=$path" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          }
+
+      - name: Check isolated installation, upgrade, and removal
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = Get-Content -LiteralPath $env:PACKAGE_MANIFEST -Raw | ConvertFrom-Json
+          ./scripts/test-installer.ps1 -PackageDirectory $manifest.package_directory -CompilerPath $env:INNO_COMPILER
+
+      - name: Upload installer, portable ZIP, and checksums
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: color-picker-windows-x64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.package.outputs.installer_path }}
+            ${{ steps.package.outputs.installer_sha256_path }}
+            ${{ steps.package.outputs.archive_path }}
+            ${{ steps.package.outputs.archive_sha256_path }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Summarize package version and checksums
+        env:
+          PACKAGE_ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = Get-Content -LiteralPath $env:PACKAGE_MANIFEST -Raw | ConvertFrom-Json
+          $lines = @(
+            '### Windows x64 packages'
+            ''
+            ('Version: `{0}`' -f $manifest.version)
+            ('Source commit: `{0}`' -f $manifest.source_commit)
+            ''
+            ('[Download build artifacts]({0}) — retained for 30 days.' -f $env:PACKAGE_ARTIFACT_URL)
+            ''
+            '| File | SHA256 |'
+            '| --- | --- |'
+          )
+          foreach ($path in @($manifest.installer_path, $manifest.archive_path)) {
+            $name = Split-Path -Leaf $path
+            $sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            $lines += '| {0} | `{1}` |' -f $name, $sha256
+          }
+          $lines | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8

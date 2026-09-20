@@ -1,0 +1,3 @@
+# Preserve vendored upstream bytes so the recorded SHA-256 values stay stable.
+ChineseSimplified.isl -text
+INNO-SETUP-LICENSE.txt -text
