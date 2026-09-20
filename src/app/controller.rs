@@ -38,7 +38,7 @@ pub struct PreviewController {
 
 struct SessionResources {
     input: InputSession,
-    preview: PreviewWindow,
+    preview: Option<PreviewWindow>,
     sampler: Option<GdiSampler>,
     magnifier: Option<MagnifierWindow>,
     monitors: Monitors,
@@ -83,7 +83,7 @@ impl PreviewController {
             let input = InputSession::start(session, self.host)?;
             Ok(SessionResources {
                 input,
-                preview,
+                preview: Some(preview),
                 sampler: Some(sampler),
                 magnifier: None,
                 monitors,
@@ -178,7 +178,9 @@ impl PreviewController {
         self.timer.take();
         self.pending_hover = None;
         if let Some(resources) = self.session.as_ref() {
-            resources.preview.hide();
+            if let Some(preview) = resources.preview.as_ref() {
+                preview.hide();
+            }
             if let Some(magnifier) = resources.magnifier.as_ref() {
                 magnifier.hide();
             }
@@ -350,17 +352,17 @@ impl PreviewController {
         let Some(resources) = self.session.as_mut() else {
             return Ok(None);
         };
+        let preview = resources
+            .preview
+            .as_ref()
+            .ok_or_else(|| Error::new(E_FAIL, "实时预览窗口不可用"))?;
         let Some(monitor) = resources.monitors.at(point).copied() else {
             resources.last_sample = None;
-            resources.preview.hide();
+            preview.hide();
             return unavailable(resources, Error::new(E_FAIL, "该位置没有有效显示器"));
         };
-        if resources
-            .preview
-            .rect()
-            .is_some_and(|rect| rect.contains(point))
-        {
-            resources.preview.hide();
+        if preview.rect().is_some_and(|rect| rect.contains(point)) {
+            preview.hide();
             flush_composition()?;
         }
         self.sample_attempts = self.sample_attempts.saturating_add(1);
@@ -377,14 +379,12 @@ impl PreviewController {
                     kind: SampleKind::Live,
                 };
                 resources.last_sample = Some(picked);
-                resources
-                    .preview
-                    .update(point, Some(rgb), monitor.work_area)?;
+                preview.update(point, Some(rgb), monitor.work_area)?;
                 Ok(Some(picked))
             }
             Err(error) => {
                 resources.last_sample = None;
-                resources.preview.update(point, None, monitor.work_area)?;
+                preview.update(point, None, monitor.work_area)?;
                 unavailable(resources, platform_error(error))
             }
         }
@@ -430,7 +430,10 @@ impl PreviewController {
         let rect = freeze_rect(point, monitor.bounds)
             .ok_or_else(|| Error::new(E_FAIL, "无法确定冻结区域"))?;
         self.timer.take();
-        resources.preview.hide();
+        // Frozen does not retain a hidden Live window or its font/backbuffer.
+        if let Some(preview) = resources.preview.take() {
+            preview.hide();
+        }
         flush_composition()?;
         let image = resources
             .sampler
@@ -461,6 +464,7 @@ impl PreviewController {
             magnifier.hide();
         }
         flush_composition()?;
+        resources.preview = Some(PreviewWindow::new()?);
         resources.sampler = Some(GdiSampler::new().map_err(platform_error)?);
         resources.last_sample = None;
         resources.failures = 0;

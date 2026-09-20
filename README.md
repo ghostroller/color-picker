@@ -6,7 +6,7 @@ Windows 原生桌面取色工具，按 [实现计划](docs/implementation-plan.m
 当前进展与验收证据见 [开发记录](docs/progress.md) 和 [验证记录](docs/validation.md)。
 当前是开发版本，尚未完成 v0.1 发布验收。
 
-当前已实现 M0–M6：实时取色、冻结放大、结果展示、复制与设置。启动后在托盘显示图标；
+当前已实现 M0–M6 功能及 M7 测量、打包工具；完整实机发布验收尚未完成。启动后在托盘显示图标；
 按 `Ctrl + Alt + C`、激活托盘或重复启动，开始显示鼠标所在物理像素的颜色、HEX 和坐标。
 取色中重复激活不会叠加会话；右键或 Esc 取消，退出程序请使用托盘菜单。
 鼠标静止时仍检查画面变化，停止预览后释放采样资源和定时器。
@@ -95,3 +95,19 @@ cargo test --locked --test windows_capture --test windows_preview --test windows
 目标为 Windows 11 x64，Windows 10 22H2 x64 待兼容性验证。
 仅保证普通 SDR 桌面的 8 位 RGB 采样设计，不承诺 HDR、原始 alpha 或受保护内容的颜色。
 不联网、不遥测；屏幕图像只保留在内存中。
+
+## 资源测量与预览打包
+
+[资源探针说明](docs/resource-probe.md) 提供 100 / 500 / 1000 次受控启动、取消测量，
+输出 CPU、工作集、私有提交、句柄、GDI/USER、线程和首帧提交延迟的原始 JSON。
+工具单独运行，日常应用不增加测量线程或周期任务。
+
+```powershell
+.\scripts\package-windows.ps1
+```
+
+脚本先执行必要检查，再构建 x64 Release，在 `dist/` 下生成独立的预览 ZIP、SHA256。
+包中包含 EXE、使用说明、已知限制、验证记录、依赖许可和源码/编译器信息。
+刚完成同一源码检查时可加 `-SkipChecks`，仍会重新确认 Release 构建。
+无安装器、自动升级或管理员权限要求；许可状态与发布边界见
+[LICENSE-STATUS.md](LICENSE-STATUS.md) 和 [已知限制](docs/known-limitations.md)。
