@@ -1,0 +1,35 @@
+{
+  "pid": 24472,
+  "status": "COMPLETED",
+  "scope": "30s low-interference actual-process Idle: diagnostic/resource queries only before and after; no activation or capture by measurement",
+  "logical_processors": 16,
+  "measured_utc": "2026-09-20T15:52:15.6737877Z",
+  "duration_ms": 30039.6616,
+  "cpu_ms": 0.0,
+  "cpu_one_core_percent": 0.0,
+  "cpu_machine_percent": 0.0,
+  "before": {
+    "cpu_ms": 11859.375,
+    "working_set": 22552576,
+    "private_commit": 3170304,
+    "handles": 216,
+    "threads": 1,
+    "gdi": 19,
+    "user": 13,
+    "state": 0,
+    "timer": 0,
+    "samples": 3761
+  },
+  "after": {
+    "cpu_ms": 11859.375,
+    "working_set": 22552576,
+    "private_commit": 3170304,
+    "handles": 216,
+    "threads": 1,
+    "gdi": 19,
+    "user": 13,
+    "state": 0,
+    "timer": 0,
+    "samples": 3761
+  }
+}

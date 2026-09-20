@@ -34,7 +34,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'LICENSE-STATUS.md') -Destination $package
     $docs = Join-Path $package 'docs'
     New-Item -ItemType Directory -Path $docs | Out-Null
-    foreach ($name in @('validation.md', 'known-limitations.md', 'resource-probe.md')) {
+    foreach ($name in @('validation.md', 'known-limitations.md', 'resource-probe.md', 'performance-running-app.md')) {
         Copy-Item -LiteralPath (Join-Path $repositoryRoot "docs/$name") -Destination $docs
     }
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'docs/measurements') -Destination $docs -Recurse

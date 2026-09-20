@@ -102,6 +102,9 @@ cargo test --locked --test windows_capture --test windows_preview --test windows
 输出 CPU、工作集、私有提交、句柄、GDI/USER、线程和首帧提交延迟的原始 JSON。
 工具单独运行，日常应用不增加测量线程或周期任务。
 
+[实际程序性能记录](docs/performance-running-app.md) 另测已有进程的后台、持续实时取色、
+调用延迟和取消后的资源回落；复测工具为 `scripts/measure-running-app.ps1`。
+
 ```powershell
 .\scripts\package-windows.ps1
 ```
