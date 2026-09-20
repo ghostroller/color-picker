@@ -22,7 +22,6 @@ pub(super) mod palette {
     pub const BACKGROUND: COLORREF = rgb(0x111827);
     pub const PANEL: COLORREF = rgb(0x172033);
     pub const BORDER: COLORREF = rgb(0x334155);
-    pub const SWATCH_BORDER: COLORREF = rgb(0x64748b);
     pub const TEXT: COLORREF = rgb(0xf8fafc);
     pub const SECONDARY: COLORREF = rgb(0xcbd5e1);
     pub const ACCENT: COLORREF = rgb(0x93c5fd);
@@ -123,8 +122,8 @@ impl Surface {
                 "Could not create the preview back buffer",
             ));
         }
-        let heading_font = OwnedFont::new(16, 600, dpi)?;
-        let body_font = OwnedFont::new(11, 400, dpi)?;
+        let heading_font = OwnedFont::new(13, 600, dpi)?;
+        let body_font = OwnedFont::new(10, 400, dpi)?;
         let old_bitmap = unsafe { SelectObject(dc.0, HGDIOBJ(bitmap.0.0)) };
         if invalid_selection(old_bitmap) {
             return Err(Error::new(E_FAIL, "Could not select the preview bitmap"));
@@ -166,33 +165,25 @@ impl Surface {
         let color = content.rgb.map_or(palette::EMPTY, |rgb| {
             COLORREF(u32::from(rgb.r) | (u32::from(rgb.g) << 8) | (u32::from(rgb.b) << 16))
         });
-        self.swatch(
-            swatch_brush,
-            palette::SWATCH_BORDER,
-            RECT {
-                left: 10,
-                top: 11,
-                right: 46,
-                bottom: 47,
-            },
-        )?;
-        self.swatch(
+        // The swatch runs flush to all three outside edges, without an inset
+        // border or decorative padding. Only the text panel keeps its border.
+        self.fill(
             swatch_brush,
             color,
             RECT {
-                left: 11,
-                top: 12,
-                right: 45,
-                bottom: 46,
+                left: 0,
+                top: 0,
+                right: dip(38, self.dpi),
+                bottom: self.height,
             },
         )?;
         self.text(
             &self.heading_font,
             RECT {
-                left: 58,
-                top: 9,
-                right: 198,
-                bottom: 32,
+                left: 44,
+                top: 2,
+                right: 164,
+                bottom: 21,
             },
             palette::TEXT,
             &content.color_text,
@@ -200,10 +191,10 @@ impl Surface {
         self.text(
             &self.body_font,
             RECT {
-                left: 58,
-                top: 34,
-                right: 198,
-                bottom: 50,
+                left: 44,
+                top: 21,
+                right: 164,
+                bottom: 37,
             },
             palette::SECONDARY,
             &content.coordinates,
@@ -221,10 +212,6 @@ impl Surface {
                 SRCCOPY,
             )
         }
-    }
-
-    fn swatch(&self, brush: HBRUSH, color: COLORREF, rect_dip: RECT) -> Result<()> {
-        self.fill(brush, color, self.scale_rect(rect_dip))
     }
 
     fn fill(&self, brush: HBRUSH, color: COLORREF, rect: RECT) -> Result<()> {

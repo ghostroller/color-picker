@@ -150,7 +150,7 @@ impl PreviewWindow {
             let content = Content {
                 rgb,
                 color_text: color_text.encode_utf16().collect(),
-                coordinates: format!("X: {}    Y: {}", point.x, point.y)
+                coordinates: format!("X {}  Y {}", point.x, point.y)
                     .encode_utf16()
                     .collect(),
             };
@@ -166,8 +166,8 @@ impl PreviewWindow {
             if dpi == 0 || dpi > 9600 {
                 return Err(Error::new(E_FAIL, "Could not determine preview DPI"));
             }
-            let width = dip(208, dpi);
-            let height = dip(58, dpi);
+            let width = dip(168, dpi);
+            let height = dip(38, dpi);
             let Some(rect) = place_preview(
                 point,
                 work_area,

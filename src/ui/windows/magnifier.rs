@@ -174,7 +174,7 @@ impl MagnifierWindow {
             diagnostics::event(format_args!("magnifier.capture_exclusion_failed {error}"));
         }
         let dpi = unsafe { GetDpiForWindow(hwnd) };
-        let (bounds, viewport) = window_layout(focus, work_area, dpi)?;
+        let (bounds, viewport) = window_layout(focus, work_area, dpi, image.width, image.height)?;
         let view = ZoomView::new(image, viewport, ZoomScale::X4, cache)
             .map_err(|_| Error::new(E_INVALIDARG, "Could not map the frozen viewport"))?;
         let surface = Surface::new(bounds.width() as i32, bounds.height() as i32, dpi)?;
@@ -323,25 +323,36 @@ fn window_layout(
     focus: ScreenPointPx,
     work: ScreenRectPx,
     dpi: u32,
+    image_width: u32,
+    image_height: u32,
 ) -> Result<(ScreenRectPx, ScreenRectPx)> {
-    if dpi == 0 || dpi > 9600 || work.is_empty() {
+    if dpi == 0 || dpi > 9600 || work.is_empty() || image_width == 0 || image_height == 0 {
         return Err(failure("Invalid magnifier DPI/work area"));
     }
-    let padding = dip(6, dpi);
-    let footer = dip(36, dpi);
-    let available_width = i64::from(work.width()) - i64::from(2 * padding);
-    let available_height = i64::from(work.height()) - i64::from(2 * padding + footer);
-    let side = i64::from(dip(240, dpi))
-        .min(available_width)
-        .min(available_height);
-    if side < 32 {
+    let footer = i64::from(dip(24, dpi));
+    let initial_scale = i64::from(ZoomScale::X4.factor());
+    let cap = i64::from(dip(240, dpi));
+    // Source pixels, unlike the footer, are physical pixels. In particular a
+    // 65×65 image at 4× needs 260×260 px even on a high-DPI display. Keep only
+    // the 32 px minimum needed for a complete cell at the highest zoom when a
+    // caller supplies an unusually narrow image. Round down to whole 4× cells.
+    let axis = |source: u32, available: i64| {
+        (i64::from(source) * initial_scale)
+            .max(i64::from(ZoomScale::X32.factor()))
+            .min(cap)
+            .min(available)
+            / initial_scale
+            * initial_scale
+    };
+    let width = axis(image_width, i64::from(work.width()));
+    let viewport_height = axis(image_height, i64::from(work.height()) - footer);
+    if width < 32 || viewport_height < 32 {
         return Err(failure("工作区空间不足，无法显示完整像素格"));
     }
-    let width = side + i64::from(2 * padding);
-    let height = side + i64::from(2 * padding + footer);
-    let left = (i64::from(focus.x) - side / 2 - i64::from(padding))
-        .clamp(i64::from(work.left), i64::from(work.right) - width);
-    let top = (i64::from(focus.y) - side / 2 - i64::from(padding))
+    let height = viewport_height + footer;
+    let left =
+        (i64::from(focus.x) - width / 2).clamp(i64::from(work.left), i64::from(work.right) - width);
+    let top = (i64::from(focus.y) - viewport_height / 2)
         .clamp(i64::from(work.top), i64::from(work.bottom) - height);
     let bounds = ScreenRectPx {
         left: left as i32,
@@ -350,10 +361,10 @@ fn window_layout(
         bottom: (top + height) as i32,
     };
     let viewport = ScreenRectPx {
-        left: (left + i64::from(padding)) as i32,
-        top: (top + i64::from(padding)) as i32,
-        right: (left + i64::from(padding) + side) as i32,
-        bottom: (top + i64::from(padding) + side) as i32,
+        left: bounds.left,
+        top: bounds.top,
+        right: bounds.right,
+        bottom: (top + viewport_height) as i32,
     };
     Ok((bounds, viewport))
 }
@@ -475,8 +486,8 @@ impl Surface {
         if bitmap.0.is_invalid() {
             return Err(failure("Could not create magnifier buffer"));
         }
-        let heading_font = OwnedFont::new(16, 600, dpi)?;
-        let body_font = OwnedFont::new(11, 400, dpi)?;
+        let heading_font = OwnedFont::new(13, 600, dpi)?;
+        let body_font = OwnedFont::new(10, 400, dpi)?;
         let old_bitmap = unsafe { SelectObject(dc.0, bitmap.0.into()) };
         if old_bitmap.is_invalid() {
             return Err(failure("Could not select magnifier bitmap"));
@@ -513,26 +524,6 @@ impl Surface {
         let source = view.source_view();
         let drawn = local_rect(view.drawn_rect(), bounds);
         let viewport = local_rect(view.viewport(), bounds);
-        // Borders stay outside the viewport. Snapshot scaling, the integer grid
-        // and the contrasting selection frame below retain their exact geometry.
-        self.frame(
-            RECT {
-                left: 0,
-                top: 0,
-                right: self.width,
-                bottom: self.height,
-            },
-            palette::BORDER,
-        )?;
-        self.frame(
-            RECT {
-                left: viewport.left - 1,
-                top: viewport.top - 1,
-                right: viewport.right + 1,
-                bottom: viewport.bottom + 1,
-            },
-            palette::BORDER,
-        )?;
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -606,6 +597,7 @@ impl Surface {
                     right: left + scale + 1,
                     bottom: top + scale + 1,
                 },
+                drawn,
                 COLORREF(0),
             )?;
             self.frame(
@@ -615,6 +607,7 @@ impl Surface {
                     right: left + scale,
                     bottom: top + scale,
                 },
+                drawn,
                 COLORREF(0x00ffffff),
             )?;
         }
@@ -635,62 +628,49 @@ impl Surface {
     }
 
     fn draw_footer(&self, top: i32, footer: &Footer) -> Result<()> {
-        let pad = dip(10, self.dpi);
         self.fill(
             RECT {
-                left: 1,
-                top: top + dip(5, self.dpi),
-                right: self.width - 1,
-                bottom: self.height - 1,
+                left: 0,
+                top,
+                right: self.width,
+                bottom: self.height,
             },
             palette::PANEL,
         )?;
-        self.fill(
-            RECT {
-                left: pad,
-                top: top + dip(5, self.dpi),
-                right: self.width - pad,
-                bottom: top + dip(6, self.dpi),
-            },
-            palette::BORDER,
-        )?;
-        let swatch = RECT {
-            left: pad,
-            top: top + dip(13, self.dpi),
-            right: dip(30, self.dpi).min(self.width - pad),
-            bottom: top + dip(33, self.dpi),
-        };
-        if swatch.right > swatch.left {
-            self.fill(swatch, palette::SWATCH_BORDER)?;
-            let inset = dip(1, self.dpi).max(1);
-            let interior = RECT {
-                left: swatch.left + inset,
-                top: swatch.top + inset,
-                right: swatch.right - inset,
-                bottom: swatch.bottom - inset,
+        let compact = self.width < dip(132, self.dpi);
+        let text_left = if compact {
+            // The image already displays this color. Omit the redundant swatch
+            // when an edge crop needs the available width for HEX and scale.
+            dip(4, self.dpi)
+        } else {
+            let swatch = RECT {
+                left: 0,
+                top,
+                right: dip(24, self.dpi),
+                bottom: self.height,
             };
-            if interior.right > interior.left {
-                self.fill(
-                    interior,
-                    footer.rgb.map_or(palette::EMPTY, |rgb| {
-                        COLORREF(
-                            u32::from(rgb.r) | (u32::from(rgb.g) << 8) | (u32::from(rgb.b) << 16),
-                        )
-                    }),
-                )?;
-            }
-        }
-        let right = self.width - pad;
-        let badge_width = dip(32, self.dpi);
-        let badge_left = (right - badge_width).max(dip(40, self.dpi));
+            self.fill(
+                swatch,
+                footer.rgb.map_or(palette::EMPTY, |rgb| {
+                    COLORREF(u32::from(rgb.r) | (u32::from(rgb.g) << 8) | (u32::from(rgb.b) << 16))
+                }),
+            )?;
+            swatch.right + dip(2, self.dpi)
+        };
+        let right = self.width - dip(2, self.dpi);
+        let badge_left = (right - dip(24, self.dpi)).max(text_left);
         draw_text(
             self.dc.0,
-            &self.heading_font,
+            if compact {
+                &self.body_font
+            } else {
+                &self.heading_font
+            },
             RECT {
-                left: dip(40, self.dpi),
-                top: top + dip(10, self.dpi),
-                right: badge_left - dip(6, self.dpi),
-                bottom: top + dip(34, self.dpi),
+                left: text_left,
+                top: top + dip(if compact { 6 } else { 3 }, self.dpi),
+                right: badge_left - dip(2, self.dpi),
+                bottom: self.height,
             },
             palette::TEXT,
             &footer.hex,
@@ -700,9 +680,9 @@ impl Surface {
             &self.body_font,
             RECT {
                 left: badge_left,
-                top: top + dip(15, self.dpi),
+                top: top + dip(6, self.dpi),
                 right,
-                bottom: top + dip(32, self.dpi),
+                bottom: self.height,
             },
             palette::ACCENT,
             &footer.scale,
@@ -729,12 +709,13 @@ impl Surface {
             Ok(())
         }
     }
-    fn frame(&self, rect: RECT, color: COLORREF) -> Result<()> {
-        if unsafe { FrameRect(self.dc.0, &rect, self.brush(color)?) } == 0 {
-            Err(failure("Could not draw selected pixel border"))
-        } else {
-            Ok(())
+    fn frame(&self, rect: RECT, clip: RECT, color: COLORREF) -> Result<()> {
+        // Clipping each original edge preserves the cell geometry. Intersecting
+        // the frame rectangle first would invent an edge along the clip boundary.
+        for edge in clipped_frame_edges(rect, clip).into_iter().flatten() {
+            self.fill(edge, color)?;
         }
+        Ok(())
     }
 }
 
@@ -755,6 +736,36 @@ fn local_rect(rect: ScreenRectPx, bounds: ScreenRectPx) -> RECT {
     }
 }
 
+fn clipped_frame_edges(rect: RECT, clip: RECT) -> [Option<RECT>; 4] {
+    [
+        RECT {
+            bottom: rect.top + 1,
+            ..rect
+        },
+        RECT {
+            top: rect.bottom - 1,
+            ..rect
+        },
+        RECT {
+            right: rect.left + 1,
+            ..rect
+        },
+        RECT {
+            left: rect.right - 1,
+            ..rect
+        },
+    ]
+    .map(|edge| {
+        let clipped = RECT {
+            left: edge.left.max(clip.left),
+            top: edge.top.max(clip.top),
+            right: edge.right.min(clip.right),
+            bottom: edge.bottom.min(clip.bottom),
+        };
+        (clipped.left < clipped.right && clipped.top < clipped.bottom).then_some(clipped)
+    })
+}
+
 fn failure(message: &'static str) -> Error {
     Error::new(E_FAIL, message)
 }
@@ -771,19 +782,16 @@ mod tests {
             right: -200,
             bottom: 100,
         };
-        for dpi in [96, 120, 144, 192] {
+        for dpi in [96, 120, 144, 168, 192] {
             let (window, viewport) =
-                window_layout(ScreenPointPx { x: -1199, y: -699 }, work, dpi).unwrap();
+                window_layout(ScreenPointPx { x: -1199, y: -699 }, work, dpi, 65, 65).unwrap();
             assert_eq!(window.intersection(work), Some(window));
             assert_eq!(viewport.width(), viewport.height());
-            assert_eq!(viewport.width(), dip(240, dpi) as u32);
-            assert_eq!(viewport.left - window.left, dip(6, dpi));
-            assert_eq!(viewport.top - window.top, dip(6, dpi));
-            assert_eq!(window.width(), viewport.width() + 2 * dip(6, dpi) as u32);
-            assert_eq!(
-                window.height(),
-                viewport.height() + (2 * dip(6, dpi) + dip(36, dpi)) as u32
-            );
+            assert_eq!(viewport.width(), dip(240, dpi).min(260) as u32 / 4 * 4);
+            assert_eq!(viewport.left, window.left);
+            assert_eq!(viewport.top, window.top);
+            assert_eq!(window.width(), viewport.width());
+            assert_eq!(window.height(), viewport.height() + dip(24, dpi) as u32);
             assert!(viewport.width() >= 32);
             assert!(viewport.bottom < window.bottom);
         }
@@ -796,9 +804,143 @@ mod tests {
                     right: 16,
                     bottom: 16
                 },
-                96
+                96,
+                65,
+                65,
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn edge_crops_and_small_work_areas_use_rectangular_complete_cells() {
+        let work = ScreenRectPx {
+            left: -1000,
+            top: -800,
+            right: 0,
+            bottom: 0,
+        };
+        let (window, viewport) =
+            window_layout(ScreenPointPx { x: -1, y: -1 }, work, 168, 33, 65).unwrap();
+        assert_eq!(viewport.width(), 132);
+        assert_eq!(viewport.height(), 260);
+        assert_eq!(window.height(), 302);
+        assert_eq!(window.intersection(work), Some(window));
+        let mut view = ZoomView::new(
+            image(33, 65),
+            viewport,
+            ZoomScale::X4,
+            CachePoint { x: 16, y: 32 },
+        )
+        .unwrap();
+        assert_eq!(
+            view.drawn_rect(),
+            viewport,
+            "initial view has no unused margins"
+        );
+        let anchor = ScreenPointPx {
+            x: viewport.left + 66,
+            y: viewport.top + 130,
+        };
+        for scale in [ZoomScale::X8, ZoomScale::X16, ZoomScale::X32] {
+            view.change_scale(scale, anchor);
+            assert_eq!(
+                view.viewport(),
+                viewport,
+                "zoom keeps the physical viewport fixed"
+            );
+            assert_eq!(view.drawn_rect().width() % scale.factor(), 0);
+            assert_eq!(view.drawn_rect().height() % scale.factor(), 0);
+            assert!(view.hit_test(anchor).is_some());
+            assert!(
+                view.hit_test(ScreenPointPx {
+                    x: viewport.left,
+                    y: viewport.bottom
+                })
+                .is_none()
+            );
+        }
+
+        let small_work = ScreenRectPx {
+            left: -119,
+            top: -103,
+            right: 0,
+            bottom: 0,
+        };
+        let (window, viewport) =
+            window_layout(ScreenPointPx { x: -1, y: -1 }, small_work, 96, 65, 65).unwrap();
+        assert_eq!((viewport.width(), viewport.height()), (116, 76));
+        assert_eq!(window.intersection(small_work), Some(window));
+    }
+
+    #[test]
+    fn tiny_images_keep_one_complete_cell_at_the_highest_scale() {
+        let work = ScreenRectPx {
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 800,
+        };
+        for size in 1..=7 {
+            let (_, viewport) =
+                window_layout(ScreenPointPx { x: 50, y: 50 }, work, 168, size, 8 - size).unwrap();
+            assert_eq!((viewport.width(), viewport.height()), (32, 32));
+            let mut view = ZoomView::new(
+                image(size, 8 - size),
+                viewport,
+                ZoomScale::X4,
+                CachePoint { x: 0, y: 0 },
+            )
+            .unwrap();
+            let anchor = view.cell_center(CachePoint { x: 0, y: 0 }).unwrap();
+            view.change_scale(ZoomScale::X32, anchor);
+            assert_eq!(view.drawn_rect(), viewport);
+            assert_eq!(
+                view.hit_test(anchor).unwrap().cache,
+                CachePoint { x: 0, y: 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn selection_frame_clips_original_edges_to_pixels_only() {
+        let pixels = RECT {
+            left: 0,
+            top: 0,
+            right: 32,
+            bottom: 32,
+        };
+        let edges = clipped_frame_edges(
+            RECT {
+                left: -1,
+                top: 27,
+                right: 5,
+                bottom: 33,
+            },
+            pixels,
+        );
+        assert!(
+            edges[1].is_none(),
+            "outer bottom edge cannot enter the footer"
+        );
+        assert!(
+            edges[2].is_none(),
+            "outer left edge cannot escape the image"
+        );
+        assert_eq!(edges[0].unwrap().top, 27);
+        assert_eq!(edges[3].unwrap().left, 4);
+        for edge in edges.into_iter().flatten() {
+            assert!(edge.left >= 0 && edge.top >= 0 && edge.right <= 32 && edge.bottom <= 32);
+        }
+    }
+
+    fn image(width: u32, height: u32) -> FrozenImage {
+        FrozenImage {
+            origin: ScreenPointPx { x: 0, y: 0 },
+            width,
+            height,
+            stride_bytes: width as usize * 4,
+            bgrx: vec![0; width as usize * height as usize * 4],
+        }
     }
 }

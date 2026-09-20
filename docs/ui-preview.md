@@ -12,8 +12,12 @@
 修饰键仍单独选择，按“应用”后才保存；监听只处理设置窗口的按键消息。
 已消费的按键保持到释放，避免长按 Enter 或切换焦点时意外应用设置。
 
-实时浮窗缩小为 208×58 DIP；冻结视口由 320 缩为 240 DIP，标准外框为
-252×288 DIP，仅保留色块、HEX 和倍率。两种浮窗均移除操作说明，统一放在设置页。
+实时浮窗进一步缩小为 168×38 DIP，左侧色块贴边铺满高度，HEX / 坐标使用 13 / 10 DIP 字号。
+冻结像素区取消外围边距，按快照在初始 4× 下的实际物理像素范围收紧（每轴上限 240 DIP，
+并限制在工作区内）；边缘裁剪的快照允许矩形视口。信息栏缩至 24 DIP，色块贴边，
+HEX / 倍率使用 13 / 10 DIP 字号。175% 下完整 65×65 快照的窗口为 260×302 物理像素。
+极窄缓存保留每轴至少 32 个物理像素，以支持最高倍率；缩放时保留完整整数像素格所需的
+少量对称余量，不拉伸图像填充。两种浮窗均移除操作说明，统一放在设置页。
 冻结模式窗外左键取消取色，窗口内边框、留白和信息栏继续等待有效选择。
 
 字体与画刷由窗口持有，字体只在 DPI / Surface 变化时重建；未增加常驻计时器、
@@ -22,7 +26,7 @@
 ## 本机检查
 
 - Windows 11，窗口实际 DPI 为 168（175% 缩放）。下方图片为真实原生窗口截图。
-- `scripts/verify-windows.ps1` 通过：格式、Clippy、77 项默认测试、x64 Release、
+- `scripts/verify-windows.ps1` 通过：格式、Clippy、80 项默认测试、x64 Release、
   嵌入 manifest 和 PerMonitorV2 检查。
 - 已有 `windows_selection_ui` 桌面冒烟通过，覆盖冻结倍率映射、只读色值、
   按键录入 / F12 拒绝 / Esc / Tab / F10 系统键 / 多键长按与换焦点、
@@ -40,6 +44,7 @@ cargo run --release --example ui-preview -- result
 cargo run --release --example ui-preview -- settings
 cargo run --release --example ui-preview -- live
 cargo run --release --example ui-preview -- frozen
+cargo run --release --example ui-preview -- frozen-edge
 ```
 
 可在模式后指定存活秒数（1–600）。预览中的“应用”只校验，不保存；
@@ -61,3 +66,7 @@ cargo run --release --example ui-preview -- frozen
 ![实时取色](images/ui-live.png)
 
 ![冻结放大](images/ui-frozen.png)
+
+屏幕边缘的窄快照使用紧凑信息栏，省略重复色块，保留完整 HEX 与倍率：
+
+![边缘快照](images/ui-frozen-edge.png)

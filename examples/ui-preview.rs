@@ -1,7 +1,7 @@
 //! A visual fixture using the production native windows and synthetic pixels.
 //! No hotkeys, hooks, screen sampling or configuration writes are started.
 //! cargo run --example ui-preview -- result [seconds]
-//! Modes: result, settings, live, frozen. Result copy buttons use the clipboard
+//! Modes: result, settings, live, frozen, frozen-edge. Copy buttons use the clipboard
 //! only when explicitly clicked. Settings Apply validates but never saves.
 
 #[cfg(not(windows))]
@@ -134,14 +134,15 @@ mod fixture {
                 window.update(focus, Some(rgb), work)?;
                 Scene::Live(window)
             }
-            "frozen" => {
+            "frozen" | "frozen-edge" => {
+                let width = if mode == "frozen-edge" { 33_usize } else { 65 };
                 let origin = ScreenPointPx {
-                    x: focus.x - 32,
+                    x: focus.x - (width / 2) as i32,
                     y: focus.y - 32,
                 };
-                let mut bgrx = Vec::with_capacity(65 * 65 * 4);
+                let mut bgrx = Vec::with_capacity(width * 65 * 4);
                 for y in 0..65 {
-                    for x in 0..65 {
+                    for x in 0..width {
                         let cell = ((x / 8) + (y / 8)) % 2;
                         let color = if cell == 0 {
                             rgb
@@ -154,25 +155,26 @@ mod fixture {
                 let window = MagnifierWindow::new(
                     FrozenImage {
                         origin,
-                        width: 65,
+                        width: width as u32,
                         height: 65,
-                        stride_bytes: 65 * 4,
+                        stride_bytes: width * 4,
                         bgrx,
                     },
                     focus,
                     work,
                 )?;
                 let bounds = window.rect().expect("shown magnifier");
+                let footer_height = (24 * unsafe { GetDpiForWindow(window.hwnd()) } + 48) / 96;
                 window.update_hover(ScreenPointPx {
                     x: bounds.left + (bounds.width() / 2) as i32,
-                    y: bounds.top + (bounds.width() / 2) as i32,
+                    y: bounds.top + ((bounds.height() - footer_height) / 2) as i32,
                 })?;
                 Scene::Frozen(window)
             }
             _ => {
                 return Err(Error::new(
                     windows::Win32::Foundation::E_INVALIDARG,
-                    "Mode must be result, settings, live, or frozen",
+                    "Mode must be result, settings, live, frozen, or frozen-edge",
                 ));
             }
         };

@@ -22,6 +22,7 @@ use color_picker::{
     },
 };
 use pixel_fixture::ScopedPmv2;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, WPARAM},
@@ -77,11 +78,12 @@ fn cached_selection_and_native_result_controls_smoke() {
         (WS_EX_TOPMOST | WS_EX_NOACTIVATE).0
     );
     let bounds = magnifier.rect().unwrap();
-    // The square viewport center uses the window width; its text footer sits
-    // below the square and must never produce a color selection.
+    // Edge-clipped snapshots can have rectangular viewports. Exclude only the
+    // compact 24 DIP footer when locating the image center.
+    let footer_height = (24 * unsafe { GetDpiForWindow(magnifier_hwnd) } + 48) / 96;
     let hover = ScreenPointPx {
         x: (i64::from(bounds.left) + i64::from(bounds.width()) / 2) as i32,
-        y: (i64::from(bounds.top) + i64::from(bounds.width()) / 2) as i32,
+        y: (i64::from(bounds.top) + i64::from(bounds.height() - footer_height) / 2) as i32,
     };
     let picked = magnifier
         .hit_test(hover)
