@@ -1,0 +1,34 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows native build and tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust components and target
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup component add rustfmt clippy
+          if ($LASTEXITCODE -ne 0) { throw "rustup component add failed: $LASTEXITCODE" }
+          rustup target add x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "rustup target add failed: $LASTEXITCODE" }
+      - name: Verify native build, manifest, and DPI context
+        shell: pwsh
+        run: ./scripts/verify-windows.ps1
+
+  core:
+    name: Pure Rust core on Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test core without Windows APIs or an interactive desktop
+        run: cargo test --lib --tests --locked
