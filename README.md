@@ -6,7 +6,7 @@ Windows 原生桌面取色工具，按 [实现计划](docs/implementation-plan.m
 当前进展与验收证据见 [开发记录](docs/progress.md) 和 [验证记录](docs/validation.md)。
 当前是开发版本，尚未完成 v0.1 发布验收。
 
-当前已实现 M0–M5：实时取色、冻结放大、结果展示和复制。启动后在托盘显示图标；
+当前已实现 M0–M6：实时取色、冻结放大、结果展示、复制与设置。启动后在托盘显示图标；
 按 `Ctrl + Alt + C`、激活托盘或重复启动，开始显示鼠标所在物理像素的颜色、HEX 和坐标。
 取色中重复激活不会叠加会话；右键或 Esc 取消，退出程序请使用托盘菜单。
 鼠标静止时仍检查画面变化，停止预览后释放采样资源和定时器。
@@ -14,8 +14,13 @@ Windows 原生桌面取色工具，按 [实现计划](docs/implementation-plan.m
 滚轮向上冻结并放大，倍率为 4× / 8× / 16× / 32×；向下滚出 4× 恢复实时取色。
 冻结后在像素格内点击确认，边框 / 文字栏 / 留白点击不取色。
 确认后打开原生结果窗口，显示 HEX、RGB、CSS RGB、HSL、原始坐标及实时 / 冻结来源。
-每行可单独复制，也可复制默认 HEX；支持 Tab、Enter、Esc、文本选择和“重新取色”。
-默认不自动复制。自定义快捷键、默认格式、自动复制和配置保存属于后续 M6。
+每行可单独复制，也可复制默认格式；支持 Tab、Enter、Esc、文本选择和“重新取色”。
+初始默认格式为 HEX，自动复制关闭；托盘“设置”可修改快捷键、默认格式和自动复制。
+点击“应用”才保存；设置窗口打开期间不开始取色。新键冲突或保存失败保留旧设置。
+
+配置存储在 Windows Known Folder 对应的 `%LOCALAPPDATA%\color-picker\config.json`。
+缺失时使用默认值；损坏、无法读取或未知版本时保留原文件并禁止覆盖。
+退出程序后修复或移走该文件，再启动即可恢复设置功能；无需手工创建默认配置。
 
 ## 构建
 
@@ -65,7 +70,7 @@ cargo test --locked --test windows_capture --test windows_preview --test windows
 
 | 日志事件 | 含义 |
 |---|---|
-| `hotkey.registered` | Ctrl+Alt+C 已成功注册 |
+| `hotkey.registered` | 配置的快捷键已成功注册（初始为 Ctrl+Alt+C） |
 | `hotkey.registration_failed` | 注册失败，后面包含系统错误；可能已被其他程序占用 |
 | `hotkey.received` | 宿主已收到该快捷键的 WM_HOTKEY |
 | `activation.handled` | 已处理激活，开始实时预览 |
@@ -75,6 +80,7 @@ cargo test --locked --test windows_capture --test windows_preview --test windows
 | `session.starting` / `session.finishing` | 等待输入就绪 / 正在释放已消费的手势 |
 | `session.frozen` / `session.resumed_live` | 进入冻结放大 / 恢复实时取色 |
 | `result.shown` | 输入与采样资源清理完毕，结果窗口已显示 |
+| `config.applied` / `config.apply_failed` | 设置已保存并生效 / 失败保留原设置 |
 | `preview.sample_unavailable` / `preview.failed` | 采样暂不可用或预览因错误停止 |
 | `tray.notification_accepted` | Windows 已接受通知请求，不保证用户看到了通知 |
 | `tray.balloon_show` | 收到 Shell 的通知显示回调 |

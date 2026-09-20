@@ -5,12 +5,14 @@ use windows::Win32::UI::HiDpi::{
 
 pub mod capture;
 pub mod clipboard;
+pub mod config_path;
 pub mod host;
 pub mod hotkey;
 pub mod input;
 pub mod instance;
 pub mod monitors;
 pub mod session;
+pub mod settings;
 pub mod tray;
 
 pub fn check_environment() -> windows::core::Result<()> {

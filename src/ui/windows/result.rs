@@ -74,6 +74,7 @@ struct Pending {
 
 struct CallbackState {
     notify_hwnd: HWND,
+    default_format: ColorFormat,
     pending: Cell<Pending>,
     wake_posted: Cell<bool>,
     wake_failed: Cell<bool>,
@@ -206,6 +207,15 @@ pub struct ResultWindow {
 
 impl ResultWindow {
     pub fn new(picked: PickedColor, notify_hwnd: HWND) -> Result<Self> {
+        Self::new_with_options(picked, notify_hwnd, ColorFormat::Hex, false)
+    }
+
+    pub fn new_with_options(
+        picked: PickedColor,
+        notify_hwnd: HWND,
+        default_format: ColorFormat,
+        auto_copy: bool,
+    ) -> Result<Self> {
         let instance = unsafe { GetModuleHandleW(None)? }.into();
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
@@ -222,6 +232,7 @@ impl ResultWindow {
         }
         let callback = Box::new(CallbackState {
             notify_hwnd,
+            default_format,
             pending: Cell::new(Pending::default()),
             wake_posted: Cell::new(false),
             wake_failed: Cell::new(false),
@@ -275,6 +286,13 @@ impl ResultWindow {
             let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
             let _ = SetForegroundWindow(hwnd);
             let _ = SetFocus(Some(window.controls.default_copy));
+        }
+        if auto_copy {
+            // The host constructs this window only after capture/input cleanup.
+            // Clipboard access stays in process_pending, just like button copies.
+            window
+                .callback
+                .queue(|pending| pending.copy = Some(default_format));
         }
         Ok(window)
     }
@@ -381,7 +399,7 @@ impl ResultWindow {
         }
         self.controls.default_copy = self.control(
             w!("BUTTON"),
-            "复制默认格式（HEX）",
+            &format!("复制默认格式（{}）", self.callback.default_format.label()),
             COPY_DEFAULT,
             WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
             WINDOW_EX_STYLE::default(),
@@ -746,7 +764,7 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             match wparam.0 & 0xffff {
                 CLOSE => state.queue(|pending| pending.action = Some(ResultAction::Close)),
                 PICK_AGAIN => state.queue(|pending| pending.action = Some(ResultAction::PickAgain)),
-                COPY_DEFAULT => state.queue(|pending| pending.copy = Some(ColorFormat::Hex)),
+                COPY_DEFAULT => state.queue(|pending| pending.copy = Some(state.default_format)),
                 id if (COPY_ROW..COPY_ROW + 4).contains(&id) => {
                     state.queue(|pending| pending.copy = Some(ColorFormat::ALL[id - COPY_ROW]))
                 }

@@ -1,7 +1,9 @@
 use super::color::{Hsl, Rgb8};
+use serde::{Deserialize, Serialize};
 
 /// UI display and clipboard output must share this formatter.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ColorFormat {
     #[default]
     Hex,

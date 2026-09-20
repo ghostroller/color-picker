@@ -64,7 +64,7 @@ impl PreviewController {
     }
 
     pub fn start(&mut self) -> Result<bool> {
-        if self.active() {
+        if !self.activation_allowed() {
             return Ok(false);
         }
         self.completed = None;
@@ -112,6 +112,9 @@ impl PreviewController {
     pub fn active(&self) -> bool {
         self.machine.session_id().is_some()
     }
+    pub fn activation_allowed(&self) -> bool {
+        matches!(self.state(), AppState::Idle | AppState::Result(_))
+    }
     pub fn input_wait_handle(&self) -> Option<HANDLE> {
         self.session
             .as_ref()
@@ -136,6 +139,12 @@ impl PreviewController {
     }
     pub fn close_result(&mut self) -> Result<()> {
         self.transition(Event::CloseResult)
+    }
+    pub fn open_settings(&mut self) -> Result<()> {
+        self.transition(Event::OpenSettings)
+    }
+    pub fn close_settings(&mut self) -> Result<()> {
+        self.transition(Event::CloseSettings)
     }
 
     pub fn state_code(&self) -> isize {

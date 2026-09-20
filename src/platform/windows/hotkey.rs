@@ -2,14 +2,16 @@ use std::{marker::PhantomData, rc::Rc};
 
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{E_INVALIDARG, HWND},
         UI::Input::KeyboardAndMouse::{
-            HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey,
+            HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey,
             UnregisterHotKey, VK_C,
         },
     },
-    core::Result,
+    core::{Error, Result},
 };
+
+use crate::app::config::HotkeyConfig;
 
 pub const DEFAULT_HOTKEY_ID: i32 = 1;
 
@@ -28,6 +30,23 @@ pub struct HotkeyGuard {
 }
 
 impl HotkeyGuard {
+    pub fn register_config(hwnd: HWND, id: i32, config: &HotkeyConfig) -> Result<Self> {
+        let key = config
+            .virtual_key()
+            .map_err(|error| Error::new(E_INVALIDARG, error.to_string()))?;
+        let mut modifiers = MOD_NOREPEAT;
+        if config.ctrl {
+            modifiers |= MOD_CONTROL;
+        }
+        if config.alt {
+            modifiers |= MOD_ALT;
+        }
+        if config.shift {
+            modifiers |= MOD_SHIFT;
+        }
+        Self::register(hwnd, id, modifiers, key)
+    }
+
     pub fn register(hwnd: HWND, id: i32, modifiers: HOT_KEY_MODIFIERS, vk: u32) -> Result<Self> {
         // SAFETY: registration only passes the window handle and scalar values
         // to Win32; failure (including a conflict) is returned to the caller.

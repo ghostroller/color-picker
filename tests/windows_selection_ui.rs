@@ -6,6 +6,7 @@
 mod pixel_fixture;
 
 use color_picker::{
+    app::config::{Config, HotkeyConfig},
     core::{
         color::Rgb8,
         format::{ColorFormat, format_color},
@@ -17,16 +18,18 @@ use color_picker::{
     ui::windows::{
         magnifier::MagnifierWindow,
         result::{ResultAction, ResultWindow},
+        settings::{SettingsAction, SettingsWindow},
     },
 };
 use pixel_fixture::ScopedPmv2;
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, WPARAM},
         Graphics::Gdi::UpdateWindow,
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, ES_READONLY, GWL_STYLE, GetDlgItem, GetWindowLongW,
-            GetWindowTextW, IsWindow, SendMessageW, WINDOW_EX_STYLE, WM_CLOSE, WS_OVERLAPPED,
+            BM_SETCHECK, CB_GETCOUNT, CreateWindowExW, DestroyWindow, ES_READONLY, GWL_STYLE,
+            GetDlgItem, GetWindowLongW, GetWindowTextW, IsWindow, SendMessageW, WINDOW_EX_STYLE,
+            WM_CLOSE, WM_COMMAND, WS_OVERLAPPED,
         },
     },
     core::w,
@@ -129,9 +132,11 @@ fn cached_selection_and_native_result_controls_smoke() {
         }
         .unwrap(),
     );
-    let result = ResultWindow::new(picked, owner.0).unwrap();
+    let result = ResultWindow::new_with_options(picked, owner.0, ColorFormat::Hsl, false).unwrap();
     let result_hwnd = result.hwnd();
     assert_eq!(result.process_pending().unwrap(), None);
+    let default_copy = unsafe { GetDlgItem(Some(result_hwnd), 1) }.unwrap();
+    assert!(window_text(default_copy).contains("HSL"));
     for (index, format) in ColorFormat::ALL.into_iter().enumerate() {
         let edit = unsafe { GetDlgItem(Some(result_hwnd), 30 + index as i32) }.unwrap();
         let mut text = [0_u16; 128];
@@ -149,10 +154,63 @@ fn cached_selection_and_native_result_controls_smoke() {
     assert_eq!(result.process_pending().unwrap(), Some(ResultAction::Close));
     drop(result);
     assert!(!unsafe { IsWindow(Some(result_hwnd)) }.as_bool());
+
+    let config = Config {
+        hotkey: HotkeyConfig {
+            ctrl: false,
+            alt: true,
+            shift: true,
+            key: "F11".to_owned(),
+        },
+        default_format: ColorFormat::CssRgb,
+        auto_copy_on_pick: true,
+        ..Config::default()
+    };
+    let settings =
+        SettingsWindow::new(&config, owner.0, Some("控件测试；不会保存配置"), true).unwrap();
+    let settings_hwnd = settings.hwnd();
+    assert_eq!(settings.process_pending().unwrap(), None);
+    for (id, count) in [(104, 47), (105, 4)] {
+        let combo = unsafe { GetDlgItem(Some(settings_hwnd), id) }.unwrap();
+        assert_eq!(
+            unsafe { SendMessageW(combo, CB_GETCOUNT, None, None) }.0,
+            count
+        );
+    }
+    unsafe { SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None) };
+    assert_eq!(
+        settings.process_pending().unwrap(),
+        Some(SettingsAction::Apply(config.clone()))
+    );
+    // Removing both Ctrl and Alt is invalid; no draft may reach persistence.
+    let alt = unsafe { GetDlgItem(Some(settings_hwnd), 102) }.unwrap();
+    unsafe {
+        SendMessageW(alt, BM_SETCHECK, Some(WPARAM(0)), None);
+        SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None);
+    }
+    assert_eq!(settings.process_pending().unwrap(), None);
+    unsafe { SendMessageW(settings_hwnd, WM_CLOSE, None, None) };
+    assert_eq!(
+        settings.process_pending().unwrap(),
+        Some(SettingsAction::Close)
+    );
+    drop(settings);
+    assert!(!unsafe { IsWindow(Some(settings_hwnd)) }.as_bool());
+
+    let readonly = SettingsWindow::new(&config, owner.0, None, false).unwrap();
+    unsafe { SendMessageW(readonly.hwnd(), WM_COMMAND, Some(WPARAM(1)), None) };
+    assert_eq!(readonly.process_pending().unwrap(), None);
+    drop(readonly);
     assert!(unsafe { IsWindow(Some(owner.0)) }.as_bool());
     let owner_hwnd = owner.0;
     drop(owner);
     assert!(!unsafe { IsWindow(Some(owner_hwnd)) }.as_bool());
+}
+
+fn window_text(hwnd: HWND) -> String {
+    let mut text = [0_u16; 256];
+    let length = unsafe { GetWindowTextW(hwnd, &mut text) };
+    String::from_utf16(&text[..length as usize]).unwrap()
 }
 
 struct TestOwner(HWND);

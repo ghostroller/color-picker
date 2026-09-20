@@ -28,13 +28,16 @@ use windows::{
 use crate::{
     app::{controller::PreviewController, diagnostics},
     core::format::{ColorFormat, format_color},
-    ui::windows::result::{ResultAction, ResultWindow, WM_RESULT_WAKE},
+    ui::windows::{
+        result::{ResultAction, ResultWindow, WM_RESULT_WAKE},
+        settings::{SettingsAction, SettingsWindow, WM_SETTINGS_WAKE},
+    },
 };
 
 use super::{
-    hotkey,
     input::WM_INPUT_WAKE,
     instance::{InstanceStatus, SingleInstance, instance_key},
+    settings::SettingsRuntime,
     tray::{TrayCommand, TrayIcon},
 };
 
@@ -48,34 +51,37 @@ pub const WM_DIAGNOSTICS: u32 = WM_APP + 3;
 pub const WM_STOP_PREVIEW: u32 = WM_APP + 4;
 
 // Activation source bits preserve logging even when the request must be ignored.
-const ACTIVATE: u16 = 1;
-const MENU: u16 = 2;
-const EXIT: u16 = 4;
-const RESTORE_TRAY: u16 = 8;
-const ENVIRONMENT_CHANGED: u16 = 16;
-const HOTKEY_ACTIVATE: u16 = 32;
-const TRAY_ACTIVATE: u16 = 64;
-const BALLOON_SHOW: u16 = 128;
-const BALLOON_HIDE: u16 = 256;
-const BALLOON_TIMEOUT: u16 = 512;
-const SAMPLE_TICK: u16 = 1024;
-const STOP_PREVIEW: u16 = 2048;
-const START_REQUEST: u16 = 4096;
-const ACTIVATION_IGNORED: u16 = 8192;
-const INPUT_WAKE: u16 = 16384;
-const RESULT_WAKE: u16 = 32768;
+const ACTIVATE: u32 = 1;
+const MENU: u32 = 2;
+const EXIT: u32 = 4;
+const RESTORE_TRAY: u32 = 8;
+const ENVIRONMENT_CHANGED: u32 = 16;
+const HOTKEY_ACTIVATE: u32 = 32;
+const TRAY_ACTIVATE: u32 = 64;
+const BALLOON_SHOW: u32 = 128;
+const BALLOON_HIDE: u32 = 256;
+const BALLOON_TIMEOUT: u32 = 512;
+const SAMPLE_TICK: u32 = 1024;
+const STOP_PREVIEW: u32 = 2048;
+const START_REQUEST: u32 = 4096;
+const ACTIVATION_IGNORED: u32 = 8192;
+const INPUT_WAKE: u32 = 16384;
+const RESULT_WAKE: u32 = 32768;
+const SETTINGS_WAKE: u32 = 65536;
 // shellapi.h defines this expression; windows 0.62.2 does not emit that macro.
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 
 thread_local! {
     // Cells have no dynamic borrows, callbacks cannot alias the main-thread app.
-    static PENDING: Cell<u16> = const { Cell::new(0) };
+    static PENDING: Cell<u32> = const { Cell::new(0) };
     static TASKBAR_MESSAGE: Cell<u32> = const { Cell::new(0) };
     static CALLBACK_FAILED: Cell<bool> = const { Cell::new(false) };
     static DIAGNOSTICS: Cell<bool> = const { Cell::new(false) };
     static READY: Cell<bool> = const { Cell::new(false) };
     static ACTIVATIONS: Cell<u32> = const { Cell::new(0) };
     static HOTKEY_REGISTERED: Cell<bool> = const { Cell::new(false) };
+    static ACCEPTED_HOTKEY: Cell<i32> = const { Cell::new(0) };
+    static ACTIVATION_BLOCKED: Cell<bool> = const { Cell::new(false) };
     static TRAY_ADDED: Cell<bool> = const { Cell::new(false) };
     static TRAY_RESTORATIONS: Cell<u32> = const { Cell::new(0) };
     static PREVIEW_ACTIVE: Cell<bool> = const { Cell::new(false) };
@@ -129,27 +135,11 @@ pub fn run(diagnostics: bool) -> Result<()> {
     let mut tray = TrayIcon::new(window.0, WM_TRAY)?;
     TRAY_ADDED.set(true);
     diagnostics::event(format_args!("tray.registered version=4"));
-    let hotkey = match hotkey::register_default(window.0) {
-        Ok(guard) => {
-            diagnostics::event(format_args!(
-                "hotkey.registered chord=Ctrl+Alt+C id={} norepeat=true",
-                guard.id()
-            ));
-            Some(guard)
-        }
-        Err(error) => {
-            diagnostics::event(format_args!(
-                "hotkey.registration_failed chord=Ctrl+Alt+C error={error}"
-            ));
-            notify(
-                &tray,
-                "快捷键注册失败",
-                &format!("Ctrl + Alt + C 不可用：{error}。仍可通过托盘开始取色。"),
-            );
-            None
-        }
-    };
-    HOTKEY_REGISTERED.set(hotkey.is_some());
+    let mut settings = SettingsRuntime::load(window.0);
+    publish_hotkey_status(&settings);
+    if let Some(notice) = settings.notice.as_deref() {
+        notify(&tray, "设置提示", notice);
+    }
     let session_notifications = match SessionNotifications::new(window.0) {
         Ok(guard) => {
             diagnostics::event(format_args!("session_notifications.registered"));
@@ -169,16 +159,17 @@ pub fn run(diagnostics: bool) -> Result<()> {
     };
     READY.set(true);
     diagnostics::event(format_args!(
-        "host.ready hotkey_registered={} stage=M5; left click picks, wheel zooms, right click or Esc cancels",
-        hotkey.is_some()
+        "host.ready hotkey_registered={} stage=M6; left click picks, wheel zooms, right click or Esc cancels",
+        settings.hotkey_id().is_some()
     ));
 
-    let result = message_loop(window.0, &mut tray);
+    let result = message_loop(window.0, &mut tray, &mut settings);
     READY.set(false);
     HOTKEY_REGISTERED.set(false);
+    ACCEPTED_HOTKEY.set(0);
     TRAY_ADDED.set(false);
     drop(session_notifications);
-    drop(hotkey);
+    drop(settings);
     drop(tray);
     drop(window);
     drop(class);
@@ -186,14 +177,26 @@ pub fn run(diagnostics: bool) -> Result<()> {
     result
 }
 
-fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
+fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime) -> Result<()> {
     let mut controller = PreviewController::new(hwnd);
     let mut result_window: Option<ResultWindow> = None;
+    let mut settings_window: Option<SettingsWindow> = None;
     let mut exiting = false;
     let mut deferred_menu = false;
     loop {
         if CALLBACK_FAILED.get() {
             return Err(Error::new(E_FAIL, "Failed to wake the host message loop"));
+        }
+        // Broadcasts/exit already received must invalidate a pending candidate
+        // before worker completion can promote it to Result and auto-copy it.
+        let cancellation = PENDING.get() & (EXIT | ENVIRONMENT_CHANGED | STOP_PREVIEW);
+        if cancellation & EXIT != 0 {
+            exiting = true;
+            result_window.take();
+            settings_window.take();
+        }
+        if cancellation != 0 {
+            controller.stop("pending_cancellation");
         }
         if let Err(error) = controller.process_input() {
             diagnostics::event(format_args!("input.failed error={error}"));
@@ -204,21 +207,29 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
             && !exiting
         {
             result_window.take();
-            match ResultWindow::new(picked, hwnd) {
+            match ResultWindow::new_with_options(
+                picked,
+                hwnd,
+                settings.config.default_format,
+                settings.config.auto_copy_on_pick,
+            ) {
                 Ok(window) => {
                     result_window = Some(window);
                     diagnostics::event(format_args!(
                         "result.shown resources_released_before_show=true"
                     ));
                 }
-                Err(error) => notify(
-                    tray,
-                    "结果窗口无法显示",
-                    &format!(
-                        "已取色 {}。{error}",
-                        format_color(picked.rgb, ColorFormat::Hex)
-                    ),
-                ),
+                Err(error) => {
+                    controller.close_result()?;
+                    notify(
+                        tray,
+                        "结果窗口无法显示",
+                        &format!(
+                            "已取色 {}。{error}",
+                            format_color(picked.rgb, ColorFormat::Hex)
+                        ),
+                    );
+                }
             }
         }
         if let Some(window) = result_window.as_ref() {
@@ -226,7 +237,7 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
                 Ok(Some(action)) => {
                     result_window.take();
                     controller.close_result()?;
-                    if action == ResultAction::PickAgain && !exiting {
+                    if action == ResultAction::PickAgain && !exiting && cancellation == 0 {
                         activate(tray, &mut controller, &mut result_window);
                     }
                 }
@@ -237,6 +248,32 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
                 }
             }
         }
+        if let Some(window) = settings_window.as_ref() {
+            match window.process_pending() {
+                Ok(Some(SettingsAction::Apply(config))) => match settings.apply(hwnd, config) {
+                    Ok(old_hotkey) => {
+                        publish_hotkey_status(settings);
+                        drop(old_hotkey);
+                        window
+                            .show_status("设置已保存。关闭此窗口后可使用新的快捷键取色。", true)?;
+                    }
+                    Err(error) => {
+                        diagnostics::event(format_args!("config.apply_failed error={error}"));
+                        window.show_status(&error, false)?;
+                    }
+                },
+                Ok(Some(SettingsAction::Close)) => {
+                    settings_window.take();
+                    controller.close_settings()?;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    diagnostics::event(format_args!("settings.failed error={error}"));
+                    window.show_status(&error.to_string(), false)?;
+                }
+            }
+        }
+        publish_preview_status(&controller);
         if exiting && !controller.active() {
             return Ok(());
         }
@@ -257,6 +294,7 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
                 diagnostics::event(format_args!("host.exit_requested"));
                 exiting = true;
                 result_window.take();
+                settings_window.take();
                 controller.stop("host_exit");
                 publish_preview_status(&controller);
             }
@@ -302,7 +340,10 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
                 }
             }
             if pending & HOTKEY_ACTIVATE != 0 {
-                diagnostics::event(format_args!("hotkey.received chord=Ctrl+Alt+C"));
+                diagnostics::event(format_args!(
+                    "hotkey.received chord={}",
+                    settings.config.hotkey.label()
+                ));
             }
             if pending & TRAY_ACTIVATE != 0 {
                 diagnostics::event(format_args!("tray.activation_received"));
@@ -315,7 +356,7 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
                 || activate(tray, &mut controller, &mut result_window),
                 || {
                     diagnostics::event(format_args!(
-                        "activation.ignored reason=preview_already_active"
+                        "activation.ignored reason=picker_or_settings_active"
                     ))
                 },
             );
@@ -339,10 +380,29 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
                         diagnostics::event(format_args!("tray.menu_selected command=stop"));
                     }
                     Some(TrayCommand::Settings) => {
-                        controller.stop("settings");
-                        result_window.take();
-                        controller.close_result()?;
-                        notify(tray, "设置", "快捷键和复制设置将在后续版本接入。");
+                        if let Some(window) = settings_window.as_ref() {
+                            unsafe {
+                                let _ = ShowWindow(window.hwnd(), SW_RESTORE);
+                                let _ = SetForegroundWindow(window.hwnd());
+                            }
+                        } else {
+                            result_window.take();
+                            controller.close_result()?;
+                            controller.open_settings()?;
+                            publish_preview_status(&controller);
+                            match SettingsWindow::new(
+                                &settings.config,
+                                hwnd,
+                                settings.notice.as_deref(),
+                                settings.save_allowed,
+                            ) {
+                                Ok(window) => settings_window = Some(window),
+                                Err(error) => {
+                                    controller.close_settings()?;
+                                    notify(tray, "无法打开设置", &error.to_string());
+                                }
+                            }
+                        }
                     }
                     Some(TrayCommand::Exit) => {
                         diagnostics::event(format_args!("tray.menu_selected command=exit"));
@@ -397,10 +457,16 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
         if status == 0 {
             exiting = true;
             result_window.take();
+            settings_window.take();
             controller.stop("quit_message");
             continue;
         }
         if let Some(window) = result_window.as_ref()
+            && unsafe { IsDialogMessageW(window.hwnd(), &message) }.as_bool()
+        {
+            continue;
+        }
+        if let Some(window) = settings_window.as_ref()
             && unsafe { IsDialogMessageW(window.hwnd(), &message) }.as_bool()
         {
             continue;
@@ -417,6 +483,12 @@ fn activate(
     controller: &mut PreviewController,
     result_window: &mut Option<ResultWindow>,
 ) {
+    if !controller.activation_allowed() {
+        diagnostics::event(format_args!(
+            "activation.ignored reason=picker_or_settings_active"
+        ));
+        return;
+    }
     if !controller.active() {
         // Destroy the result and flush before sampling so it cannot become part
         // of the next pick, including a hotkey pressed over that same window.
@@ -431,7 +503,7 @@ fn activate(
         Ok(true) => {
             ACTIVATIONS.set(ACTIVATIONS.get().saturating_add(1));
             diagnostics::event(format_args!(
-                "activation.handled count={} stage=M5",
+                "activation.handled count={} stage=M6",
                 ACTIVATIONS.get()
             ));
         }
@@ -448,10 +520,16 @@ fn activate(
 
 fn publish_preview_status(controller: &PreviewController) {
     PREVIEW_ACTIVE.set(controller.active());
+    ACTIVATION_BLOCKED.set(!controller.activation_allowed());
     ACTIVE_TIMER.set(controller.timer_id());
     PREVIEW_SESSION.set(controller.session_id());
     SAMPLE_ATTEMPTS.set(controller.sample_attempts());
     PICKER_STATE.set(controller.state_code());
+}
+
+fn publish_hotkey_status(settings: &SettingsRuntime) {
+    ACCEPTED_HOTKEY.set(settings.hotkey_id().unwrap_or(0));
+    HOTKEY_REGISTERED.set(settings.hotkey_id().is_some());
 }
 
 fn notify(tray: &TrayIcon, title: &str, message: &str) {
@@ -487,7 +565,7 @@ fn activate_existing() -> Result<()> {
     ))
 }
 
-fn enqueue(hwnd: HWND, action: u16) {
+fn enqueue(hwnd: HWND, action: u32) {
     let previous = PENDING.replace(PENDING.get() | action);
     if previous != 0 {
         return;
@@ -502,7 +580,7 @@ fn enqueue(hwnd: HWND, action: u16) {
 
 /// Capture eligibility at receipt, before a nested menu loop can stop the
 /// preview. Source bits alone must never turn into a later start request.
-fn activation_intent(source: u16, preview_active: bool) -> u16 {
+fn activation_intent(source: u32, preview_active: bool) -> u32 {
     source
         | if preview_active {
             ACTIVATION_IGNORED
@@ -511,7 +589,7 @@ fn activation_intent(source: u16, preview_active: bool) -> u16 {
         }
 }
 
-fn dispatch_activation_intent(pending: u16, start: impl FnOnce(), ignored: impl FnOnce()) {
+fn dispatch_activation_intent(pending: u32, start: impl FnOnce(), ignored: impl FnOnce()) {
     if pending & ACTIVATION_IGNORED != 0 {
         ignored();
     }
@@ -540,20 +618,24 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
     match message {
         WM_INPUT_WAKE => enqueue(hwnd, INPUT_WAKE),
         WM_RESULT_WAKE => enqueue(hwnd, RESULT_WAKE),
+        WM_SETTINGS_WAKE => enqueue(hwnd, SETTINGS_WAKE),
         WM_TIMER if wparam.0 != 0 && wparam.0 == ACTIVE_TIMER.get() => {
             PENDING_TIMER.set(wparam.0);
             enqueue(hwnd, SAMPLE_TICK);
         }
         WM_STOP_PREVIEW if DIAGNOSTICS.get() => enqueue(hwnd, STOP_PREVIEW),
-        WM_ACTIVATE_PICKER => enqueue(hwnd, activation_intent(ACTIVATE, PREVIEW_ACTIVE.get())),
-        WM_HOTKEY if wparam.0 == hotkey::DEFAULT_HOTKEY_ID as usize => enqueue(
-            hwnd,
-            activation_intent(HOTKEY_ACTIVATE, PREVIEW_ACTIVE.get()),
-        ),
+        WM_ACTIVATE_PICKER => enqueue(hwnd, activation_intent(ACTIVATE, ACTIVATION_BLOCKED.get())),
+        WM_HOTKEY if ACCEPTED_HOTKEY.get() != 0 && wparam.0 == ACCEPTED_HOTKEY.get() as usize => {
+            enqueue(
+                hwnd,
+                activation_intent(HOTKEY_ACTIVATE, ACTIVATION_BLOCKED.get()),
+            )
+        }
         WM_TRAY => match (lparam.0 as u32) & 0xffff {
-            NIN_SELECT | NIN_KEYSELECT => {
-                enqueue(hwnd, activation_intent(TRAY_ACTIVATE, PREVIEW_ACTIVE.get()))
-            }
+            NIN_SELECT | NIN_KEYSELECT => enqueue(
+                hwnd,
+                activation_intent(TRAY_ACTIVATE, ACTIVATION_BLOCKED.get()),
+            ),
             WM_CONTEXTMENU => enqueue(hwnd, MENU),
             NIN_BALLOONSHOW => enqueue(hwnd, BALLOON_SHOW),
             NIN_BALLOONHIDE => enqueue(hwnd, BALLOON_HIDE),
@@ -677,7 +759,7 @@ mod tests {
             }
         }
 
-        fn receive(&self, pending: &mut u16, source: u16) {
+        fn receive(&self, pending: &mut u32, source: u32) {
             *pending |= activation_intent(source, self.active.get());
         }
 
@@ -685,7 +767,7 @@ mod tests {
             self.active.set(false);
         }
 
-        fn drain(&self, pending: u16) {
+        fn drain(&self, pending: u32) {
             dispatch_activation_intent(
                 pending,
                 || {
