@@ -19,30 +19,41 @@ fn main() -> std::process::ExitCode {
         {
             let message = format!("无法打开诊断日志 {}：{error}", path.display());
             eprintln!("{message}");
-            if !options.check_environment {
+            if !options.check_environment && !options.quit {
                 color_picker::platform::windows::host::show_error(&message);
             }
             return std::process::ExitCode::FAILURE;
         }
         diagnostics::event(format_args!(
-            "app.start version={} check_environment={} diagnostics={}",
+            "app.start version={} check_environment={} diagnostics={} startup={} quit={}",
             env!("CARGO_PKG_VERSION"),
             options.check_environment,
-            options.diagnostics
+            options.diagnostics,
+            options.startup,
+            options.quit,
         ));
-        let result = color_picker::platform::windows::check_environment().and_then(|()| {
-            diagnostics::event(format_args!("environment.pmv2_ok"));
-            if options.check_environment {
-                println!("color-picker: PerMonitorV2 active");
-                Ok(())
-            } else {
-                color_picker::platform::windows::host::run(options.diagnostics)
-            }
-        });
+        // Installer control never creates resident resources or checks display
+        // requirements: it only asks this installation's existing process to exit.
+        let result = if options.quit {
+            color_picker::platform::windows::host::quit_current_installation()
+        } else {
+            color_picker::platform::windows::check_environment().and_then(|()| {
+                diagnostics::event(format_args!("environment.pmv2_ok"));
+                if options.check_environment {
+                    println!("color-picker: PerMonitorV2 active");
+                    Ok(())
+                } else {
+                    color_picker::platform::windows::host::run_with_startup(
+                        options.diagnostics,
+                        options.startup,
+                    )
+                }
+            })
+        };
         if let Err(error) = result {
             eprintln!("color-picker: {error}");
             diagnostics::event(format_args!("app.error error={error}"));
-            if !options.check_environment {
+            if !options.check_environment && !options.quit {
                 color_picker::platform::windows::host::show_error(&error.to_string());
             }
             return std::process::ExitCode::FAILURE;

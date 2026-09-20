@@ -1,11 +1,12 @@
 use std::{ffi::OsString, path::PathBuf};
 
-pub const USAGE: &str =
-    "Usage: color-picker [--check-environment] [--diagnostics] [--log-file <path>]";
+pub const USAGE: &str = "Usage: color-picker [--startup | --quit | --check-environment] [--diagnostics] [--log-file <path>]";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Options {
     pub check_environment: bool,
+    pub startup: bool,
+    pub quit: bool,
     pub diagnostics: bool,
     pub log_file: Option<PathBuf>,
 }
@@ -17,6 +18,10 @@ impl Options {
         while let Some(argument) = arguments.next() {
             if argument == "--check-environment" {
                 options.check_environment = true;
+            } else if argument == "--startup" {
+                options.startup = true;
+            } else if argument == "--quit" {
+                options.quit = true;
             } else if argument == "--diagnostics" {
                 options.diagnostics = true;
             } else if argument == "--log-file" {
@@ -32,6 +37,11 @@ impl Options {
             } else {
                 return Err(format!("Unknown argument: {}", argument.to_string_lossy()));
             }
+        }
+        if u8::from(options.startup) + u8::from(options.quit) + u8::from(options.check_environment)
+            > 1
+        {
+            return Err("--startup, --quit and --check-environment cannot be combined".into());
         }
         Ok(options)
     }
@@ -66,8 +76,22 @@ mod tests {
             vec!["--log-file", ""],
             vec!["--log-file", "a", "--log-file", "b"],
             vec!["--unknown"],
+            vec!["--startup", "--quit"],
+            vec!["--startup", "--check-environment"],
+            vec!["--quit", "--check-environment"],
         ] {
             assert!(parse(&arguments).is_err());
         }
+    }
+
+    #[test]
+    fn automatic_start_and_quit_are_explicit_separate_modes() {
+        assert!(parse(&["--startup"]).unwrap().startup);
+        let quit = parse(&["--quit"]).unwrap();
+        assert!(quit.quit);
+        assert!(!quit.startup);
+        assert!(!quit.check_environment);
+        assert!(!quit.diagnostics);
+        assert!(quit.log_file.is_none());
     }
 }

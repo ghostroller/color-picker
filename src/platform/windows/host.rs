@@ -2,12 +2,19 @@
 //! application work runs after DispatchMessage returns, with no borrowed window
 //! data surviving a reentrant Win32 call. No HWND userdata allocation is needed.
 
-use std::{cell::Cell, time::Duration};
+use std::{
+    cell::Cell,
+    ffi::OsString,
+    os::windows::ffi::OsStringExt,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use windows::{
     Win32::{
         Foundation::{
-            E_FAIL, HINSTANCE, HWND, LPARAM, LRESULT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+            CloseHandle, E_FAIL, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, HANDLE, HINSTANCE,
+            HWND, LPARAM, LRESULT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
         },
         System::{
             LibraryLoader::GetModuleHandleW,
@@ -15,14 +22,18 @@ use windows::{
                 NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification,
                 WTSUnRegisterSessionNotification,
             },
-            Threading::INFINITE,
+            Threading::{
+                INFINITE, OpenMutexW, OpenProcess, PROCESS_NAME_WIN32,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
+                SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+            },
         },
         UI::{
             Shell::{NIN_BALLOONHIDE, NIN_BALLOONSHOW, NIN_BALLOONTIMEOUT, NIN_SELECT, NINF_KEY},
             WindowsAndMessaging::*,
         },
     },
-    core::{Error, PCWSTR, Result, w},
+    core::{Error, HRESULT, PCWSTR, PWSTR, Result, w},
 };
 
 use crate::{
@@ -93,12 +104,21 @@ thread_local! {
 }
 
 pub fn run(diagnostics: bool) -> Result<()> {
+    run_with_startup(diagnostics, false)
+}
+
+/// Automatic launches should never start picking in an already running process.
+pub fn run_with_startup(diagnostics: bool, startup: bool) -> Result<()> {
     let _instance = match SingleInstance::acquire()? {
         InstanceStatus::Primary(instance) => {
             diagnostics::event(format_args!("instance.primary"));
             instance
         }
         InstanceStatus::Existing => {
+            if startup {
+                diagnostics::event(format_args!("instance.startup_already_running"));
+                return Ok(());
+            }
             diagnostics::event(format_args!(
                 "instance.existing logging_applies_to_this_process_only; exit the old instance from its tray and restart with --log-file to trace hotkeys"
             ));
@@ -201,7 +221,9 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime)
         }
         if let Err(error) = controller.process_input() {
             diagnostics::event(format_args!("input.failed error={error}"));
-            notify(tray, "取色已停止", &error.to_string());
+            if !exiting {
+                notify(tray, "取色已停止", &error.to_string());
+            }
         }
         publish_preview_status(&controller);
         if let Some(picked) = controller.take_result()
@@ -548,6 +570,132 @@ fn notify(tray: &TrayIcon, title: &str, message: &str) {
     }
 }
 
+/// Installer control: close only the resident executable at our own path.
+/// This never acquires the single-instance marker or starts the application.
+pub fn quit_current_installation() -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let key = instance_key()?;
+    let title = wide(&key);
+    let marker = wide(&format!("Local\\{key}.Instance"));
+    let Some(hwnd) = wait_for_existing_host(&title, &marker, deadline)? else {
+        return Ok(());
+    };
+    let mut pid = 0;
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) } == 0 {
+        // The host can disappear between FindWindow and this lookup.
+        return Ok(());
+    }
+    let process = match unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
+    } {
+        Ok(handle) => OwnedHandle(handle),
+        Err(error) if error.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if unsafe { WaitForSingleObject(process.0, 0) } == WAIT_OBJECT_0 {
+        return Ok(());
+    }
+    let mut path = vec![0_u16; 32768];
+    let mut length = path.len() as u32;
+    if let Err(error) = unsafe {
+        QueryFullProcessImageNameW(
+            process.0,
+            PROCESS_NAME_WIN32,
+            PWSTR(path.as_mut_ptr()),
+            &mut length,
+        )
+    } {
+        return if unsafe { WaitForSingleObject(process.0, 0) } == WAIT_OBJECT_0 {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    let resident_path = PathBuf::from(OsString::from_wide(&path[..length as usize]));
+    let own_path = std::env::current_exe()
+        .map_err(|error| Error::new(E_FAIL, format!("无法确定安装程序路径：{error}")))?;
+    if !same_installation(&own_path, &resident_path)
+        .map_err(|error| Error::new(E_FAIL, format!("无法核对运行中的程序路径：{error}")))?
+    {
+        diagnostics::event(format_args!("instance.quit_skipped reason=different_path"));
+        return Ok(());
+    }
+    // Keep the process HANDLE open while rechecking HWND ownership, so a stale
+    // lookup cannot turn a reused process ID into a request to another process.
+    let mut current_pid = 0;
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut current_pid)) } != 0 {
+        if current_pid != pid {
+            return Err(Error::new(E_FAIL, "程序窗口已改变，请重试退出操作"));
+        }
+        if let Err(error) = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }
+            && unsafe { WaitForSingleObject(process.0, 0) } != WAIT_OBJECT_0
+        {
+            return Err(error);
+        }
+    }
+    let remaining_ms = deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis() as u32;
+    match unsafe { WaitForSingleObject(process.0, remaining_ms) } {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_TIMEOUT => Err(Error::new(
+            E_FAIL,
+            "color-picker 未在 10 秒内退出，请通过托盘退出后重试",
+        )),
+        _ => Err(Error::from_thread()),
+    }
+}
+
+fn wait_for_existing_host(
+    title: &[u16],
+    marker: &[u16],
+    deadline: Instant,
+) -> Result<Option<HWND>> {
+    loop {
+        if !instance_marker_exists(marker)? {
+            return Ok(None);
+        }
+        if let Ok(hwnd) = unsafe { FindWindowW(HOST_CLASS, PCWSTR(title.as_ptr())) } {
+            return Ok(Some(hwnd));
+        }
+        // The first process owns its marker before it creates the host. Never
+        // tell an installer that process is absent during this startup gap.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::new(
+                E_FAIL,
+                "color-picker 已在运行，但控制窗口未在 10 秒内就绪，请退出后重试",
+            ));
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
+fn instance_marker_exists(name: &[u16]) -> Result<bool> {
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) } {
+        Ok(handle) => {
+            // Close on every probe: retaining this handle could itself keep an
+            // exited process's existence marker alive. Never acquire ownership.
+            let _marker = OwnedHandle(handle);
+            Ok(true)
+        }
+        Err(error) if error.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn same_installation(own_path: &Path, resident_path: &Path) -> std::io::Result<bool> {
+    // Resolve relative components, junctions and long/short path aliases before
+    // comparison. Do not accept a matching executable name in another folder.
+    Ok(own_path.canonicalize()? == resident_path.canonicalize()?)
+}
+
 fn activate_existing() -> Result<()> {
     let title = wide(&instance_key()?);
     // A second launch can race the first process's window creation. This is a
@@ -659,9 +807,17 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 _ => -1,
             });
         }
-        WM_CLOSE => enqueue(hwnd, EXIT),
+        WM_CLOSE => {
+            enqueue(hwnd, EXIT);
+            // Return from TrackPopupMenu's nested loop so the owner can drain
+            // input and release resources even while the tray menu is open.
+            let _ = unsafe { EndMenu() };
+        }
         WM_QUERYENDSESSION => return LRESULT(1),
-        WM_ENDSESSION if wparam.0 != 0 => enqueue(hwnd, EXIT),
+        WM_ENDSESSION if wparam.0 != 0 => {
+            enqueue(hwnd, EXIT);
+            let _ = unsafe { EndMenu() };
+        }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_WTSSESSION_CHANGE => {
             enqueue(hwnd, ENVIRONMENT_CHANGED)
         }
@@ -725,6 +881,14 @@ impl Drop for OwnedWindow {
     }
 }
 
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
 struct SessionNotifications(HWND);
 
 impl SessionNotifications {
@@ -743,6 +907,69 @@ impl Drop for SessionNotifications {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quit_waits_for_a_starting_instance_without_creating_or_retaining_its_marker() {
+        use windows::Win32::System::Threading::CreateMutexW;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let title = wide(&format!(
+            "color-picker-test-control-{}-{unique}",
+            std::process::id(),
+        ));
+        let marker = wide(&format!(
+            "Local\\color-picker-test-control-{}-{unique}.Instance",
+            std::process::id(),
+        ));
+        assert!(
+            wait_for_existing_host(&title, &marker, Instant::now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!instance_marker_exists(&marker).unwrap());
+        let running =
+            OwnedHandle(unsafe { CreateMutexW(None, false, PCWSTR(marker.as_ptr())).unwrap() });
+        assert!(instance_marker_exists(&marker).unwrap());
+        // A known process without a host window must fail when its shared
+        // deadline expires, rather than let installation proceed as if absent.
+        assert!(wait_for_existing_host(&title, &marker, Instant::now()).is_err());
+        drop(running);
+        assert!(!instance_marker_exists(&marker).unwrap());
+    }
+
+    #[test]
+    fn quit_matches_the_canonical_executable_path_not_another_installation() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "color-picker-host-paths-{}-{unique}",
+            std::process::id(),
+        ));
+        let installed = root.join("安装目录");
+        let portable = root.join("portable");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&installed).unwrap();
+        std::fs::create_dir(&portable).unwrap();
+        let own = installed.join("color-picker.exe");
+        let other = portable.join("color-picker.exe");
+        std::fs::write(&own, b"installed").unwrap();
+        std::fs::write(&other, b"portable").unwrap();
+        assert!(
+            same_installation(&own, &installed.join("..\\安装目录\\color-picker.exe")).unwrap()
+        );
+        assert!(!same_installation(&own, &other).unwrap());
+        assert!(same_installation(&own, &root.join("missing.exe")).is_err());
+        std::fs::remove_file(own).unwrap();
+        std::fs::remove_file(other).unwrap();
+        std::fs::remove_dir(installed).unwrap();
+        std::fs::remove_dir(portable).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     /// The real receipt/dispatch helpers run against a controlled preview owner.
     /// No window, input, timer, capture operation, or nested native menu is created.
