@@ -22,10 +22,14 @@ use windows::{
     core::{Error, PCWSTR, Result, w},
 };
 
-use crate::app::{controller::PreviewController, diagnostics};
+use crate::{
+    app::{controller::PreviewController, diagnostics},
+    core::format::{ColorFormat, format_color},
+};
 
 use super::{
     hotkey,
+    input::WM_INPUT_WAKE,
     instance::{InstanceStatus, SingleInstance, instance_key},
     tray::{TrayCommand, TrayIcon},
 };
@@ -54,6 +58,7 @@ const SAMPLE_TICK: u16 = 1024;
 const STOP_PREVIEW: u16 = 2048;
 const START_REQUEST: u16 = 4096;
 const ACTIVATION_IGNORED: u16 = 8192;
+const INPUT_WAKE: u16 = 16384;
 // shellapi.h defines this expression; windows 0.62.2 does not emit that macro.
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 
@@ -73,6 +78,7 @@ thread_local! {
     static PENDING_TIMER: Cell<usize> = const { Cell::new(0) };
     static SAMPLE_ATTEMPTS: Cell<u64> = const { Cell::new(0) };
     static PREVIEW_SESSION: Cell<u64> = const { Cell::new(0) };
+    static PICKER_STATE: Cell<isize> = const { Cell::new(0) };
 }
 
 pub fn run(diagnostics: bool) -> Result<()> {
@@ -158,7 +164,7 @@ pub fn run(diagnostics: bool) -> Result<()> {
     };
     READY.set(true);
     diagnostics::event(format_args!(
-        "host.ready hotkey_registered={} stage=M2; activation starts live preview, stop using the tray menu",
+        "host.ready hotkey_registered={} stage=M3; left click picks, right click or Esc cancels",
         hotkey.is_some()
     ));
 
@@ -177,9 +183,38 @@ pub fn run(diagnostics: bool) -> Result<()> {
 
 fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
     let mut controller = PreviewController::new(hwnd);
+    let mut exiting = false;
+    let mut deferred_menu = false;
     loop {
         if CALLBACK_FAILED.get() {
             return Err(Error::new(E_FAIL, "Failed to wake the host message loop"));
+        }
+        if let Err(error) = controller.process_input() {
+            diagnostics::event(format_args!("input.failed error={error}"));
+            notify(tray, "取色已停止", &error.to_string());
+        }
+        publish_preview_status(&controller);
+        if let Some(picked) = controller.take_result()
+            && !exiting
+        {
+            // M5 replaces this temporary shell result with the native result window.
+            notify(
+                tray,
+                "已取色",
+                &format!(
+                    "{}  X: {}  Y: {}",
+                    format_color(picked.rgb, ColorFormat::Hex),
+                    picked.source.x,
+                    picked.source.y
+                ),
+            );
+        }
+        if exiting && !controller.active() {
+            return Ok(());
+        }
+        if deferred_menu && !controller.active() {
+            deferred_menu = false;
+            PENDING.set(PENDING.get() | MENU);
         }
         // Drain before blocking too: a startup error dialog can consume WM_NULL
         // in its nested loop while leaving an activation/exit intention pending.
@@ -192,7 +227,12 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
             }
             if pending & EXIT != 0 {
                 diagnostics::event(format_args!("host.exit_requested"));
-                return Ok(());
+                exiting = true;
+                controller.stop("host_exit");
+                publish_preview_status(&controller);
+            }
+            if exiting {
+                continue;
             }
             // A topology, desktop/session or power transition invalidates the
             // current DC and coordinates. Never automatically resume capture.
@@ -252,13 +292,15 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
             );
             if pending & MENU != 0 {
                 diagnostics::event(format_args!("tray.menu_requested"));
-                let active = controller.active();
-                if let Err(error) = controller.pause_for_menu() {
-                    controller.stop("menu_pause_failure");
-                    notify(tray, "预览已停止", &error.to_string());
+                if controller.active() {
+                    // Native menus must not run while the input owner consumes
+                    // their clicks. Drain hooks asynchronously before opening.
+                    controller.stop("tray_menu");
+                    deferred_menu = true;
+                    publish_preview_status(&controller);
+                    continue;
                 }
-                publish_preview_status(&controller);
-                match tray.show_menu(active)? {
+                match tray.show_menu(false)? {
                     Some(TrayCommand::Start) => {
                         diagnostics::event(format_args!("tray.menu_selected command=start"));
                         activate(tray, &mut controller);
@@ -269,17 +311,15 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
                     }
                     Some(TrayCommand::Settings) => {
                         controller.stop("settings");
+                        controller.close_result()?;
                         notify(tray, "设置", "快捷键和复制设置将在后续版本接入。");
                     }
                     Some(TrayCommand::Exit) => {
                         diagnostics::event(format_args!("tray.menu_selected command=exit"));
-                        return Ok(());
+                        exiting = true;
+                        controller.stop("host_exit");
                     }
                     None => {}
-                }
-                if let Err(error) = controller.resume_after_menu() {
-                    controller.stop("menu_resume_failure");
-                    notify(tray, "预览已停止", &error.to_string());
                 }
                 publish_preview_status(&controller);
             }
@@ -292,17 +332,18 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
                 publish_preview_status(&controller);
             }
         }
+        if exiting && !controller.active() {
+            return Ok(());
+        }
         let mut message = MSG::default();
         let status = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
         if status == -1 {
             return Err(Error::from_thread());
         }
         if status == 0 {
-            return if CALLBACK_FAILED.get() {
-                Err(Error::new(E_FAIL, "Failed to wake the host message loop"))
-            } else {
-                Ok(())
-            };
+            exiting = true;
+            controller.stop("quit_message");
+            continue;
         }
         unsafe {
             let _ = TranslateMessage(&message);
@@ -316,7 +357,7 @@ fn activate(tray: &TrayIcon, controller: &mut PreviewController) {
         Ok(true) => {
             ACTIVATIONS.set(ACTIVATIONS.get().saturating_add(1));
             diagnostics::event(format_args!(
-                "activation.handled count={} stage=M2",
+                "activation.handled count={} stage=M3",
                 ACTIVATIONS.get()
             ));
         }
@@ -336,6 +377,7 @@ fn publish_preview_status(controller: &PreviewController) {
     ACTIVE_TIMER.set(controller.timer_id());
     PREVIEW_SESSION.set(controller.session_id());
     SAMPLE_ATTEMPTS.set(controller.sample_attempts());
+    PICKER_STATE.set(controller.state_code());
 }
 
 fn notify(tray: &TrayIcon, title: &str, message: &str) {
@@ -422,6 +464,7 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         return LRESULT(0);
     }
     match message {
+        WM_INPUT_WAKE => enqueue(hwnd, INPUT_WAKE),
         WM_TIMER if wparam.0 != 0 && wparam.0 == ACTIVE_TIMER.get() => {
             PENDING_TIMER.set(wparam.0);
             enqueue(hwnd, SAMPLE_TICK);
@@ -453,6 +496,7 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 6 => ACTIVE_TIMER.get() as isize,
                 7 => SAMPLE_ATTEMPTS.get() as isize,
                 8 => PREVIEW_SESSION.get() as isize,
+                9 => PICKER_STATE.get(),
                 _ => -1,
             });
         }

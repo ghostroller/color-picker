@@ -3,7 +3,8 @@
 //! Explicit desktop smoke tests. Run separately with:
 //! cargo test --test windows_shell --locked -- --ignored --test-threads=1
 //! These tests create tray icons/previews and reserve the default hotkey temporarily.
-//! They never synthesize input, install hooks, open menus, or touch the clipboard.
+//! Sessions briefly install input hooks; tests never synthesize input, open menus,
+//! or touch the clipboard. Keep hands off input during these explicit tests.
 
 use std::{
     fs::{self, OpenOptions},
@@ -52,6 +53,7 @@ const DIAG_PREVIEW_ACTIVE: usize = 5;
 const DIAG_ACTIVE_TIMER: usize = 6;
 const DIAG_SAMPLE_ATTEMPTS: usize = 7;
 const DIAG_PREVIEW_SESSION: usize = 8;
+const DIAG_PICKER_STATE: usize = 9;
 
 #[test]
 #[ignore = "requires an interactive Windows desktop, Explorer, and a free Ctrl+Alt+C hotkey"]
@@ -96,6 +98,7 @@ fn resident_shell_smoke() {
     assert_logged(&second_log, "instance.activation_forwarded");
     wait_counter(hwnd, 1, activations + 1);
     wait_diagnostic(hwnd, DIAG_PREVIEW_ACTIVE, 1);
+    wait_diagnostic(hwnd, DIAG_PICKER_STATE, 2);
     let first_session = diagnostic(hwnd, DIAG_PREVIEW_SESSION);
     let first_timer = diagnostic(hwnd, DIAG_ACTIVE_TIMER);
     assert_ne!(first_session, 0);
@@ -143,6 +146,7 @@ fn resident_shell_smoke() {
     );
     wait_counter(hwnd, 1, activations + 1);
     wait_diagnostic(hwnd, DIAG_PREVIEW_ACTIVE, 1);
+    wait_diagnostic(hwnd, DIAG_PICKER_STATE, 2);
     let second_session = diagnostic(hwnd, DIAG_PREVIEW_SESSION);
     let second_timer = diagnostic(hwnd, DIAG_ACTIVE_TIMER);
     assert!(
@@ -252,6 +256,7 @@ fn hotkey_conflict_keeps_tray_activation_available() {
     );
     wait_counter(hwnd, 1, activations + 1);
     wait_diagnostic(hwnd, DIAG_PREVIEW_ACTIVE, 1);
+    wait_diagnostic(hwnd, DIAG_PICKER_STATE, 2);
     assert_ne!(diagnostic(hwnd, DIAG_ACTIVE_TIMER), 0);
     assert_ne!(diagnostic(hwnd, DIAG_PREVIEW_SESSION), 0);
     assert!(diagnostic(hwnd, DIAG_SAMPLE_ATTEMPTS) > 0);
