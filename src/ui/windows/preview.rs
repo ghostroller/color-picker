@@ -147,7 +147,7 @@ impl PreviewWindow {
                 coordinates: format!("X: {}    Y: {}", point.x, point.y)
                     .encode_utf16()
                     .collect(),
-                help: "左键取色 · 右键 / Esc 取消".encode_utf16().collect(),
+                help: "左键取色 · 滚轮放大 · Esc 取消".encode_utf16().collect(),
             };
             let mut state = self.state.borrow_mut();
             state.sample = Some((point, rgb));

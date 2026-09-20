@@ -7,6 +7,7 @@ mod protocol;
 use std::{
     cell::RefCell,
     marker::PhantomData,
+    os::windows::io::AsRawHandle,
     rc::Rc,
     sync::{
         Arc,
@@ -186,6 +187,14 @@ impl InputSession {
     }
     pub fn is_finished(&self) -> bool {
         self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+    /// Borrow the worker's native waitable thread handle. The caller must not
+    /// close it, transfer ownership, or retain it across try_join/this owner's
+    /// destruction. Waiting alongside the UI queue requires no polling timer.
+    pub fn wait_handle(&self) -> Option<HANDLE> {
+        self.worker
+            .as_ref()
+            .map(|worker| HANDLE(worker.as_raw_handle()))
     }
     pub fn try_join(&mut self) -> Option<std::result::Result<(), InputFailure>> {
         if !self.is_finished() {

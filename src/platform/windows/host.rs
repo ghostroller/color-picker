@@ -6,13 +6,16 @@ use std::{cell::Cell, time::Duration};
 
 use windows::{
     Win32::{
-        Foundation::{E_FAIL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{
+            E_FAIL, HINSTANCE, HWND, LPARAM, LRESULT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+        },
         System::{
             LibraryLoader::GetModuleHandleW,
             RemoteDesktop::{
                 NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification,
                 WTSUnRegisterSessionNotification,
             },
+            Threading::INFINITE,
         },
         UI::{
             Shell::{NIN_BALLOONHIDE, NIN_BALLOONSHOW, NIN_BALLOONTIMEOUT, NIN_SELECT, NINF_KEY},
@@ -164,7 +167,7 @@ pub fn run(diagnostics: bool) -> Result<()> {
     };
     READY.set(true);
     diagnostics::event(format_args!(
-        "host.ready hotkey_registered={} stage=M3; left click picks, right click or Esc cancels",
+        "host.ready hotkey_registered={} stage=M4; left click picks, wheel zooms, right click or Esc cancels",
         hotkey.is_some()
     ));
 
@@ -336,7 +339,31 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
             return Ok(());
         }
         let mut message = MSG::default();
-        let status = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
+        // A thread HANDLE signals after the worker has actually exited. This
+        // closes the gap between its final notification and JoinHandle completion,
+        // including Frozen/Finishing where no application timer is running.
+        let status = if let Some(worker) = controller.input_wait_handle() {
+            let wait = unsafe {
+                MsgWaitForMultipleObjectsEx(
+                    Some(&[worker]),
+                    INFINITE,
+                    QS_ALLINPUT,
+                    MWMO_INPUTAVAILABLE,
+                )
+            };
+            if wait == WAIT_OBJECT_0 {
+                continue;
+            }
+            if wait == WAIT_FAILED {
+                return Err(Error::from_thread());
+            }
+            if !unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                continue;
+            }
+            if message.message == WM_QUIT { 0 } else { 1 }
+        } else {
+            unsafe { GetMessageW(&mut message, None, 0, 0) }.0
+        };
         if status == -1 {
             return Err(Error::from_thread());
         }
@@ -357,7 +384,7 @@ fn activate(tray: &TrayIcon, controller: &mut PreviewController) {
         Ok(true) => {
             ACTIVATIONS.set(ACTIVATIONS.get().saturating_add(1));
             diagnostics::event(format_args!(
-                "activation.handled count={} stage=M3",
+                "activation.handled count={} stage=M4",
                 ACTIVATIONS.get()
             ));
         }

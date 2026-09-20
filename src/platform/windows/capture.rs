@@ -5,18 +5,22 @@ use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
 
 use windows::{
     Win32::{
-        Foundation::{E_FAIL, POINT},
+        Foundation::{E_FAIL, E_OUTOFMEMORY, POINT},
         Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC,
-            CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, HBITMAP,
-            HDC, HGDIOBJ, MONITOR_DEFAULTTONULL, MonitorFromPoint, ReleaseDC, SRCCOPY,
-            SelectObject,
+            CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC,
+            GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, MONITOR_DEFAULTTONULL, MONITORINFO,
+            MonitorFromPoint, ReleaseDC, SRCCOPY, SelectObject,
         },
     },
     core::Error,
 };
 
-use crate::core::{color::Rgb8, geometry::ScreenPointPx};
+use crate::core::{
+    color::Rgb8,
+    geometry::{ScreenPointPx, ScreenRectPx},
+    zoom::FrozenImage,
+};
 
 #[derive(Debug)]
 pub enum CaptureError {
@@ -24,6 +28,8 @@ pub enum CaptureError {
     DesktopUnavailable,
     /// The physical screen point is outside every display, including display gaps.
     NoMonitor,
+    /// Freeze capture is limited to a nonempty local area of at most 65 × 65.
+    InvalidRectangle,
     Api(Error),
 }
 
@@ -31,7 +37,12 @@ impl std::fmt::Display for CaptureError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DesktopUnavailable => formatter.write_str("the desktop DC is unavailable"),
-            Self::NoMonitor => formatter.write_str("the source point is outside all monitors"),
+            Self::NoMonitor => {
+                formatter.write_str("the source is not contained in one actual monitor")
+            }
+            Self::InvalidRectangle => formatter.write_str(
+                "freeze capture requires a nonempty area no larger than 65 by 65 pixels",
+            ),
             Self::Api(error) => write!(formatter, "screen capture failed: {error}"),
         }
     }
@@ -41,7 +52,7 @@ impl std::error::Error for CaptureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Api(error) => Some(error),
-            Self::DesktopUnavailable | Self::NoMonitor => None,
+            Self::DesktopUnavailable | Self::NoMonitor | Self::InvalidRectangle => None,
         }
     }
 }
@@ -161,6 +172,130 @@ impl GdiSampler {
             let r = self.pixels.as_ptr().add(2).read();
             Ok(Rgb8::new(r, g, b))
         }
+    }
+
+    /// Copy one small physical-pixel area into an immutable top-down snapshot.
+    /// The caller clips to a monitor and hides/flushed owned overlays first.
+    /// This validation rejects crossing monitors even if their edges touch.
+    pub fn capture_rect(&mut self, rect: ScreenRectPx) -> Result<FrozenImage, CaptureError> {
+        if rect.is_empty() || rect.width() > 65 || rect.height() > 65 {
+            return Err(CaptureError::InvalidRectangle);
+        }
+        let monitor = unsafe {
+            MonitorFromPoint(
+                POINT {
+                    x: rect.left,
+                    y: rect.top,
+                },
+                MONITOR_DEFAULTTONULL,
+            )
+        };
+        if monitor.is_invalid() {
+            return Err(CaptureError::NoMonitor);
+        }
+        let mut monitor_info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }.as_bool() {
+            return Err(api_failure("Could not validate the freeze monitor"));
+        }
+        let monitor = monitor_info.rcMonitor;
+        if rect.left < monitor.left
+            || rect.top < monitor.top
+            || rect.right > monitor.right
+            || rect.bottom > monitor.bottom
+        {
+            return Err(CaptureError::NoMonitor);
+        }
+        let width = rect.width();
+        let height = rect.height();
+        // The preceding 65-pixel limit makes these dimensions and sizes small,
+        // positive and representable in both GDI's i32 and usize arithmetic.
+        let stride_bytes = width as usize * 4;
+        let length = stride_bytes * height as usize;
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: length as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut raw_pixels: *mut c_void = std::ptr::null_mut();
+        let bitmap = OwnedBitmap(unsafe {
+            CreateDIBSection(
+                Some(self.screen.0),
+                &info,
+                DIB_RGB_COLORS,
+                &mut raw_pixels,
+                None,
+                0,
+            )?
+        });
+        let pixels = NonNull::new(raw_pixels.cast::<u8>())
+            .ok_or_else(|| api_failure("CreateDIBSection returned null freeze storage"))?;
+        let previous = unsafe { SelectObject(self.memory.0, bitmap.0.into()) };
+        if previous.is_invalid() {
+            return Err(api_failure("Could not select the freeze bitmap"));
+        }
+        // Declared after bitmap: restore the reusable 1x1 surface before the
+        // temporary bitmap is deleted, on both successful and failed captures.
+        let _selection = BitmapSelection {
+            dc: self.memory.0,
+            previous,
+        };
+        unsafe {
+            BitBlt(
+                self.memory.0,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                Some(self.screen.0),
+                rect.left,
+                rect.top,
+                SRCCOPY | CAPTUREBLT,
+            )?;
+            if !GdiFlush().as_bool() {
+                return Err(api_failure("GdiFlush failed while freezing the screen"));
+            }
+        }
+        let mut bgrx = Vec::new();
+        bgrx.try_reserve_exact(length).map_err(|_| {
+            CaptureError::Api(Error::new(
+                E_OUTOFMEMORY,
+                "Could not allocate the frozen pixels",
+            ))
+        })?;
+        // The selected DIB owns this exact byte span until the guards above drop.
+        bgrx.extend_from_slice(unsafe { std::slice::from_raw_parts(pixels.as_ptr(), length) });
+        Ok(FrozenImage {
+            origin: ScreenPointPx {
+                x: rect.left,
+                y: rect.top,
+            },
+            width,
+            height,
+            stride_bytes,
+            bgrx,
+        })
+    }
+}
+
+struct BitmapSelection {
+    dc: HDC,
+    previous: HGDIOBJ,
+}
+
+impl Drop for BitmapSelection {
+    fn drop(&mut self) {
+        let _ = unsafe { SelectObject(self.dc, self.previous) };
     }
 }
 

@@ -3,7 +3,10 @@
 #[path = "support/pixel_fixture.rs"]
 mod pixel_fixture;
 
-use color_picker::{core::color::Rgb8, platform::windows::capture::GdiSampler};
+use color_picker::{
+    core::{color::Rgb8, geometry::ScreenRectPx},
+    platform::windows::capture::{CaptureError, GdiSampler},
+};
 use pixel_fixture::{PixelFixture, STRIPE_TOP, ScopedPmv2, gdi_objects};
 
 #[test]
@@ -47,6 +50,40 @@ fn screen_sampler_matches_known_pixels_and_releases_gdi_objects() {
 
     let stationary = fixture.screen_point(101, 73).unwrap();
     let original = sampler.sample_pixel(stationary).unwrap();
+    let origin = fixture.screen_point(90, 60).unwrap();
+    let frozen = sampler
+        .capture_rect(ScreenRectPx {
+            left: origin.x,
+            top: origin.y,
+            right: origin.x + 65,
+            bottom: origin.y + 65,
+        })
+        .unwrap();
+    assert_eq!(
+        (frozen.width, frozen.height, frozen.stride_bytes),
+        (65, 65, 65 * 4)
+    );
+    for y in 0..65 {
+        for x in 0..65 {
+            assert_eq!(
+                frozen.pixel_at(x, y),
+                Some(Rgb8::new(
+                    (90 + x) as u8,
+                    (60 + y) as u8,
+                    ((90 + x) ^ (60 + y)) as u8
+                ))
+            );
+        }
+    }
+    assert!(matches!(
+        sampler.capture_rect(ScreenRectPx {
+            left: origin.x,
+            top: origin.y,
+            right: origin.x + 66,
+            bottom: origin.y + 1,
+        }),
+        Err(CaptureError::InvalidRectangle)
+    ));
     let updated = Rgb8::new(23, 211, 84);
     assert_ne!(original, updated);
     fixture.change_pixel(101, 73, updated).unwrap();
@@ -54,6 +91,11 @@ fn screen_sampler_matches_known_pixels_and_releases_gdi_objects() {
         sampler.sample_pixel(stationary).unwrap(),
         updated,
         "sampling must refresh a fixed physical point after its content changes"
+    );
+    assert_eq!(
+        frozen.pixel_at(11, 13),
+        Some(original),
+        "a frozen pixel must retain its value after the desktop changes"
     );
     drop(sampler);
 
