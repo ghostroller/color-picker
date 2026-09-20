@@ -179,6 +179,7 @@ pub fn run(diagnostics: bool) -> Result<()> {
 
 fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime) -> Result<()> {
     let mut controller = PreviewController::new(hwnd);
+    controller.set_appearance(settings.config.appearance);
     let mut result_window: Option<ResultWindow> = None;
     let mut settings_window: Option<SettingsWindow> = None;
     let mut exiting = false;
@@ -252,10 +253,10 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime)
             match window.process_pending() {
                 Ok(Some(SettingsAction::Apply(config))) => match settings.apply(hwnd, config) {
                     Ok(old_hotkey) => {
+                        controller.set_appearance(settings.config.appearance);
                         publish_hotkey_status(settings);
                         drop(old_hotkey);
-                        window
-                            .show_status("设置已保存。关闭此窗口后可使用新的快捷键取色。", true)?;
+                        window.show_status("设置已保存，关闭此窗口后生效。", true)?;
                     }
                     Err(error) => {
                         diagnostics::event(format_args!("config.apply_failed error={error}"));

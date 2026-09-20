@@ -119,10 +119,12 @@ impl SettingsRuntime {
         let old_hotkey = replacement.and_then(|guard| self.hotkey.replace(guard));
         self.notice = None;
         diagnostics::event(format_args!(
-            "config.applied hotkey={} default_format={:?} auto_copy={}",
+            "config.applied hotkey={} default_format={:?} auto_copy={} border_width_dip={} background_transparency_percent={}",
             self.config.hotkey.label(),
             self.config.default_format,
-            self.config.auto_copy_on_pick
+            self.config.auto_copy_on_pick,
+            self.config.appearance.border_width_dip,
+            self.config.appearance.background_transparency_percent
         ));
         Ok(old_hotkey)
     }

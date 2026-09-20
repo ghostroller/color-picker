@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    app::diagnostics,
+    app::{config::AppearanceConfig, diagnostics},
     core::{
         geometry::{ScreenPointPx, ScreenRectPx, freeze_rect},
         state::{AppState, Event, PickedColor, SampleKind, StateMachine},
@@ -34,9 +34,11 @@ pub struct PreviewController {
     wheel: WheelAccumulator,
     pending_hover: Option<ScreenPointPx>,
     last_frozen_draw: Option<Instant>,
+    appearance: AppearanceConfig,
 }
 
 struct SessionResources {
+    appearance: AppearanceConfig,
     input: InputSession,
     preview: Option<PreviewWindow>,
     sampler: Option<GdiSampler>,
@@ -60,7 +62,14 @@ impl PreviewController {
             wheel: WheelAccumulator::default(),
             pending_hover: None,
             last_frozen_draw: None,
+            appearance: AppearanceConfig::default(),
         }
+    }
+
+    /// Applies to the next session; a live/frozen transition keeps that
+    /// session's accepted appearance until it finishes.
+    pub fn set_appearance(&mut self, appearance: AppearanceConfig) {
+        self.appearance = appearance;
     }
 
     pub fn start(&mut self) -> Result<bool> {
@@ -78,10 +87,11 @@ impl PreviewController {
         let resources = (|| {
             let monitors = Monitors::enumerate()?;
             let sampler = GdiSampler::new().map_err(platform_error)?;
-            let preview = PreviewWindow::new()?;
+            let preview = PreviewWindow::with_appearance(self.appearance)?;
             // Resources precede hooks; no partially built UI ever consumes input.
             let input = InputSession::start(session, self.host)?;
             Ok(SessionResources {
+                appearance: self.appearance,
                 input,
                 preview: Some(preview),
                 sampler: Some(sampler),
@@ -454,7 +464,12 @@ impl PreviewController {
             .capture_rect(rect)
             .map_err(platform_error)?;
         resources.sampler.take();
-        resources.magnifier = Some(MagnifierWindow::new(image, point, monitor.work_area)?);
+        resources.magnifier = Some(MagnifierWindow::with_appearance(
+            image,
+            point,
+            monitor.work_area,
+            resources.appearance,
+        )?);
         let session = resources.input.session_id();
         self.transition(Event::Freeze(session))?;
         self.pending_hover = None;
@@ -476,7 +491,7 @@ impl PreviewController {
             magnifier.hide();
         }
         flush_composition()?;
-        resources.preview = Some(PreviewWindow::new()?);
+        resources.preview = Some(PreviewWindow::with_appearance(resources.appearance)?);
         resources.sampler = Some(GdiSampler::new().map_err(platform_error)?);
         resources.last_sample = None;
         resources.failures = 0;

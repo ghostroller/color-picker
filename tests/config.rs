@@ -1,5 +1,5 @@
 use color_picker::{
-    app::config::{Config, ConfigStore, HotkeyConfig},
+    app::config::{AppearanceConfig, Config, ConfigStore, HotkeyConfig},
     core::format::ColorFormat,
 };
 use std::{
@@ -62,6 +62,10 @@ fn missing_config_defaults_and_valid_changes_round_trip() {
         },
         default_format: ColorFormat::CssRgb,
         auto_copy_on_pick: true,
+        appearance: AppearanceConfig {
+            border_width_dip: 4,
+            background_transparency_percent: 65,
+        },
         ..Config::default()
     };
     store.save(&changed).unwrap();
@@ -73,6 +77,78 @@ fn missing_config_defaults_and_valid_changes_round_trip() {
             .contains("\"css_rgb\"")
     );
     assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 1);
+}
+
+#[test]
+fn previous_schema_one_configs_default_missing_appearance_fields() {
+    let directory = TempDirectory::new();
+    let store = ConfigStore::new(directory.path());
+    let mut previous = serde_json::to_value(Config::default()).unwrap();
+    previous.as_object_mut().unwrap().remove("appearance");
+    std::fs::write(store.path(), serde_json::to_vec(&previous).unwrap()).unwrap();
+    let loaded = store.load();
+    assert!(loaded.save_allowed && loaded.warning.is_none());
+    assert_eq!(loaded.config.appearance, AppearanceConfig::default());
+
+    previous["appearance"] = serde_json::json!({"border_width_dip": 5});
+    let partial: Config = serde_json::from_value(previous).unwrap();
+    assert_eq!(partial.appearance.border_width_dip, 5);
+    assert_eq!(partial.appearance.background_transparency_percent, 35);
+    store.save(&partial).unwrap();
+    assert_eq!(store.load().config, partial);
+}
+
+#[test]
+fn appearance_limits_reject_invalid_changes_and_protect_existing_files() {
+    let directory = TempDirectory::new();
+    let store = ConfigStore::new(directory.path());
+    let original = Config::default();
+    store.save(&original).unwrap();
+    let original_bytes = std::fs::read(store.path()).unwrap();
+    for appearance in [
+        AppearanceConfig {
+            border_width_dip: 7,
+            ..AppearanceConfig::default()
+        },
+        AppearanceConfig {
+            background_transparency_percent: 81,
+            ..AppearanceConfig::default()
+        },
+    ] {
+        let invalid = Config {
+            appearance,
+            ..original.clone()
+        };
+        assert!(store.save(&invalid).is_err());
+        assert_eq!(std::fs::read(store.path()).unwrap(), original_bytes);
+    }
+    for appearance in [
+        AppearanceConfig {
+            border_width_dip: 0,
+            background_transparency_percent: 0,
+        },
+        AppearanceConfig {
+            border_width_dip: 6,
+            background_transparency_percent: 80,
+        },
+    ] {
+        assert!(appearance.validate().is_ok());
+    }
+
+    let invalid_on_disk = Config {
+        appearance: AppearanceConfig {
+            background_transparency_percent: 81,
+            ..AppearanceConfig::default()
+        },
+        ..original.clone()
+    };
+    let invalid_bytes = serde_json::to_vec(&invalid_on_disk).unwrap();
+    std::fs::write(store.path(), &invalid_bytes).unwrap();
+    let loaded = store.load();
+    assert!(!loaded.save_allowed && loaded.warning.is_some());
+    assert_eq!(loaded.config, original);
+    assert!(store.save(&original).is_err());
+    assert_eq!(std::fs::read(store.path()).unwrap(), invalid_bytes);
 }
 
 #[test]
@@ -113,6 +189,9 @@ fn unsupported_keys_and_strict_json_are_rejected() {
     assert!(serde_json::from_value::<Config>(value).is_err());
     let mut value = serde_json::to_value(Config::default()).unwrap();
     value["hotkey"]["win"] = true.into();
+    assert!(serde_json::from_value::<Config>(value).is_err());
+    let mut value = serde_json::to_value(Config::default()).unwrap();
+    value["appearance"]["blur"] = 50.into();
     assert!(serde_json::from_value::<Config>(value).is_err());
     let mut value = serde_json::to_value(Config::default()).unwrap();
     value["default_format"] = "unknown".into();

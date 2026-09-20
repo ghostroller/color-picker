@@ -21,7 +21,11 @@ use windows::{
         },
         System::{LibraryLoader::GetModuleHandleW, SystemServices::SS_NOPREFIX},
         UI::{
-            Controls::{EM_GETLINECOUNT, ShowScrollBar},
+            Controls::{
+                EM_GETLINECOUNT, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
+                ShowScrollBar, TBM_SETPAGESIZE, TBM_SETPOS, TBM_SETRANGEMAX, TBM_SETRANGEMIN,
+                TBS_NOTICKS, TRACKBAR_CLASSW,
+            },
             HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
             Input::KeyboardAndMouse::{
                 EnableWindow, SetFocus, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT, VK_TAB,
@@ -38,7 +42,10 @@ use super::{
     theme::{self, Font, Theme, Tone},
 };
 use crate::{
-    app::config::{Config, HotkeyConfig},
+    app::config::{
+        AppearanceConfig, Config, HotkeyConfig, MAX_BACKGROUND_TRANSPARENCY_PERCENT,
+        MAX_BORDER_WIDTH_DIP,
+    },
     core::format::ColorFormat,
 };
 
@@ -52,15 +59,24 @@ const SHIFT: usize = 103;
 const KEY: usize = 104;
 const FORMAT: usize = 105;
 const AUTO_COPY: usize = 106;
+const BORDER_WIDTH: usize = 107;
+const BACKGROUND_TRANSPARENCY: usize = 108;
 const TITLE: usize = 15;
 const SUBTITLE: usize = 16;
 const COPY_HEADING: usize = 17;
 const USAGE_HEADING: usize = 18;
 const USAGE_HINT: usize = 19;
+const APPEARANCE_HEADING: usize = 20;
+const BORDER_LABEL: usize = 21;
+const BORDER_VALUE: usize = 22;
+const TRANSPARENCY_LABEL: usize = 23;
+const TRANSPARENCY_VALUE: usize = 24;
 const STATUS: usize = 14;
 const CLIENT_WIDTH: i32 = 480;
 const CLIENT_HEIGHT: i32 = 588;
 const KEY_SUBCLASS: usize = 1;
+// CommCtrl.h aliases TBM_GETPOS to WM_USER; windows-rs omits this alias.
+const TBM_GETPOS: u32 = WM_USER;
 const STYLE: WINDOW_STYLE =
     WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0);
 const EX_STYLE: WINDOW_EX_STYLE = WINDOW_EX_STYLE(WS_EX_APPWINDOW.0 | WS_EX_CONTROLPARENT.0);
@@ -69,19 +85,19 @@ const PANELS: [RECT; 3] = [
         left: 24,
         top: 88,
         right: 456,
-        bottom: 232,
+        bottom: 220,
     },
     RECT {
         left: 24,
-        top: 244,
+        top: 232,
         right: 456,
-        bottom: 364,
+        bottom: 338,
     },
     RECT {
         left: 24,
-        top: 376,
+        top: 350,
         right: 456,
-        bottom: 472,
+        bottom: 466,
     },
 ];
 
@@ -100,6 +116,7 @@ struct Pending {
     default_style: bool,
     capture: bool,
     focus_key: bool,
+    appearance: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -192,6 +209,13 @@ struct Controls {
     format_label: HWND,
     format: HWND,
     auto_copy: HWND,
+    appearance_heading: HWND,
+    border_label: HWND,
+    border_width: HWND,
+    border_value: HWND,
+    transparency_label: HWND,
+    background_transparency: HWND,
+    transparency_value: HWND,
     usage_heading: HWND,
     usage_hint: HWND,
     apply: HWND,
@@ -200,7 +224,7 @@ struct Controls {
 }
 
 impl Controls {
-    fn handles(&self) -> [HWND; 18] {
+    fn handles(&self) -> [HWND; 25] {
         [
             self.title,
             self.subtitle,
@@ -215,6 +239,13 @@ impl Controls {
             self.format_label,
             self.format,
             self.auto_copy,
+            self.appearance_heading,
+            self.border_label,
+            self.border_width,
+            self.border_value,
+            self.transparency_label,
+            self.background_transparency,
+            self.transparency_value,
             self.usage_heading,
             self.usage_hint,
             self.apply,
@@ -438,6 +469,9 @@ impl SettingsWindow {
         if pending.focus_key && self.callback.recording.get() {
             unsafe { SetFocus(Some(self.controls.key))? };
         }
+        if pending.appearance {
+            self.update_appearance_text()?;
+        }
         if pending.apply && self.save_allowed {
             match self.read_config() {
                 Ok(config) => match config.validate() {
@@ -451,13 +485,28 @@ impl SettingsWindow {
     }
 
     fn create_controls(&mut self, config: &Config) -> Result<()> {
+        if !unsafe {
+            InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_BAR_CLASSES,
+            })
+        }
+        .as_bool()
+        {
+            return Err(Error::new(E_FAIL, "Could not initialize settings sliders"));
+        }
         let label = WINDOW_STYLE(SS_NOPREFIX.0);
         let check = WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32);
         let combo = WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32);
         let button = WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32);
+        let slider = WS_TABSTOP | WINDOW_STYLE(TBS_NOTICKS);
         self.controls.title = self.control(w!("STATIC"), "偏好设置", TITLE, label)?;
-        self.controls.subtitle =
-            self.control(w!("STATIC"), "自定义取色快捷键和复制方式", SUBTITLE, label)?;
+        self.controls.subtitle = self.control(
+            w!("STATIC"),
+            "自定义快捷键、复制方式和取色外观",
+            SUBTITLE,
+            label,
+        )?;
         self.controls.hotkey_label = self.control(w!("STATIC"), "取色快捷键", 10, label)?;
         self.controls.ctrl = self.control(w!("BUTTON"), "Ctrl", CTRL, check)?;
         self.controls.alt = self.control(w!("BUTTON"), "Alt", ALT, check)?;
@@ -484,11 +533,27 @@ impl SettingsWindow {
         self.controls.format_label = self.control(w!("STATIC"), "默认格式", 13, label)?;
         self.controls.format = self.control(w!("COMBOBOX"), "", FORMAT, combo)?;
         self.controls.auto_copy = self.control(w!("BUTTON"), "取色后自动复制", AUTO_COPY, check)?;
+        self.controls.appearance_heading =
+            self.control(w!("STATIC"), "取色外观", APPEARANCE_HEADING, label)?;
+        self.controls.border_label = self.control(w!("STATIC"), "边框粗细", BORDER_LABEL, label)?;
+        self.controls.border_width =
+            self.control(TRACKBAR_CLASSW, "边框粗细", BORDER_WIDTH, slider)?;
+        self.controls.border_value = self.control(w!("STATIC"), "", BORDER_VALUE, label)?;
+        self.controls.transparency_label =
+            self.control(w!("STATIC"), "背景透明度", TRANSPARENCY_LABEL, label)?;
+        self.controls.background_transparency = self.control(
+            TRACKBAR_CLASSW,
+            "背景透明度",
+            BACKGROUND_TRANSPARENCY,
+            slider,
+        )?;
+        self.controls.transparency_value =
+            self.control(w!("STATIC"), "", TRANSPARENCY_VALUE, label)?;
         self.controls.usage_heading =
-            self.control(w!("STATIC"), "取色操作", USAGE_HEADING, label)?;
+            self.control(w!("STATIC"), "操作提示", USAGE_HEADING, label)?;
         self.controls.usage_hint = self.control(
             w!("STATIC"),
-            "左键确认 · 右键 / Esc 取消\r\n上滚轮冻结并放大 · 下滚轮缩小\r\n缩放取色窗外左键取消",
+            "左键确认 · 右键 / Esc 取消 · 窗外左键取消\r\n上滚轮冻结并放大 · 下滚轮缩小",
             USAGE_HINT,
             label,
         )?;
@@ -513,6 +578,19 @@ impl SettingsWindow {
         set_checked(self.controls.alt, config.hotkey.alt);
         set_checked(self.controls.shift, config.hotkey.shift);
         set_checked(self.controls.auto_copy, config.auto_copy_on_pick);
+        set_slider(
+            self.controls.border_width,
+            MAX_BORDER_WIDTH_DIP,
+            config.appearance.border_width_dip,
+            1,
+        );
+        set_slider(
+            self.controls.background_transparency,
+            MAX_BACKGROUND_TRANSPARENCY_PERCENT,
+            config.appearance.background_transparency_percent,
+            5,
+        );
+        self.update_appearance_text()?;
         Ok(())
     }
 
@@ -553,7 +631,29 @@ impl SettingsWindow {
             },
             default_format,
             auto_copy_on_pick: checked(self.controls.auto_copy),
+            appearance: AppearanceConfig {
+                border_width_dip: slider_value(self.controls.border_width)?,
+                background_transparency_percent: slider_value(
+                    self.controls.background_transparency,
+                )?,
+            },
         })
+    }
+
+    fn update_appearance_text(&self) -> Result<()> {
+        for (hwnd, text) in [
+            (
+                self.controls.border_value,
+                format!("{} DIP", slider_value(self.controls.border_width)?),
+            ),
+            (
+                self.controls.transparency_value,
+                format!("{}%", slider_value(self.controls.background_transparency)?),
+            ),
+        ] {
+            unsafe { SetWindowTextW(hwnd, PCWSTR(wide(&text).as_ptr()))? };
+        }
+        Ok(())
     }
 
     fn update_capture_text(&self) -> Result<()> {
@@ -667,7 +767,8 @@ impl SettingsWindow {
                 (self.controls.title, title.0),
                 (self.controls.hotkey_label, heading.0),
                 (self.controls.copy_heading, heading.0),
-                (self.controls.usage_heading, heading.0),
+                (self.controls.appearance_heading, heading.0),
+                (self.controls.usage_heading, small.0),
                 (self.controls.subtitle, small.0),
                 (self.controls.hint, small.0),
                 (self.controls.usage_hint, small.0),
@@ -701,22 +802,29 @@ impl SettingsWindow {
         };
         place(self.controls.title, 24, 22, 432, 30)?;
         place(self.controls.subtitle, 24, 58, 432, 20)?;
-        place(self.controls.hotkey_label, 40, 104, 396, 24)?;
-        place(self.controls.ctrl, 40, 136, 88, 26)?;
-        place(self.controls.alt, 140, 136, 88, 26)?;
-        place(self.controls.shift, 240, 136, 100, 26)?;
-        place(self.controls.key_label, 40, 183, 48, 24)?;
-        place(self.controls.key, 88, 176, 132, 36)?;
-        place(self.controls.hint, 228, 176, 212, 40)?;
-        place(self.controls.copy_heading, 40, 260, 396, 24)?;
-        place(self.controls.format_label, 40, 297, 108, 24)?;
-        place(self.controls.format, 156, 290, 180, 160)?;
-        place(self.controls.auto_copy, 40, 330, 396, 26)?;
-        place(self.controls.usage_heading, 40, 388, 396, 24)?;
-        place(self.controls.usage_hint, 40, 417, 396, 48)?;
-        place(self.controls.status, 24, 484, 432, 32)?;
-        place(self.controls.close, 264, 528, 88, 36)?;
-        place(self.controls.apply, 364, 528, 92, 36)?;
+        place(self.controls.hotkey_label, 40, 100, 396, 24)?;
+        place(self.controls.ctrl, 40, 128, 88, 26)?;
+        place(self.controls.alt, 140, 128, 88, 26)?;
+        place(self.controls.shift, 240, 128, 100, 26)?;
+        place(self.controls.key_label, 40, 171, 48, 24)?;
+        place(self.controls.key, 88, 164, 132, 36)?;
+        place(self.controls.hint, 228, 164, 212, 40)?;
+        place(self.controls.copy_heading, 40, 244, 396, 24)?;
+        place(self.controls.format_label, 40, 279, 108, 24)?;
+        place(self.controls.format, 156, 272, 180, 160)?;
+        place(self.controls.auto_copy, 40, 304, 396, 26)?;
+        place(self.controls.appearance_heading, 40, 362, 396, 24)?;
+        place(self.controls.border_label, 40, 397, 112, 24)?;
+        place(self.controls.border_width, 156, 390, 220, 30)?;
+        place(self.controls.border_value, 388, 397, 56, 24)?;
+        place(self.controls.transparency_label, 40, 433, 112, 24)?;
+        place(self.controls.background_transparency, 156, 426, 220, 30)?;
+        place(self.controls.transparency_value, 388, 433, 56, 24)?;
+        place(self.controls.usage_heading, 24, 478, 64, 20)?;
+        place(self.controls.usage_hint, 96, 478, 360, 40)?;
+        place(self.controls.status, 24, 532, 228, 40)?;
+        place(self.controls.close, 264, 532, 88, 36)?;
+        place(self.controls.apply, 364, 532, 92, 36)?;
         unsafe {
             SendMessageW(
                 self.controls.format,
@@ -864,6 +972,35 @@ fn checked(hwnd: HWND) -> bool {
     unsafe { SendMessageW(hwnd, BM_GETCHECK, None, None) }.0 == 1
 }
 
+fn set_slider(hwnd: HWND, maximum: u8, value: u8, page_size: u8) {
+    unsafe {
+        SendMessageW(hwnd, TBM_SETRANGEMIN, Some(WPARAM(0)), Some(LPARAM(0)));
+        SendMessageW(
+            hwnd,
+            TBM_SETRANGEMAX,
+            Some(WPARAM(0)),
+            Some(LPARAM(isize::from(maximum))),
+        );
+        SendMessageW(
+            hwnd,
+            TBM_SETPAGESIZE,
+            None,
+            Some(LPARAM(isize::from(page_size))),
+        );
+        SendMessageW(
+            hwnd,
+            TBM_SETPOS,
+            Some(WPARAM(1)),
+            Some(LPARAM(isize::from(value))),
+        );
+    }
+}
+
+fn slider_value(hwnd: HWND) -> Result<u8> {
+    let value = unsafe { SendMessageW(hwnd, TBM_GETPOS, None, None) }.0;
+    u8::try_from(value).map_err(|_| Error::new(E_FAIL, "请选择有效的取色外观值"))
+}
+
 unsafe extern "system" fn key_button_proc(
     hwnd: HWND,
     message: u32,
@@ -989,7 +1126,8 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                         Tone::Muted
                     },
                 ),
-                USAGE_HINT => (true, Tone::Muted),
+                USAGE_HEADING | USAGE_HINT => (false, Tone::Muted),
+                BORDER_VALUE | TRANSPARENCY_VALUE => (true, Tone::Accent),
                 APPLY | CLOSE => (false, Tone::Text),
                 _ => (true, Tone::Text),
             };
@@ -1009,6 +1147,13 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                 APPLY => state.queue(|pending| pending.apply = true),
                 KEY => state.begin_capture(),
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_HSCROLL => {
+            let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut _)) } as usize;
+            if matches!(id, BORDER_WIDTH | BACKGROUND_TRANSPARENCY) {
+                state.queue(|pending| pending.appearance = true);
             }
             LRESULT(0)
         }

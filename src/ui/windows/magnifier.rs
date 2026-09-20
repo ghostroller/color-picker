@@ -23,10 +23,12 @@ use windows::{
     core::{BOOL, Error, Result, w},
 };
 
-use super::drawing::{OwnedFont, PaintSession, dip, draw_bottom_right_border, draw_text, palette};
+use super::drawing::{
+    OwnedFont, PaintSession, border_thickness, dip, draw_bottom_right_border, draw_text, palette,
+};
 use super::frost::FrostedPanel;
 use crate::{
-    app::diagnostics,
+    app::{config::AppearanceConfig, diagnostics},
     core::{
         color::Rgb8,
         format::{ColorFormat, format_color},
@@ -58,6 +60,19 @@ struct Footer {
 }
 
 impl State {
+    fn accepts_pointer(&self, point: ScreenPointPx) -> bool {
+        self.bounds
+            .zip(self.surface.as_ref())
+            .is_some_and(|(bounds, surface)| {
+                inside_uncovered_window(
+                    point,
+                    bounds,
+                    surface.dpi,
+                    surface.appearance.border_width_dip,
+                )
+            })
+    }
+
     fn refresh_text(&mut self) {
         let factor = self.view.as_ref().map_or(4, |view| view.scale().factor());
         let hex = self.hover.map_or_else(
@@ -91,11 +106,19 @@ pub struct MagnifierWindow {
 }
 
 impl MagnifierWindow {
-    pub fn new(
+    pub fn new(image: FrozenImage, focus: ScreenPointPx, work_area: ScreenRectPx) -> Result<Self> {
+        Self::with_appearance(image, focus, work_area, AppearanceConfig::default())
+    }
+
+    pub fn with_appearance(
         mut image: FrozenImage,
         focus: ScreenPointPx,
         work_area: ScreenRectPx,
+        appearance: AppearanceConfig,
     ) -> Result<Self> {
+        appearance
+            .validate()
+            .map_err(|error| Error::new(E_INVALIDARG, error.to_string()))?;
         image
             .validate()
             .map_err(|_| Error::new(E_INVALIDARG, "Invalid frozen image"))?;
@@ -188,10 +211,16 @@ impl MagnifierWindow {
             bounds.height() as i32,
             dpi,
             capture_excluded,
+            appearance,
         )?;
         {
             let mut state = window.state.borrow_mut();
-            state.hover = view.hit_test(focus);
+            state.hover =
+                if inside_uncovered_window(focus, bounds, dpi, appearance.border_width_dip) {
+                    view.hit_test(focus)
+                } else {
+                    None
+                };
             state.view = Some(view);
             state.surface = Some(surface);
             state.bounds = Some(bounds);
@@ -248,7 +277,11 @@ impl MagnifierWindow {
 
     pub fn hit_test(&self, point: ScreenPointPx) -> Option<PickedColor> {
         let state = self.state.borrow();
-        if !state.visible || state.layout_invalidated || state.paint_error.is_some() {
+        if !state.visible
+            || state.layout_invalidated
+            || state.paint_error.is_some()
+            || !state.accepts_pointer(point)
+        {
             return None;
         }
         let pixel = state.view.as_ref()?.hit_test(point)?;
@@ -263,7 +296,11 @@ impl MagnifierWindow {
         let changed = {
             let mut state = self.state.borrow_mut();
             state.check()?;
-            let hover = state.view.as_mut().and_then(|view| view.select_at(point));
+            let hover = if state.accepts_pointer(point) {
+                state.view.as_mut().and_then(|view| view.select_at(point))
+            } else {
+                None
+            };
             if state.hover == hover {
                 false
             } else {
@@ -284,6 +321,7 @@ impl MagnifierWindow {
         let changed = {
             let mut state = self.state.borrow_mut();
             state.check()?;
+            let accepts_pointer = state.accepts_pointer(point);
             let view = state
                 .view
                 .as_mut()
@@ -298,7 +336,11 @@ impl MagnifierWindow {
                 next
             };
             view.change_scale(next, point);
-            let hover = view.hit_test(point);
+            let hover = if accepts_pointer {
+                view.hit_test(point)
+            } else {
+                None
+            };
             let changed = previous != next || state.hover != hover;
             state.hover = hover;
             if changed {
@@ -478,6 +520,7 @@ struct Surface {
     heading_font: OwnedFont,
     body_font: OwnedFont,
     frost: Option<FrostedPanel>,
+    appearance: AppearanceConfig,
     old_bitmap: HGDIOBJ,
     width: i32,
     height: i32,
@@ -485,7 +528,13 @@ struct Surface {
 }
 
 impl Surface {
-    fn new(width: i32, height: i32, dpi: u32, capture_excluded: bool) -> Result<Self> {
+    fn new(
+        width: i32,
+        height: i32,
+        dpi: u32,
+        capture_excluded: bool,
+        appearance: AppearanceConfig,
+    ) -> Result<Self> {
         let screen = ScreenDc(unsafe { GetDC(None) });
         if screen.0.is_invalid() {
             return Err(failure("Could not obtain drawing DC"));
@@ -500,13 +549,18 @@ impl Surface {
         }
         let heading_font = OwnedFont::new(13, 600, dpi)?;
         let body_font = OwnedFont::new(10, 400, dpi)?;
-        let frost = if capture_excluded {
+        let frost = if capture_excluded && appearance.background_transparency_percent != 0 {
             let panel_left = if width < dip(132, dpi) {
                 0
             } else {
                 dip(24, dpi)
             };
-            match FrostedPanel::new(width - panel_left, dip(24, dpi), dip(6, dpi)) {
+            match FrostedPanel::new(
+                width - panel_left,
+                dip(24, dpi),
+                dip(6, dpi),
+                appearance.background_transparency_percent,
+            ) {
                 Ok(panel) => Some(panel),
                 Err(error) => {
                     diagnostics::event(format_args!("magnifier.frost_unavailable {error}"));
@@ -526,6 +580,7 @@ impl Surface {
             heading_font,
             body_font,
             frost,
+            appearance,
             old_bitmap,
             width,
             height,
@@ -641,7 +696,13 @@ impl Surface {
             )?;
         }
         self.draw_footer(viewport.bottom, footer, bounds)?;
-        draw_bottom_right_border(self.dc.0, self.width, self.height)?;
+        draw_bottom_right_border(
+            self.dc.0,
+            self.width,
+            self.height,
+            self.dpi,
+            self.appearance.border_width_dip,
+        )?;
         unsafe {
             BitBlt(
                 target,
@@ -787,6 +848,23 @@ fn local_rect(rect: ScreenRectPx, bounds: ScreenRectPx) -> RECT {
         right: rect.right - bounds.left,
         bottom: rect.bottom - bounds.top,
     }
+}
+
+fn inside_uncovered_window(
+    point: ScreenPointPx,
+    bounds: ScreenRectPx,
+    dpi: u32,
+    border_width_dip: u8,
+) -> bool {
+    let border = border_thickness(
+        bounds.width() as i32,
+        bounds.height() as i32,
+        dpi,
+        border_width_dip,
+    );
+    // The bottom edge is already in the non-pixel footer. The right edge can
+    // cover image columns, which must neither hover nor produce a picked color.
+    bounds.contains(point) && point.x < bounds.right - border
 }
 
 fn clipped_frame_edges(rect: RECT, clip: RECT) -> [Option<RECT>; 4] {
@@ -984,6 +1062,35 @@ mod tests {
         assert_eq!(edges[3].unwrap().left, 4);
         for edge in edges.into_iter().flatten() {
             assert!(edge.left >= 0 && edge.top >= 0 && edge.right <= 32 && edge.bottom <= 32);
+        }
+        let bounds = ScreenRectPx {
+            left: -100,
+            top: 20,
+            right: 140,
+            bottom: 284,
+        };
+        for dpi in [96, 144] {
+            for border in [0, 2, 6] {
+                let first_covered_x = bounds.right - dip(i32::from(border), dpi);
+                assert!(inside_uncovered_window(
+                    ScreenPointPx {
+                        x: first_covered_x - 1,
+                        y: 100
+                    },
+                    bounds,
+                    dpi,
+                    border,
+                ));
+                assert!(!inside_uncovered_window(
+                    ScreenPointPx {
+                        x: first_covered_x,
+                        y: 100
+                    },
+                    bounds,
+                    dpi,
+                    border,
+                ));
+            }
         }
     }
 

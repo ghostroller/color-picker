@@ -5,6 +5,7 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::core::{Error, PCWSTR, Result, w};
 
 use super::frost::FrostedPanel;
+use crate::app::config::AppearanceConfig;
 use crate::core::color::Rgb8;
 use crate::core::geometry::ScreenPointPx;
 
@@ -102,6 +103,7 @@ pub(super) struct Surface {
     heading_font: OwnedFont,
     body_font: OwnedFont,
     frost: Option<FrostedPanel>,
+    appearance: AppearanceConfig,
     old_bitmap: HGDIOBJ,
     pub width: i32,
     pub height: i32,
@@ -109,7 +111,13 @@ pub(super) struct Surface {
 }
 
 impl Surface {
-    pub fn new(width: i32, height: i32, dpi: u32, capture_excluded: bool) -> Result<Self> {
+    pub fn new(
+        width: i32,
+        height: i32,
+        dpi: u32,
+        capture_excluded: bool,
+        appearance: AppearanceConfig,
+    ) -> Result<Self> {
         let screen = ScreenDc(unsafe { GetDC(None) });
         if screen.0.0.is_null() {
             return Err(Error::new(E_FAIL, "Could not obtain a drawing DC"));
@@ -127,8 +135,13 @@ impl Surface {
         }
         let heading_font = OwnedFont::new(13, 600, dpi)?;
         let body_font = OwnedFont::new(10, 400, dpi)?;
-        let frost = if capture_excluded {
-            match FrostedPanel::new(width - dip(38, dpi), height, dip(8, dpi)) {
+        let frost = if capture_excluded && appearance.background_transparency_percent != 0 {
+            match FrostedPanel::new(
+                width - dip(38, dpi),
+                height,
+                dip(8, dpi),
+                appearance.background_transparency_percent,
+            ) {
                 Ok(panel) => Some(panel),
                 Err(error) => {
                     crate::app::diagnostics::event(format_args!(
@@ -150,6 +163,7 @@ impl Surface {
             heading_font,
             body_font,
             frost,
+            appearance,
             old_bitmap,
             width,
             height,
@@ -220,7 +234,13 @@ impl Surface {
             palette::SECONDARY,
             &content.coordinates,
         )?;
-        draw_bottom_right_border(self.dc.0, self.width, self.height)?;
+        draw_bottom_right_border(
+            self.dc.0,
+            self.width,
+            self.height,
+            self.dpi,
+            self.appearance.border_width_dip,
+        )?;
         unsafe {
             BitBlt(
                 target,
@@ -273,10 +293,17 @@ fn invalid_selection(object: HGDIOBJ) -> bool {
     object.0.is_null() || object.0 as isize == -1
 }
 
-/// A subtle one-physical-pixel edge, painted inside the existing window bounds.
+/// A configurable edge, painted inside the existing window bounds.
 /// The top and left stay open, and neither layout nor pixel hit mapping changes.
-pub(super) fn draw_bottom_right_border(dc: HDC, width: i32, height: i32) -> Result<()> {
-    if width <= 0 || height <= 0 {
+pub(super) fn draw_bottom_right_border(
+    dc: HDC,
+    width: i32,
+    height: i32,
+    dpi: u32,
+    width_dip: u8,
+) -> Result<()> {
+    let thickness = border_thickness(width, height, dpi, width_dip);
+    if thickness == 0 {
         return Ok(());
     }
     let brush = HBRUSH(unsafe { GetStockObject(DC_BRUSH) }.0);
@@ -286,12 +313,12 @@ pub(super) fn draw_bottom_right_border(dc: HDC, width: i32, height: i32) -> Resu
     for edge in [
         RECT {
             left: 0,
-            top: height - 1,
+            top: height - thickness,
             right: width,
             bottom: height,
         },
         RECT {
-            left: width - 1,
+            left: width - thickness,
             top: 0,
             right: width,
             bottom: height,
@@ -302,6 +329,14 @@ pub(super) fn draw_bottom_right_border(dc: HDC, width: i32, height: i32) -> Resu
         }
     }
     Ok(())
+}
+
+pub(super) fn border_thickness(width: i32, height: i32, dpi: u32, width_dip: u8) -> i32 {
+    if width_dip == 0 || width <= 0 || height <= 0 {
+        0
+    } else {
+        dip(i32::from(width_dip), dpi).max(1).min(width).min(height)
+    }
 }
 
 /// Text uses cached fonts and an explicit clip rectangle. Even unusually long

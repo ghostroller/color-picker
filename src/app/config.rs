@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::core::format::ColorFormat;
 
 pub const SCHEMA_VERSION: u32 = 1;
+pub const MAX_BORDER_WIDTH_DIP: u8 = 6;
+pub const MAX_BACKGROUND_TRANSPARENCY_PERCENT: u8 = 80;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +24,8 @@ pub struct Config {
     pub hotkey: HotkeyConfig,
     pub default_format: ColorFormat,
     pub auto_copy_on_pick: bool,
+    #[serde(default)]
+    pub appearance: AppearanceConfig,
 }
 
 impl Default for Config {
@@ -31,6 +35,7 @@ impl Default for Config {
             hotkey: HotkeyConfig::default(),
             default_format: ColorFormat::Hex,
             auto_copy_on_pick: false,
+            appearance: AppearanceConfig::default(),
         }
     }
 }
@@ -42,7 +47,40 @@ impl Config {
                 self.schema_version,
             )));
         }
-        self.hotkey.validate()
+        self.hotkey.validate()?;
+        self.appearance.validate()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AppearanceConfig {
+    pub border_width_dip: u8,
+    pub background_transparency_percent: u8,
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        Self {
+            border_width_dip: 2,
+            background_transparency_percent: 35,
+        }
+    }
+}
+
+impl AppearanceConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.border_width_dip > MAX_BORDER_WIDTH_DIP {
+            return Err(ConfigError::InvalidAppearance(
+                "边框粗细必须在 0–6 DIP 之间",
+            ));
+        }
+        if self.background_transparency_percent > MAX_BACKGROUND_TRANSPARENCY_PERCENT {
+            return Err(ConfigError::InvalidAppearance(
+                "背景透明度必须在 0–80% 之间",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -126,6 +164,7 @@ impl HotkeyConfig {
 pub enum ConfigError {
     UnsupportedSchema(u64),
     InvalidHotkey(&'static str),
+    InvalidAppearance(&'static str),
     InvalidJson(serde_json::Error),
     Io {
         operation: &'static str,
@@ -147,6 +186,7 @@ impl std::fmt::Display for ConfigError {
                 "不支持配置版本 {version}，当前仅支持版本 {SCHEMA_VERSION}"
             ),
             Self::InvalidHotkey(reason) => formatter.write_str(reason),
+            Self::InvalidAppearance(reason) => formatter.write_str(reason),
             Self::InvalidJson(error) => write!(formatter, "配置 JSON 无效：{error}"),
             Self::Io {
                 operation,

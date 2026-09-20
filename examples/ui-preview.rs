@@ -5,6 +5,7 @@
 //! Modes: result, settings, live, frozen, frozen-edge. Copy buttons use the clipboard
 //! only when explicitly clicked. Settings Apply validates but never saves.
 //! Add --backdrop after the lifetime to preview material over a synthetic pattern.
+//! --border=N / --transparency=N override appearance for this fixture only.
 
 #[cfg(not(windows))]
 fn main() {
@@ -88,6 +89,30 @@ mod fixture {
     pub fn run() -> Result<()> {
         check_environment()?;
         let mode = std::env::args().nth(1).unwrap_or_else(|| "result".into());
+        let mut config = Config::default();
+        for arg in std::env::args().skip(2) {
+            let value = if let Some(value) = arg.strip_prefix("--border=") {
+                Some((&mut config.appearance.border_width_dip, value))
+            } else {
+                arg.strip_prefix("--transparency=").map(|value| {
+                    (
+                        &mut config.appearance.background_transparency_percent,
+                        value,
+                    )
+                })
+            };
+            if let Some((target, value)) = value {
+                *target = value.parse().map_err(|_| {
+                    Error::new(
+                        windows::Win32::Foundation::E_INVALIDARG,
+                        "Appearance options require whole numbers",
+                    )
+                })?;
+            }
+        }
+        config.validate().map_err(|error| {
+            Error::new(windows::Win32::Foundation::E_INVALIDARG, error.to_string())
+        })?;
         let seconds = std::env::args()
             .nth(2)
             .and_then(|arg| arg.parse::<u32>().ok())
@@ -131,14 +156,9 @@ mod fixture {
                 },
                 owner.0,
             )?),
-            "settings" => Scene::Settings(SettingsWindow::new(
-                &Config::default(),
-                owner.0,
-                None,
-                true,
-            )?),
+            "settings" => Scene::Settings(SettingsWindow::new(&config, owner.0, None, true)?),
             "live" => {
-                let window = PreviewWindow::new()?;
+                let window = PreviewWindow::with_appearance(config.appearance)?;
                 window.update(focus, Some(rgb), work)?;
                 Scene::Live(window)
             }
@@ -160,7 +180,7 @@ mod fixture {
                         bgrx.extend_from_slice(&[color.b, color.g, color.r, 255]);
                     }
                 }
-                let window = MagnifierWindow::new(
+                let window = MagnifierWindow::with_appearance(
                     FrozenImage {
                         origin,
                         width: width as u32,
@@ -170,6 +190,7 @@ mod fixture {
                     },
                     focus,
                     work,
+                    config.appearance,
                 )?;
                 let bounds = window.rect().expect("shown magnifier");
                 let footer_height = (24 * unsafe { GetDpiForWindow(window.hwnd()) } + 48) / 96;

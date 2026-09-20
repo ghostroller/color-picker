@@ -4,8 +4,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use windows::Win32::Foundation::{
-    COLORREF, E_FAIL, ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND, LPARAM,
-    LRESULT, POINT, SetLastError, WPARAM,
+    COLORREF, E_FAIL, E_INVALIDARG, ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND,
+    LPARAM, LRESULT, POINT, SetLastError, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
@@ -17,7 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, Error, Result, w};
 
 use super::drawing::{Content, PaintSession, Surface, dip};
-use crate::app::diagnostics;
+use crate::app::{config::AppearanceConfig, diagnostics};
 use crate::core::color::Rgb8;
 use crate::core::format::{ColorFormat, format_color};
 use crate::core::geometry::{ScreenPointPx, ScreenRectPx};
@@ -41,11 +41,19 @@ pub struct PreviewWindow {
     hwnd: HWND,
     state: Box<RefCell<State>>,
     capture_exclusion_enabled: bool,
+    appearance: AppearanceConfig,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
 impl PreviewWindow {
     pub fn new() -> Result<Self> {
+        Self::with_appearance(AppearanceConfig::default())
+    }
+
+    pub fn with_appearance(appearance: AppearanceConfig) -> Result<Self> {
+        appearance
+            .validate()
+            .map_err(|error| Error::new(E_INVALIDARG, error.to_string()))?;
         let instance = unsafe { GetModuleHandleW(None)? }.into();
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
@@ -88,6 +96,7 @@ impl PreviewWindow {
             hwnd,
             state,
             capture_exclusion_enabled: false,
+            appearance,
             _thread_affinity: PhantomData,
         };
         unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)? };
@@ -185,7 +194,13 @@ impl PreviewWindow {
                 surface.width != width || surface.height != height || surface.dpi != dpi
             });
             if rebuild {
-                let surface = Surface::new(width, height, dpi, self.capture_exclusion_enabled)?;
+                let surface = Surface::new(
+                    width,
+                    height,
+                    dpi,
+                    self.capture_exclusion_enabled,
+                    self.appearance,
+                )?;
                 self.state.borrow_mut().surface = Some(surface);
                 changed = true;
             }

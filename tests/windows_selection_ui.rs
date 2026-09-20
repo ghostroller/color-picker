@@ -27,12 +27,13 @@ use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, WPARAM},
         Graphics::Gdi::UpdateWindow,
+        UI::Controls::{TBM_GETRANGEMAX, TBM_GETRANGEMIN, TBM_SETPOS},
         UI::WindowsAndMessaging::{
             BM_CLICK, BM_SETCHECK, CB_GETCOUNT, CreateWindowExW, DestroyWindow, ES_READONLY,
-            GWL_EXSTYLE, GWL_STYLE, GetDlgItem, GetWindowLongW, GetWindowTextW, IsDialogMessageW,
-            IsWindow, MSG, SendMessageW, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND, WM_GETDLGCODE,
-            WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
-            WS_OVERLAPPED,
+            GWL_EXSTYLE, GWL_STYLE, GetDlgItem, GetNextDlgTabItem, GetWindowLongW, GetWindowTextW,
+            IsDialogMessageW, IsWindow, MSG, SendMessageW, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND,
+            WM_GETDLGCODE, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
+            WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_OVERLAPPED, WS_TABSTOP,
         },
     },
     core::w,
@@ -189,6 +190,61 @@ fn cached_selection_and_native_result_controls_smoke() {
         settings.process_pending().unwrap(),
         Some(SettingsAction::Apply(config.clone()))
     );
+    let border = unsafe { GetDlgItem(Some(settings_hwnd), 107) }.unwrap();
+    let transparency = unsafe { GetDlgItem(Some(settings_hwnd), 108) }.unwrap();
+    for (slider, maximum, expected) in [
+        (border, 6, config.appearance.border_width_dip),
+        (
+            transparency,
+            80,
+            config.appearance.background_transparency_percent,
+        ),
+    ] {
+        assert_ne!(
+            unsafe { GetWindowLongW(slider, GWL_STYLE) } as u32 & WS_TABSTOP.0,
+            0
+        );
+        assert_eq!(
+            unsafe { SendMessageW(slider, TBM_GETRANGEMIN, None, None) }.0,
+            0
+        );
+        assert_eq!(
+            unsafe { SendMessageW(slider, TBM_GETRANGEMAX, None, None) }.0,
+            maximum
+        );
+        // TBM_GETPOS is the WM_USER alias omitted by windows-rs.
+        assert_eq!(
+            unsafe { SendMessageW(slider, WM_USER, None, None) }.0,
+            isize::from(expected)
+        );
+    }
+    assert_eq!(
+        unsafe { GetNextDlgTabItem(settings_hwnd, Some(border), false) }.unwrap(),
+        transparency
+    );
+    press_key(border, 0x27, false); // Right increments the native trackbar.
+    press_key(transparency, 0x23, false); // End selects its maximum.
+    assert_eq!(
+        settings.process_pending().unwrap(),
+        None,
+        "slider changes remain a draft"
+    );
+    assert_eq!(
+        window_text(unsafe { GetDlgItem(Some(settings_hwnd), 22) }.unwrap()),
+        "3 DIP"
+    );
+    assert_eq!(
+        window_text(unsafe { GetDlgItem(Some(settings_hwnd), 24) }.unwrap()),
+        "80%"
+    );
+    let mut edited = config.clone();
+    edited.appearance.border_width_dip = 3;
+    edited.appearance.background_transparency_percent = 80;
+    unsafe { SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None) };
+    assert_eq!(
+        settings.process_pending().unwrap(),
+        Some(SettingsAction::Apply(edited.clone()))
+    );
     // Exercise the native key control, including the dialog message path.
     // These messages target only this fixture; no global input is generated.
     let key = unsafe { GetDlgItem(Some(settings_hwnd), 104) }.unwrap();
@@ -225,7 +281,6 @@ fn cached_selection_and_native_result_controls_smoke() {
     assert!(unsafe { IsDialogMessageW(settings_hwnd, &held_enter) }.as_bool());
     assert_eq!(settings.process_pending().unwrap(), None);
     unsafe { SendMessageW(key, WM_KEYUP, Some(WPARAM(0x0d)), Some(LPARAM(0xc000_0001))) };
-    let mut edited = config.clone();
     edited.hotkey.key = "K".into();
     unsafe { SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None) };
     assert_eq!(
@@ -316,6 +371,16 @@ fn cached_selection_and_native_result_controls_smoke() {
         SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None);
     }
     assert_eq!(settings.process_pending().unwrap(), None);
+    unsafe {
+        SendMessageW(border, TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(0)));
+        SendMessageW(
+            settings_hwnd,
+            WM_HSCROLL,
+            None,
+            Some(LPARAM(border.0 as isize)),
+        );
+    }
+    assert_eq!(settings.process_pending().unwrap(), None);
     unsafe { SendMessageW(settings_hwnd, WM_CLOSE, None, None) };
     assert_eq!(
         settings.process_pending().unwrap(),
@@ -325,6 +390,14 @@ fn cached_selection_and_native_result_controls_smoke() {
     assert!(!unsafe { IsWindow(Some(settings_hwnd)) }.as_bool());
 
     let readonly = SettingsWindow::new(&config, owner.0, None, false).unwrap();
+    assert!(
+        !unsafe {
+            windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
+                GetDlgItem(Some(readonly.hwnd()), 1).unwrap(),
+            )
+        }
+        .as_bool()
+    );
     unsafe { SendMessageW(readonly.hwnd(), WM_COMMAND, Some(WPARAM(1)), None) };
     assert_eq!(readonly.process_pending().unwrap(), None);
     drop(readonly);

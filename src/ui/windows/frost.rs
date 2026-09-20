@@ -8,13 +8,13 @@ use std::{cell::RefCell, ffi::c_void, ptr::NonNull};
 
 use windows::{
     Win32::{
-        Foundation::{E_FAIL, RECT},
+        Foundation::{E_FAIL, E_INVALIDARG, RECT},
         Graphics::Gdi::*,
     },
     core::{Error, Result},
 };
 
-use crate::core::geometry::ScreenPointPx;
+use crate::{app::config::MAX_BACKGROUND_TRANSPARENCY_PERCENT, core::geometry::ScreenPointPx};
 
 pub(super) struct FrostedPanel {
     bitmap: HBITMAP,
@@ -26,6 +26,7 @@ pub(super) struct FrostedPanel {
     width: i32,
     height: i32,
     radius: usize,
+    transparency_percent: u8,
 }
 
 struct Cache {
@@ -34,7 +35,10 @@ struct Cache {
 }
 
 impl FrostedPanel {
-    pub fn new(width: i32, height: i32, radius: i32) -> Result<Self> {
+    pub fn new(width: i32, height: i32, radius: i32, transparency_percent: u8) -> Result<Self> {
+        if transparency_percent > MAX_BACKGROUND_TRANSPARENCY_PERCENT {
+            return Err(Error::new(E_INVALIDARG, "Invalid backdrop transparency"));
+        }
         if width <= 0
             || height <= 0
             || width
@@ -101,6 +105,7 @@ impl FrostedPanel {
             width,
             height,
             radius: radius.max(1) as usize,
+            transparency_percent,
         };
         if previous.is_invalid() {
             return Err(Error::new(E_FAIL, "Could not select backdrop bitmap"));
@@ -143,6 +148,7 @@ impl FrostedPanel {
                     self.width as usize,
                     self.height as usize,
                     self.radius,
+                    self.transparency_percent,
                 );
                 cache.origin = Some(origin);
             }
@@ -180,7 +186,10 @@ fn blur_and_tint(
     width: usize,
     height: usize,
     radius: usize,
+    transparency_percent: u8,
 ) {
+    let backdrop_opacity = (u32::from(transparency_percent) * 255 + 50) / 100;
+    let tint_opacity = 255 - backdrop_opacity;
     // Sliding box filters keep the cost linear in this small information strip.
     let count = (2 * radius + 1) as u32;
     for y in 0..height {
@@ -205,8 +214,9 @@ fn blur_and_tint(
                 sum += at(y.min(height - 1));
             }
             for y in 0..height {
-                // A dark 84% tint leaves a quiet 16% of the blurred backdrop.
-                let value = ((sum / count) * 41 + tint * 214 + 127) / 255;
+                // Transparency controls only the cached information backdrop;
+                // sampled image pixels, swatches and text remain fully opaque.
+                let value = ((sum / count) * backdrop_opacity + tint * tint_opacity + 127) / 255;
                 pixels[(y * width + x) * 4 + channel] = value as u8;
                 sum -= at(y.saturating_sub(radius));
                 sum += at((y + radius + 1).min(height - 1));
@@ -221,18 +231,24 @@ mod tests {
 
     #[test]
     fn frosted_background_softens_edges_without_losing_tint_or_small_image_support() {
-        for (width, height) in [(1, 1), (1, 7), (7, 1), (12, 8)] {
-            let mut pixels = vec![255; width * height * 4];
-            let mut scratch = vec![0; pixels.len()];
-            blur_and_tint(&mut pixels, &mut scratch, width, height, 9);
-            for pixel in pixels.chunks_exact(4) {
-                assert_eq!(pixel, &[84, 68, 60, 255]);
+        for (percent, expected) in [
+            (0, [51, 32, 23, 255]),
+            (35, [122, 110, 104, 255]),
+            (80, [214, 210, 209, 255]),
+        ] {
+            for (width, height) in [(1, 1), (1, 7), (7, 1), (12, 8)] {
+                let mut pixels = vec![255; width * height * 4];
+                let mut scratch = vec![0; pixels.len()];
+                blur_and_tint(&mut pixels, &mut scratch, width, height, 9, percent);
+                for pixel in pixels.chunks_exact(4) {
+                    assert_eq!(pixel, &expected);
+                }
             }
         }
         let mut pixels = vec![0; 12 * 4];
         pixels[6 * 4..].fill(255);
         let mut scratch = vec![0; pixels.len()];
-        blur_and_tint(&mut pixels, &mut scratch, 12, 1, 3);
+        blur_and_tint(&mut pixels, &mut scratch, 12, 1, 3, 35);
         assert!(pixels[5 * 4] > pixels[0]);
         assert!(pixels[6 * 4] < pixels[11 * 4]);
         assert!(pixels[5 * 4] <= pixels[6 * 4]);
