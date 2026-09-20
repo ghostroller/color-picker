@@ -23,7 +23,8 @@ use windows::{
     core::{BOOL, Error, Result, w},
 };
 
-use super::drawing::{OwnedFont, PaintSession, dip, draw_text, palette};
+use super::drawing::{OwnedFont, PaintSession, dip, draw_bottom_right_border, draw_text, palette};
+use super::frost::FrostedPanel;
 use crate::{
     app::diagnostics,
     core::{
@@ -170,14 +171,24 @@ impl MagnifierWindow {
                 std::mem::size_of::<BOOL>() as u32,
             )?;
         }
-        if let Err(error) = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
-            diagnostics::event(format_args!("magnifier.capture_exclusion_failed {error}"));
-        }
+        let capture_excluded =
+            match unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
+                Ok(()) => true,
+                Err(error) => {
+                    diagnostics::event(format_args!("magnifier.capture_exclusion_failed {error}"));
+                    false
+                }
+            };
         let dpi = unsafe { GetDpiForWindow(hwnd) };
         let (bounds, viewport) = window_layout(focus, work_area, dpi, image.width, image.height)?;
         let view = ZoomView::new(image, viewport, ZoomScale::X4, cache)
             .map_err(|_| Error::new(E_INVALIDARG, "Could not map the frozen viewport"))?;
-        let surface = Surface::new(bounds.width() as i32, bounds.height() as i32, dpi)?;
+        let surface = Surface::new(
+            bounds.width() as i32,
+            bounds.height() as i32,
+            dpi,
+            capture_excluded,
+        )?;
         {
             let mut state = window.state.borrow_mut();
             state.hover = view.hit_test(focus);
@@ -466,6 +477,7 @@ struct Surface {
     _bitmap: OwnedBitmap,
     heading_font: OwnedFont,
     body_font: OwnedFont,
+    frost: Option<FrostedPanel>,
     old_bitmap: HGDIOBJ,
     width: i32,
     height: i32,
@@ -473,7 +485,7 @@ struct Surface {
 }
 
 impl Surface {
-    fn new(width: i32, height: i32, dpi: u32) -> Result<Self> {
+    fn new(width: i32, height: i32, dpi: u32, capture_excluded: bool) -> Result<Self> {
         let screen = ScreenDc(unsafe { GetDC(None) });
         if screen.0.is_invalid() {
             return Err(failure("Could not obtain drawing DC"));
@@ -488,6 +500,22 @@ impl Surface {
         }
         let heading_font = OwnedFont::new(13, 600, dpi)?;
         let body_font = OwnedFont::new(10, 400, dpi)?;
+        let frost = if capture_excluded {
+            let panel_left = if width < dip(132, dpi) {
+                0
+            } else {
+                dip(24, dpi)
+            };
+            match FrostedPanel::new(width - panel_left, dip(24, dpi), dip(6, dpi)) {
+                Ok(panel) => Some(panel),
+                Err(error) => {
+                    diagnostics::event(format_args!("magnifier.frost_unavailable {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let old_bitmap = unsafe { SelectObject(dc.0, bitmap.0.into()) };
         if old_bitmap.is_invalid() {
             return Err(failure("Could not select magnifier bitmap"));
@@ -497,6 +525,7 @@ impl Surface {
             _bitmap: bitmap,
             heading_font,
             body_font,
+            frost,
             old_bitmap,
             width,
             height,
@@ -611,7 +640,8 @@ impl Surface {
                 COLORREF(0x00ffffff),
             )?;
         }
-        self.draw_footer(viewport.bottom, footer)?;
+        self.draw_footer(viewport.bottom, footer, bounds)?;
+        draw_bottom_right_border(self.dc.0, self.width, self.height)?;
         unsafe {
             BitBlt(
                 target,
@@ -627,7 +657,7 @@ impl Surface {
         }
     }
 
-    fn draw_footer(&self, top: i32, footer: &Footer) -> Result<()> {
+    fn draw_footer(&self, top: i32, footer: &Footer, bounds: ScreenRectPx) -> Result<()> {
         self.fill(
             RECT {
                 left: 0,
@@ -638,6 +668,29 @@ impl Surface {
             palette::PANEL,
         )?;
         let compact = self.width < dip(132, self.dpi);
+        if let Some(frost) = &self.frost {
+            let panel = RECT {
+                left: if compact { 0 } else { dip(24, self.dpi) },
+                top,
+                right: self.width,
+                bottom: self.height,
+            };
+            if frost
+                .paint(
+                    self.dc.0,
+                    panel,
+                    ScreenPointPx {
+                        x: bounds.left,
+                        y: bounds.top,
+                    },
+                )
+                .is_err()
+            {
+                // Backdrop failure is decorative only; retain readable colors
+                // and continue sampling with the ordinary solid information bar.
+                self.fill(panel, palette::PANEL)?;
+            }
+        }
         let text_left = if compact {
             // The image already displays this color. Omit the redundant swatch
             // when an edge crop needs the available width for HEX and scale.

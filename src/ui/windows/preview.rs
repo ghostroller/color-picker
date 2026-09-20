@@ -185,7 +185,7 @@ impl PreviewWindow {
                 surface.width != width || surface.height != height || surface.dpi != dpi
             });
             if rebuild {
-                let surface = Surface::new(width, height, dpi)?;
+                let surface = Surface::new(width, height, dpi, self.capture_exclusion_enabled)?;
                 self.state.borrow_mut().surface = Some(surface);
                 changed = true;
             }
@@ -306,8 +306,16 @@ fn window_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> L
                 // BeginPaint may itself send WM_ERASEBKGND; borrow afterwards.
                 let paint = PaintSession::begin(hwnd);
                 if let Ok(mut state) = state.try_borrow_mut()
-                    && let (Some(surface), Some(content)) = (&state.surface, &state.content)
-                    && let Err(error) = surface.draw(paint.dc, content)
+                    && let (Some(surface), Some(content), Some(rect)) =
+                        (&state.surface, &state.content, state.rect)
+                    && let Err(error) = surface.draw(
+                        paint.dc,
+                        content,
+                        ScreenPointPx {
+                            x: rect.left,
+                            y: rect.top,
+                        },
+                    )
                 {
                     state.paint_error = Some(error);
                 }

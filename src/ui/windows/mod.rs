@@ -1,4 +1,5 @@
 mod drawing;
+mod frost;
 pub mod magnifier;
 pub mod preview;
 pub mod result;

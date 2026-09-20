@@ -97,7 +97,9 @@ impl PixelFixture {
         let x = monitor_info.rcWork.left + 48;
         let y = monitor_info.rcWork.top + 48;
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-        let extended = WS_EX_TOOLWINDOW;
+        // Establish topmost membership when the HWND is created, just as the
+        // sampling overlays do; some desktops ignore a later promotion alone.
+        let extended = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
         let window = FixtureWindow(unsafe {
             CreateWindowExW(
                 extended,

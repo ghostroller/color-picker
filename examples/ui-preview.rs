@@ -1,8 +1,10 @@
 //! A visual fixture using the production native windows and synthetic pixels.
-//! No hotkeys, hooks, screen sampling or configuration writes are started.
+//! No hotkeys, hooks, color sampling or configuration writes are started.
+//! The information strip may read its local backdrop to render frosted glass.
 //! cargo run --example ui-preview -- result [seconds]
 //! Modes: result, settings, live, frozen, frozen-edge. Copy buttons use the clipboard
 //! only when explicitly clicked. Settings Apply validates but never saves.
+//! Add --backdrop after the lifetime to preview material over a synthetic pattern.
 
 #[cfg(not(windows))]
 fn main() {
@@ -34,8 +36,9 @@ mod fixture {
     };
     use windows::{
         Win32::{
-            Foundation::HWND,
-            Graphics::Gdi::UpdateWindow,
+            Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
+            Graphics::{Dwm::DwmFlush, Gdi::*},
+            System::LibraryLoader::GetModuleHandleW,
             UI::{HiDpi::GetDpiForWindow, WindowsAndMessaging::*},
         },
         core::{Error, Result, w},
@@ -96,6 +99,11 @@ mod fixture {
         let focus = ScreenPointPx {
             x: work.left + (work.width() / 2) as i32,
             y: work.top + (work.height() / 2) as i32,
+        };
+        let _backdrop = if std::env::args().any(|arg| arg == "--backdrop") {
+            Some(backdrop(focus)?)
+        } else {
+            None
         };
         let owner = Owner(unsafe {
             CreateWindowExW(
@@ -180,6 +188,9 @@ mod fixture {
         };
         scene.process()?;
         unsafe {
+            // Cache the material while this overlay is still excluded from
+            // capture. PrintWindow can then use it without sampling itself.
+            let _ = UpdateWindow(scene.hwnd());
             // Only this synthetic fixture is capturable. Production overlays
             // retain WDA_EXCLUDEFROMCAPTURE for sampling correctness.
             let _ = SetWindowDisplayAffinity(scene.hwnd(), WDA_NONE);
@@ -220,5 +231,73 @@ mod fixture {
             }
         }
         Ok(())
+    }
+
+    fn backdrop(focus: ScreenPointPx) -> Result<Owner> {
+        let instance = unsafe { GetModuleHandleW(None)? }.into();
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(backdrop_proc),
+            hInstance: instance,
+            lpszClassName: w!("ColorPicker.MaterialFixture"),
+            ..Default::default()
+        };
+        unsafe { RegisterClassW(&class) };
+        let window = Owner(unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class.lpszClassName,
+                w!("Synthetic material backdrop"),
+                WS_POPUP,
+                focus.x - 180,
+                focus.y - 180,
+                600,
+                420,
+                None,
+                None,
+                Some(instance),
+                None,
+            )?
+        });
+        unsafe {
+            let _ = ShowWindow(window.0, SW_SHOWNOACTIVATE);
+            let _ = UpdateWindow(window.0);
+            DwmFlush()?;
+        }
+        Ok(window)
+    }
+
+    unsafe extern "system" fn backdrop_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if message == WM_PAINT {
+            let mut paint = PAINTSTRUCT::default();
+            let dc = unsafe { BeginPaint(hwnd, &mut paint) };
+            let brush = HBRUSH(unsafe { GetStockObject(DC_BRUSH) }.0);
+            for row in 0..7 {
+                for col in 0..10 {
+                    let color = if (row + col) % 2 == 0 {
+                        COLORREF(0x00dbc5a1)
+                    } else {
+                        COLORREF(0x0087a5d6)
+                    };
+                    let rect = RECT {
+                        left: col * 60,
+                        top: row * 60,
+                        right: (col + 1) * 60,
+                        bottom: (row + 1) * 60,
+                    };
+                    unsafe {
+                        SetDCBrushColor(dc, color);
+                        FillRect(dc, &rect, brush);
+                    }
+                }
+            }
+            let _ = unsafe { EndPaint(hwnd, &paint) };
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
     }
 }

@@ -4,7 +4,9 @@ use windows::Win32::Foundation::{COLORREF, E_FAIL, HWND, RECT};
 use windows::Win32::Graphics::Gdi::*;
 use windows::core::{Error, PCWSTR, Result, w};
 
+use super::frost::FrostedPanel;
 use crate::core::color::Rgb8;
+use crate::core::geometry::ScreenPointPx;
 
 pub(super) fn dip(value: i32, dpi: u32) -> i32 {
     ((i64::from(value) * i64::from(dpi) + 48) / 96) as i32
@@ -99,6 +101,7 @@ pub(super) struct Surface {
     _bitmap: OwnedBitmap,
     heading_font: OwnedFont,
     body_font: OwnedFont,
+    frost: Option<FrostedPanel>,
     old_bitmap: HGDIOBJ,
     pub width: i32,
     pub height: i32,
@@ -106,7 +109,7 @@ pub(super) struct Surface {
 }
 
 impl Surface {
-    pub fn new(width: i32, height: i32, dpi: u32) -> Result<Self> {
+    pub fn new(width: i32, height: i32, dpi: u32, capture_excluded: bool) -> Result<Self> {
         let screen = ScreenDc(unsafe { GetDC(None) });
         if screen.0.0.is_null() {
             return Err(Error::new(E_FAIL, "Could not obtain a drawing DC"));
@@ -124,6 +127,19 @@ impl Surface {
         }
         let heading_font = OwnedFont::new(13, 600, dpi)?;
         let body_font = OwnedFont::new(10, 400, dpi)?;
+        let frost = if capture_excluded {
+            match FrostedPanel::new(width - dip(38, dpi), height, dip(8, dpi)) {
+                Ok(panel) => Some(panel),
+                Err(error) => {
+                    crate::app::diagnostics::event(format_args!(
+                        "preview.frost_unavailable {error}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let old_bitmap = unsafe { SelectObject(dc.0, HGDIOBJ(bitmap.0.0)) };
         if invalid_selection(old_bitmap) {
             return Err(Error::new(E_FAIL, "Could not select the preview bitmap"));
@@ -133,6 +149,7 @@ impl Surface {
             _bitmap: bitmap,
             heading_font,
             body_font,
+            frost,
             old_bitmap,
             width,
             height,
@@ -140,7 +157,7 @@ impl Surface {
         })
     }
 
-    pub fn draw(&self, target: HDC, content: &Content) -> Result<()> {
+    pub fn draw(&self, target: HDC, content: &Content, origin: ScreenPointPx) -> Result<()> {
         let rect = RECT {
             left: 0,
             top: 0,
@@ -157,16 +174,20 @@ impl Surface {
             ));
         }
         self.fill(swatch_brush, palette::PANEL, rect)?;
-        if unsafe { SetDCBrushColor(self.dc.0, palette::BORDER) }.0 == CLR_INVALID
-            || unsafe { FrameRect(self.dc.0, &rect, swatch_brush) } == 0
-        {
-            return Err(Error::new(E_FAIL, "Could not paint the preview border"));
+        if let Some(frost) = &self.frost {
+            // A decorative backdrop failure keeps the opaque base below it.
+            let panel = RECT {
+                left: dip(38, self.dpi),
+                ..rect
+            };
+            if frost.paint(self.dc.0, panel, origin).is_err() {
+                self.fill(swatch_brush, palette::PANEL, panel)?;
+            }
         }
         let color = content.rgb.map_or(palette::EMPTY, |rgb| {
             COLORREF(u32::from(rgb.r) | (u32::from(rgb.g) << 8) | (u32::from(rgb.b) << 16))
         });
-        // The swatch runs flush to all three outside edges, without an inset
-        // border or decorative padding. Only the text panel keeps its border.
+        // The swatch remains flush to the window edges, without inset padding.
         self.fill(
             swatch_brush,
             color,
@@ -199,6 +220,7 @@ impl Surface {
             palette::SECONDARY,
             &content.coordinates,
         )?;
+        draw_bottom_right_border(self.dc.0, self.width, self.height)?;
         unsafe {
             BitBlt(
                 target,
@@ -249,6 +271,37 @@ impl Drop for Surface {
 
 fn invalid_selection(object: HGDIOBJ) -> bool {
     object.0.is_null() || object.0 as isize == -1
+}
+
+/// A subtle one-physical-pixel edge, painted inside the existing window bounds.
+/// The top and left stay open, and neither layout nor pixel hit mapping changes.
+pub(super) fn draw_bottom_right_border(dc: HDC, width: i32, height: i32) -> Result<()> {
+    if width <= 0 || height <= 0 {
+        return Ok(());
+    }
+    let brush = HBRUSH(unsafe { GetStockObject(DC_BRUSH) }.0);
+    if brush.is_invalid() || unsafe { SetDCBrushColor(dc, palette::BORDER) }.0 == CLR_INVALID {
+        return Err(Error::new(E_FAIL, "Could not configure the overlay border"));
+    }
+    for edge in [
+        RECT {
+            left: 0,
+            top: height - 1,
+            right: width,
+            bottom: height,
+        },
+        RECT {
+            left: width - 1,
+            top: 0,
+            right: width,
+            bottom: height,
+        },
+    ] {
+        if unsafe { FillRect(dc, &edge, brush) } == 0 {
+            return Err(Error::new(E_FAIL, "Could not paint the overlay border"));
+        }
+    }
+    Ok(())
 }
 
 /// Text uses cached fonts and an explicit clip rectangle. Even unusually long
