@@ -35,6 +35,35 @@ cargo test --locked --test windows_shell -- --ignored --test-threads=1 --nocaptu
 发布构建位于 `target/x86_64-pc-windows-msvc/release/color-picker.exe`。
 非 Windows 平台仅支持 `cargo test --lib --tests --locked` 等纯逻辑检查。
 
+## 快捷键无响应时的日志
+
+先从托盘退出已有实例，然后运行：
+
+```powershell
+.\scripts\start-with-logs.ps1
+```
+
+脚本将构建到独立的 `target/diagnostic` 目录，启动带日志的程序，并输出日志路径及
+实时查看命令。每次启动在 `logs/` 中创建独立文件，不会关闭已有实例。
+**如果旧实例未退出，新进程只激活旧实例后退出，无法给旧版本补开日志。**
+
+也可以为 EXE 显式指定 `--log-file <路径>`，可与 `--check-environment` 或 `--diagnostics` 组合。
+`--diagnostics` 单独使用仍只开启状态查询，不写日志。Release 没有控制台，文件日志可直接读取。
+
+| 日志事件 | 含义 |
+|---|---|
+| `hotkey.registered` | Ctrl+Alt+C 已成功注册 |
+| `hotkey.registration_failed` | 注册失败，后面包含系统错误；可能已被其他程序占用 |
+| `hotkey.received` | 宿主已收到该快捷键的 WM_HOTKEY |
+| `activation.handled` | 已处理激活；当前 M1 仅发阶段通知 |
+| `tray.notification_accepted` | Windows 已接受通知请求，不保证用户看到了通知 |
+| `tray.balloon_show` | 收到 Shell 的通知显示回调 |
+| `instance.existing` | 发现旧实例，本次日志不会记录旧进程中的快捷键 |
+
+默认不写日志。诊断日志仅记录离散应用事件和错误，不记录一般按键、屏幕像素或剪贴板内容；
+没有日志线程或刷新定时器。单个日志上限 1 MiB，达到上限写入 `log.limit_reached` 后停止记录；
+此时换一个文件路径或重新运行脚本。
+
 ## 范围
 
 目标为 Windows 11 x64，Windows 10 22H2 x64 待兼容性验证。

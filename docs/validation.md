@@ -61,6 +61,13 @@ cargo test --locked --test windows_shell -- --ignored --test-threads=1 --nocaptu
 
 ## 发布前实机矩阵
 
+补充诊断验证（M1 日志变更）：2026-09-20，设置 `CARGO_TARGET_DIR=target/diagnostic` 后
+完整运行 `scripts/verify-windows.ps1`，51 项默认测试及其余检查 PASS。另执行 Release
+`--check-environment --log-file <含中文和空格的绝对路径>`，确认日志含 `app.start`、
+`environment.pmv2_ok`、`app.exit status=success`；缺失日志路径返回 2。启动脚本语法检查 PASS。
+诊断变更后的两项交互桌面测试为 NOT TESTED（已有用户实例，未关闭或接管）；前面的桌面 PASS
+仍仅适用于原 M1 提交。用户实际快捷键无可见效果的根因待日志确认。
+
 当前阶段不含桌面取色功能，下列完整发布场景均尚未执行，不代表支持已经验证。
 
 | 编号 | 场景 | 结果 |

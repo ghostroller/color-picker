@@ -15,12 +15,14 @@ use windows::{
             },
         },
         UI::{
-            Shell::{NIN_SELECT, NINF_KEY},
+            Shell::{NIN_BALLOONHIDE, NIN_BALLOONSHOW, NIN_BALLOONTIMEOUT, NIN_SELECT, NINF_KEY},
             WindowsAndMessaging::*,
         },
     },
     core::{Error, PCWSTR, Result, w},
 };
+
+use crate::app::diagnostics;
 
 use super::{
     hotkey,
@@ -35,17 +37,22 @@ pub const WM_TRAY: u32 = WM_APP + 2;
 /// ready / activation count / hotkey registered / tray added / tray restorations.
 pub const WM_DIAGNOSTICS: u32 = WM_APP + 3;
 
-const ACTIVATE: u8 = 1;
-const MENU: u8 = 2;
-const EXIT: u8 = 4;
-const RESTORE_TRAY: u8 = 8;
-const ENVIRONMENT_CHANGED: u8 = 16;
+const ACTIVATE: u16 = 1;
+const MENU: u16 = 2;
+const EXIT: u16 = 4;
+const RESTORE_TRAY: u16 = 8;
+const ENVIRONMENT_CHANGED: u16 = 16;
+const HOTKEY_ACTIVATE: u16 = 32;
+const TRAY_ACTIVATE: u16 = 64;
+const BALLOON_SHOW: u16 = 128;
+const BALLOON_HIDE: u16 = 256;
+const BALLOON_TIMEOUT: u16 = 512;
 // shellapi.h defines this expression; windows 0.62.2 does not emit that macro.
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 
 thread_local! {
     // Cells have no dynamic borrows, callbacks cannot alias the main-thread app.
-    static PENDING: Cell<u8> = const { Cell::new(0) };
+    static PENDING: Cell<u16> = const { Cell::new(0) };
     static TASKBAR_MESSAGE: Cell<u32> = const { Cell::new(0) };
     static CALLBACK_FAILED: Cell<bool> = const { Cell::new(false) };
     static DIAGNOSTICS: Cell<bool> = const { Cell::new(false) };
@@ -58,8 +65,16 @@ thread_local! {
 
 pub fn run(diagnostics: bool) -> Result<()> {
     let _instance = match SingleInstance::acquire()? {
-        InstanceStatus::Primary(instance) => instance,
-        InstanceStatus::Existing => return activate_existing(),
+        InstanceStatus::Primary(instance) => {
+            diagnostics::event(format_args!("instance.primary"));
+            instance
+        }
+        InstanceStatus::Existing => {
+            diagnostics::event(format_args!(
+                "instance.existing logging_applies_to_this_process_only; exit the old instance from its tray and restart with --log-file to trace hotkeys"
+            ));
+            return activate_existing();
+        }
     };
     DIAGNOSTICS.set(diagnostics);
     let taskbar_message = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
@@ -90,9 +105,19 @@ pub fn run(diagnostics: bool) -> Result<()> {
     // top-level window, not HWND_MESSAGE. Guards below drop before the window.
     let mut tray = TrayIcon::new(window.0, WM_TRAY)?;
     TRAY_ADDED.set(true);
+    diagnostics::event(format_args!("tray.registered version=4"));
     let hotkey = match hotkey::register_default(window.0) {
-        Ok(guard) => Some(guard),
+        Ok(guard) => {
+            diagnostics::event(format_args!(
+                "hotkey.registered chord=Ctrl+Alt+C id={} norepeat=true",
+                guard.id()
+            ));
+            Some(guard)
+        }
         Err(error) => {
+            diagnostics::event(format_args!(
+                "hotkey.registration_failed chord=Ctrl+Alt+C error={error}"
+            ));
             notify(
                 &tray,
                 "快捷键注册失败",
@@ -103,8 +128,14 @@ pub fn run(diagnostics: bool) -> Result<()> {
     };
     HOTKEY_REGISTERED.set(hotkey.is_some());
     let session_notifications = match SessionNotifications::new(window.0) {
-        Ok(guard) => Some(guard),
+        Ok(guard) => {
+            diagnostics::event(format_args!("session_notifications.registered"));
+            Some(guard)
+        }
         Err(error) => {
+            diagnostics::event(format_args!(
+                "session_notifications.registration_failed error={error}"
+            ));
             notify(
                 &tray,
                 "会话通知不可用",
@@ -114,6 +145,10 @@ pub fn run(diagnostics: bool) -> Result<()> {
         }
     };
     READY.set(true);
+    diagnostics::event(format_args!(
+        "host.ready hotkey_registered={} stage=M1; activation currently shows a notification, not screen sampling",
+        hotkey.is_some()
+    ));
 
     let result = message_loop(&mut tray);
     READY.set(false);
@@ -124,6 +159,7 @@ pub fn run(diagnostics: bool) -> Result<()> {
     drop(tray);
     drop(window);
     drop(class);
+    diagnostics::event(format_args!("host.stopped resources_released=true"));
     result
 }
 
@@ -142,7 +178,17 @@ fn message_loop(tray: &mut TrayIcon) -> Result<()> {
                 break;
             }
             if pending & EXIT != 0 {
+                diagnostics::event(format_args!("host.exit_requested"));
                 return Ok(());
+            }
+            if pending & BALLOON_SHOW != 0 {
+                diagnostics::event(format_args!("tray.balloon_show received_from_shell=true"));
+            }
+            if pending & BALLOON_HIDE != 0 {
+                diagnostics::event(format_args!("tray.balloon_hide"));
+            }
+            if pending & BALLOON_TIMEOUT != 0 {
+                diagnostics::event(format_args!("tray.balloon_timeout"));
             }
             if pending & RESTORE_TRAY != 0 {
                 TRAY_ADDED.set(false);
@@ -150,6 +196,7 @@ fn message_loop(tray: &mut TrayIcon) -> Result<()> {
                     Ok(()) => {
                         TRAY_ADDED.set(true);
                         TRAY_RESTORATIONS.set(TRAY_RESTORATIONS.get().saturating_add(1));
+                        diagnostics::event(format_args!("tray.restored"));
                     }
                     // A hidden process without a tray may have no usable exit
                     // path (especially if its hotkey also conflicted).
@@ -161,23 +208,42 @@ fn message_loop(tray: &mut TrayIcon) -> Result<()> {
                     }
                 }
             }
+            if pending & HOTKEY_ACTIVATE != 0 {
+                diagnostics::event(format_args!("hotkey.received chord=Ctrl+Alt+C"));
+            }
+            if pending & TRAY_ACTIVATE != 0 {
+                diagnostics::event(format_args!("tray.activation_received"));
+            }
             if pending & ACTIVATE != 0 {
+                diagnostics::event(format_args!("instance.activation_received"));
+            }
+            if pending & (ACTIVATE | HOTKEY_ACTIVATE | TRAY_ACTIVATE) != 0 {
                 activate(tray);
             }
             if pending & MENU != 0 {
+                diagnostics::event(format_args!("tray.menu_requested"));
                 match tray.show_menu()? {
-                    Some(TrayCommand::Start) => activate(tray),
+                    Some(TrayCommand::Start) => {
+                        diagnostics::event(format_args!("tray.menu_selected command=start"));
+                        activate(tray);
+                    }
                     Some(TrayCommand::Settings) => notify(
                         tray,
                         "设置",
                         "当前为 M1 开发版本。快捷键和复制设置将在 M6 接入。",
                     ),
-                    Some(TrayCommand::Exit) => return Ok(()),
+                    Some(TrayCommand::Exit) => {
+                        diagnostics::event(format_args!("tray.menu_selected command=exit"));
+                        return Ok(());
+                    }
                     None => {}
                 }
             }
             // M1 owns no capture resources or monitor cache to invalidate.
             // M2/M6 will translate ENVIRONMENT_CHANGED into session cancellation.
+            if pending & ENVIRONMENT_CHANGED != 0 {
+                diagnostics::event(format_args!("environment.changed"));
+            }
         }
         let mut message = MSG::default();
         let status = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
@@ -200,6 +266,10 @@ fn message_loop(tray: &mut TrayIcon) -> Result<()> {
 
 fn activate(tray: &TrayIcon) {
     ACTIVATIONS.set(ACTIVATIONS.get().saturating_add(1));
+    diagnostics::event(format_args!(
+        "activation.handled count={} stage=M1",
+        ACTIVATIONS.get()
+    ));
     notify(
         tray,
         "color-picker 已激活",
@@ -208,8 +278,16 @@ fn activate(tray: &TrayIcon) {
 }
 
 fn notify(tray: &TrayIcon, title: &str, message: &str) {
-    if let Err(error) = tray.notify(title, message) {
-        show_error(&format!("{title}\n{message}\n\n托盘通知失败：{error}"));
+    match tray.notify(title, message) {
+        Ok(()) => diagnostics::event(format_args!(
+            "tray.notification_accepted title={title}; visibility depends on Windows notification settings"
+        )),
+        Err(error) => {
+            diagnostics::event(format_args!(
+                "tray.notification_failed title={title} error={error}"
+            ));
+            show_error(&format!("{title}\n{message}\n\n托盘通知失败：{error}"));
+        }
     }
 }
 
@@ -221,6 +299,7 @@ fn activate_existing() -> Result<()> {
         if let Ok(hwnd) = unsafe { FindWindowW(HOST_CLASS, PCWSTR(title.as_ptr())) }
             && unsafe { PostMessageW(Some(hwnd), WM_ACTIVATE_PICKER, WPARAM(0), LPARAM(0)) }.is_ok()
         {
+            diagnostics::event(format_args!("instance.activation_forwarded"));
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -231,7 +310,7 @@ fn activate_existing() -> Result<()> {
     ))
 }
 
-fn enqueue(hwnd: HWND, action: u8) {
+fn enqueue(hwnd: HWND, action: u16) {
     let previous = PENDING.replace(PENDING.get() | action);
     if previous != 0 {
         return;
@@ -262,10 +341,15 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
     }
     match message {
         WM_ACTIVATE_PICKER => enqueue(hwnd, ACTIVATE),
-        WM_HOTKEY if wparam.0 == hotkey::DEFAULT_HOTKEY_ID as usize => enqueue(hwnd, ACTIVATE),
+        WM_HOTKEY if wparam.0 == hotkey::DEFAULT_HOTKEY_ID as usize => {
+            enqueue(hwnd, HOTKEY_ACTIVATE)
+        }
         WM_TRAY => match (lparam.0 as u32) & 0xffff {
-            NIN_SELECT | NIN_KEYSELECT => enqueue(hwnd, ACTIVATE),
+            NIN_SELECT | NIN_KEYSELECT => enqueue(hwnd, TRAY_ACTIVATE),
             WM_CONTEXTMENU => enqueue(hwnd, MENU),
+            NIN_BALLOONSHOW => enqueue(hwnd, BALLOON_SHOW),
+            NIN_BALLOONHIDE => enqueue(hwnd, BALLOON_HIDE),
+            NIN_BALLOONTIMEOUT => enqueue(hwnd, BALLOON_TIMEOUT),
             _ => {}
         },
         WM_DIAGNOSTICS if DIAGNOSTICS.get() => {

@@ -6,11 +6,17 @@
 //! They never synthesize input, install hooks, open menus, or touch the clipboard.
 
 use std::{
+    fs::{self, OpenOptions},
+    io,
     os::windows::process::CommandExt,
+    path::PathBuf,
     process::{Child, Command, ExitStatus},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use color_picker::platform::windows::{
@@ -80,6 +86,9 @@ fn resident_shell_smoke() {
         second.wait_exit().success(),
         "second launch did not exit successfully"
     );
+    let second_log = second.log_contents();
+    assert_logged(&second_log, "instance.existing");
+    assert_logged(&second_log, "instance.activation_forwarded");
     wait_counter(hwnd, 1, activations + 1);
     assert_eq!(
         matching_hosts(&title),
@@ -108,6 +117,16 @@ fn resident_shell_smoke() {
     assert_eq!(diagnostic(hwnd, 3), 1);
 
     primary.close();
+    let primary_log = primary.log_contents();
+    for event in [
+        "hotkey.registered",
+        "hotkey.received",
+        "activation.handled",
+        "tray.notification_accepted",
+        "host.stopped",
+    ] {
+        assert_logged(&primary_log, event);
+    }
     assert!(
         matching_hosts(&title).is_empty(),
         "host survived normal shutdown"
@@ -158,6 +177,13 @@ fn hotkey_conflict_keeps_tray_activation_available() {
     wait_counter(hwnd, 1, activations + 1);
     assert_eq!(diagnostic(hwnd, 2), 0);
     child.close();
+    let conflict_log = child.log_contents();
+    assert_logged(&conflict_log, "hotkey.registration_failed");
+    assert_logged(&conflict_log, "tray.activation_received");
+    assert!(
+        !contains_event(&conflict_log, "hotkey.registered"),
+        "conflicting hotkey was incorrectly logged as registered:\n{conflict_log}"
+    );
     assert!(matching_hosts(&title).is_empty());
     drop(reservation);
 }
@@ -233,19 +259,45 @@ fn wait_counter(hwnd: HWND, field: usize, expected: usize) {
     }
 }
 
+fn contains_event(log: &str, event: &str) -> bool {
+    // Each record starts with unix_ms, pid and elapsed_ms, followed by its event.
+    // Match the event token rather than text that might occur in a message field.
+    log.lines()
+        .any(|line| line.split_whitespace().nth(3) == Some(event))
+}
+
+fn assert_logged(log: &str, event: &str) {
+    assert!(
+        contains_event(log, event),
+        "missing log event {event}:\n{log}"
+    );
+}
+
 struct AppChild {
     child: Child,
     hwnd: Option<HWND>,
+    log: TempLog,
 }
 
 impl AppChild {
     fn spawn() -> Self {
+        let log = TempLog::new();
         let child = Command::new(env!("CARGO_BIN_EXE_color-picker"))
             .arg("--diagnostics")
+            .arg("--log-file")
+            .arg(&log.path)
             .creation_flags(CREATE_NO_WINDOW.0)
             .spawn()
             .expect("could not start the color-picker test child");
-        Self { child, hwnd: None }
+        Self {
+            child,
+            hwnd: None,
+            log,
+        }
+    }
+
+    fn log_contents(&self) -> String {
+        fs::read_to_string(&self.log.path).expect("could not read the test child's diagnostic log")
     }
 
     fn wait_ready(&mut self, title: &[u16]) -> HWND {
@@ -326,8 +378,56 @@ impl Drop for AppChild {
             }
         }
         // This Child handle was created by this test. Never enumerate or kill user processes.
-        if self.child.kill().is_ok() {
-            let _ = self.child.wait();
+        self.log.remove_on_drop = if self.child.kill().is_ok() {
+            self.child.wait().is_ok()
+        } else {
+            matches!(self.child.try_wait(), Ok(Some(_)))
+        };
+        // If cleanup could not confirm exit, leave this child's log intact.
+        // Otherwise its TempLog field is dropped only after the child stopped.
+    }
+}
+
+struct TempLog {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+impl TempLog {
+    fn new() -> Self {
+        static NEXT_LOG: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..100 {
+            let serial = NEXT_LOG.fetch_add(1, Ordering::Relaxed);
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "color-picker-shell-test-{}-{timestamp}-{serial}.log",
+                std::process::id(),
+            ));
+            // Atomically reserve a new file. Never adopt or truncate an existing log.
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    drop(file);
+                    return Self {
+                        path,
+                        remove_on_drop: true,
+                    };
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("could not allocate a temporary diagnostic log: {error}"),
+            }
+        }
+        panic!("could not allocate a unique temporary diagnostic log");
+    }
+}
+
+impl Drop for TempLog {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            // Only this exact file, reserved with create_new, belongs to this guard.
+            let _ = fs::remove_file(&self.path);
         }
     }
 }
