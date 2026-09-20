@@ -6,5 +6,8 @@ fn main() {
         embed_resource::compile("resources/app.rc", embed_resource::NONE)
             .manifest_required()
             .expect("failed to embed the required Windows manifest");
+        embed_resource::compile_for_examples("resources/app.rc", embed_resource::NONE)
+            .manifest_required()
+            .expect("failed to embed the pixel fixture's required Windows manifest");
     }
 }

@@ -6,10 +6,12 @@ Windows 原生桌面取色工具，按 [实现计划](docs/implementation-plan.m
 当前进展与验收证据见 [开发记录](docs/progress.md) 和 [验证记录](docs/validation.md)。
 当前是开发版本，尚未完成 v0.1 发布验收。
 
-当前已实现 M0 核心与 M1 常驻外壳。启动后在托盘显示图标；`Ctrl + Alt + C`、
-托盘激活和重复启动都触发阶段提示。右键菜单提供开始取色、设置、退出。
-**当前还不能采样屏幕**，设置入口也仅显示阶段说明；后续按 M2–M6 接入。
-退出请使用托盘“退出”。系统可能按通知设置抑制阶段提示。
+当前已实现 M0 核心、M1 常驻外壳和 M2 实时颜色预览。启动后在托盘显示图标；
+按 `Ctrl + Alt + C`、激活托盘或重复启动，开始显示鼠标所在物理像素的颜色、HEX 和坐标。
+预览中重复激活不会叠加会话；右键托盘可“停止预览”或“退出”。
+鼠标静止时仍检查画面变化，停止预览后释放采样资源和定时器。
+**当前仅能预览**：点击选择、Esc / 右键取消、滚轮放大、结果复制和设置将在 M3–M6 接入。
+当前鼠标点击和滚轮仍会传给底层程序，请通过托盘停止预览。
 
 ## 构建
 
@@ -21,14 +23,20 @@ cargo run --locked
 .\scripts\verify-windows.ps1
 ```
 
-在交互 Windows 桌面单独执行常驻外壳冒烟测试（开始前关闭已有 color-picker）：
+在交互 Windows 桌面单独执行桌面测试（开始前关闭已有 color-picker）：
 
 ```powershell
-cargo test --locked --test windows_shell -- --ignored --test-threads=1 --nocapture
+cargo test --locked --test windows_capture --test windows_preview --test windows_shell -- --ignored --test-threads=1 --nocapture
 ```
 
-该测试临时启动并关闭自己的实例、占用默认热键以验证冲突，并模拟托盘恢复通知。
-不生成真实键鼠输入，也不重启 Explorer；因此不能替代人工热键、菜单和 Explorer 重启验收。
+这些测试显示小型已知像素窗口和预览，检查采样、非激活窗口、资源释放以及停止后不再采样；
+临时启动并关闭自己的实例、占用默认热键验证冲突，并模拟托盘恢复及显示变化消息。
+不生成真实键鼠输入，也不重启 Explorer；不能替代人工热键、菜单、多屏 DPI 和 Explorer 重启验收。
+运行时请保持测试窗口无遮挡，不切换前台程序或修改显示设置。
+
+人工核对像素可运行 `cargo run --locked --example pixel-fixture`：
+窗口客户区为 384×256 像素，局部 `(x, y)` 的 RGB 为 `(x % 256, y % 256, (x ^ y) % 256)`；
+底部 16 行改为每列循环红、绿、蓝的单像素条纹。标题显示客户区物理原点，关闭窗口结束。
 `--check-environment` 检查实际 DPI 上下文后退出；`--diagnostics` 启用按需的宿主状态查询，
 不增加后台采样或日志线程。
 
@@ -55,7 +63,11 @@ cargo test --locked --test windows_shell -- --ignored --test-threads=1 --nocaptu
 | `hotkey.registered` | Ctrl+Alt+C 已成功注册 |
 | `hotkey.registration_failed` | 注册失败，后面包含系统错误；可能已被其他程序占用 |
 | `hotkey.received` | 宿主已收到该快捷键的 WM_HOTKEY |
-| `activation.handled` | 已处理激活；当前 M1 仅发阶段通知 |
+| `activation.handled` | 已处理激活，开始实时预览 |
+| `activation.ignored` | 预览已开启，忽略重复激活 |
+| `preview.started` | 采样会话及定时器已建立 |
+| `preview.stopped` | 会话结束，定时器和预览资源已释放 |
+| `preview.sample_unavailable` / `preview.failed` | 采样暂不可用或预览因错误停止 |
 | `tray.notification_accepted` | Windows 已接受通知请求，不保证用户看到了通知 |
 | `tray.balloon_show` | 收到 Shell 的通知显示回调 |
 | `instance.existing` | 发现旧实例，本次日志不会记录旧进程中的快捷键 |

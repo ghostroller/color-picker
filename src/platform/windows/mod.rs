@@ -3,9 +3,12 @@ use windows::Win32::UI::HiDpi::{
     GetThreadDpiAwarenessContext,
 };
 
+pub mod capture;
 pub mod host;
 pub mod hotkey;
 pub mod instance;
+pub mod monitors;
+pub mod session;
 pub mod tray;
 
 pub fn check_environment() -> windows::core::Result<()> {

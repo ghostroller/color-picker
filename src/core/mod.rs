@@ -3,5 +3,6 @@
 pub mod color;
 pub mod format;
 pub mod geometry;
+pub mod placement;
 pub mod state;
 pub mod zoom;

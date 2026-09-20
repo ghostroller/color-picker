@@ -116,6 +116,11 @@ try {
 
     # This mode checks the effective process DPI context and exits; it installs no input hooks.
     Invoke-CheckedNative $executable @('--check-environment')
+    # The standalone pixel fixture must use physical pixels too. Resource linking
+    # for Cargo examples is separate from application binaries.
+    Invoke-CheckedNative cargo @('build', '--locked', '--example', 'pixel-fixture', '--target', 'x86_64-pc-windows-msvc')
+    $fixture = Join-Path $metadata.target_directory 'x86_64-pc-windows-msvc\debug\examples\pixel-fixture.exe'
+    Invoke-CheckedNative $fixture @('--check-environment')
     Write-Host 'Windows build, embedded manifest, and process DPI checks passed.'
 }
 finally {

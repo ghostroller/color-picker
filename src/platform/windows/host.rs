@@ -22,7 +22,7 @@ use windows::{
     core::{Error, PCWSTR, Result, w},
 };
 
-use crate::app::diagnostics;
+use crate::app::{controller::PreviewController, diagnostics};
 
 use super::{
     hotkey,
@@ -36,7 +36,10 @@ pub const WM_TRAY: u32 = WM_APP + 2;
 /// Read-only diagnostics, enabled explicitly with --diagnostics. wParam selects
 /// ready / activation count / hotkey registered / tray added / tray restorations.
 pub const WM_DIAGNOSTICS: u32 = WM_APP + 3;
+/// Diagnostic harness only: normal users end M2 preview using the tray menu.
+pub const WM_STOP_PREVIEW: u32 = WM_APP + 4;
 
+// Activation source bits preserve logging even when the request must be ignored.
 const ACTIVATE: u16 = 1;
 const MENU: u16 = 2;
 const EXIT: u16 = 4;
@@ -47,6 +50,10 @@ const TRAY_ACTIVATE: u16 = 64;
 const BALLOON_SHOW: u16 = 128;
 const BALLOON_HIDE: u16 = 256;
 const BALLOON_TIMEOUT: u16 = 512;
+const SAMPLE_TICK: u16 = 1024;
+const STOP_PREVIEW: u16 = 2048;
+const START_REQUEST: u16 = 4096;
+const ACTIVATION_IGNORED: u16 = 8192;
 // shellapi.h defines this expression; windows 0.62.2 does not emit that macro.
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 
@@ -61,6 +68,11 @@ thread_local! {
     static HOTKEY_REGISTERED: Cell<bool> = const { Cell::new(false) };
     static TRAY_ADDED: Cell<bool> = const { Cell::new(false) };
     static TRAY_RESTORATIONS: Cell<u32> = const { Cell::new(0) };
+    static PREVIEW_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static ACTIVE_TIMER: Cell<usize> = const { Cell::new(0) };
+    static PENDING_TIMER: Cell<usize> = const { Cell::new(0) };
+    static SAMPLE_ATTEMPTS: Cell<u64> = const { Cell::new(0) };
+    static PREVIEW_SESSION: Cell<u64> = const { Cell::new(0) };
 }
 
 pub fn run(diagnostics: bool) -> Result<()> {
@@ -146,11 +158,11 @@ pub fn run(diagnostics: bool) -> Result<()> {
     };
     READY.set(true);
     diagnostics::event(format_args!(
-        "host.ready hotkey_registered={} stage=M1; activation currently shows a notification, not screen sampling",
+        "host.ready hotkey_registered={} stage=M2; activation starts live preview, stop using the tray menu",
         hotkey.is_some()
     ));
 
-    let result = message_loop(&mut tray);
+    let result = message_loop(window.0, &mut tray);
     READY.set(false);
     HOTKEY_REGISTERED.set(false);
     TRAY_ADDED.set(false);
@@ -163,7 +175,8 @@ pub fn run(diagnostics: bool) -> Result<()> {
     result
 }
 
-fn message_loop(tray: &mut TrayIcon) -> Result<()> {
+fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
+    let mut controller = PreviewController::new(hwnd);
     loop {
         if CALLBACK_FAILED.get() {
             return Err(Error::new(E_FAIL, "Failed to wake the host message loop"));
@@ -180,6 +193,17 @@ fn message_loop(tray: &mut TrayIcon) -> Result<()> {
             if pending & EXIT != 0 {
                 diagnostics::event(format_args!("host.exit_requested"));
                 return Ok(());
+            }
+            // A topology, desktop/session or power transition invalidates the
+            // current DC and coordinates. Never automatically resume capture.
+            if pending & ENVIRONMENT_CHANGED != 0 {
+                controller.stop("environment_changed");
+                publish_preview_status(&controller);
+                diagnostics::event(format_args!("environment.changed"));
+            }
+            if pending & STOP_PREVIEW != 0 {
+                controller.stop("diagnostic_request");
+                publish_preview_status(&controller);
             }
             if pending & BALLOON_SHOW != 0 {
                 diagnostics::event(format_args!("tray.balloon_show received_from_shell=true"));
@@ -217,32 +241,55 @@ fn message_loop(tray: &mut TrayIcon) -> Result<()> {
             if pending & ACTIVATE != 0 {
                 diagnostics::event(format_args!("instance.activation_received"));
             }
-            if pending & (ACTIVATE | HOTKEY_ACTIVATE | TRAY_ACTIVATE) != 0 {
-                activate(tray);
-            }
+            dispatch_activation_intent(
+                pending,
+                || activate(tray, &mut controller),
+                || {
+                    diagnostics::event(format_args!(
+                        "activation.ignored reason=preview_already_active"
+                    ))
+                },
+            );
             if pending & MENU != 0 {
                 diagnostics::event(format_args!("tray.menu_requested"));
-                match tray.show_menu()? {
+                let active = controller.active();
+                if let Err(error) = controller.pause_for_menu() {
+                    controller.stop("menu_pause_failure");
+                    notify(tray, "预览已停止", &error.to_string());
+                }
+                publish_preview_status(&controller);
+                match tray.show_menu(active)? {
                     Some(TrayCommand::Start) => {
                         diagnostics::event(format_args!("tray.menu_selected command=start"));
-                        activate(tray);
+                        activate(tray, &mut controller);
                     }
-                    Some(TrayCommand::Settings) => notify(
-                        tray,
-                        "设置",
-                        "当前为 M1 开发版本。快捷键和复制设置将在 M6 接入。",
-                    ),
+                    Some(TrayCommand::Stop) => {
+                        controller.stop("tray_menu");
+                        diagnostics::event(format_args!("tray.menu_selected command=stop"));
+                    }
+                    Some(TrayCommand::Settings) => {
+                        controller.stop("settings");
+                        notify(tray, "设置", "快捷键和复制设置将在后续版本接入。");
+                    }
                     Some(TrayCommand::Exit) => {
                         diagnostics::event(format_args!("tray.menu_selected command=exit"));
                         return Ok(());
                     }
                     None => {}
                 }
+                if let Err(error) = controller.resume_after_menu() {
+                    controller.stop("menu_resume_failure");
+                    notify(tray, "预览已停止", &error.to_string());
+                }
+                publish_preview_status(&controller);
             }
-            // M1 owns no capture resources or monitor cache to invalidate.
-            // M2/M6 will translate ENVIRONMENT_CHANGED into session cancellation.
-            if pending & ENVIRONMENT_CHANGED != 0 {
-                diagnostics::event(format_args!("environment.changed"));
+            if pending & SAMPLE_TICK != 0 {
+                let timer = PENDING_TIMER.replace(0);
+                if let Err(error) = controller.on_timer(timer) {
+                    diagnostics::event(format_args!("preview.failed error={error}"));
+                    notify(tray, "预览已停止", &error.to_string());
+                }
+                publish_preview_status(&controller);
             }
         }
         let mut message = MSG::default();
@@ -264,17 +311,31 @@ fn message_loop(tray: &mut TrayIcon) -> Result<()> {
     }
 }
 
-fn activate(tray: &TrayIcon) {
-    ACTIVATIONS.set(ACTIVATIONS.get().saturating_add(1));
-    diagnostics::event(format_args!(
-        "activation.handled count={} stage=M1",
-        ACTIVATIONS.get()
-    ));
-    notify(
-        tray,
-        "color-picker 已激活",
-        "M1 常驻外壳已就绪。实时取色将在 M2 接入。",
-    );
+fn activate(tray: &TrayIcon, controller: &mut PreviewController) {
+    match controller.start() {
+        Ok(true) => {
+            ACTIVATIONS.set(ACTIVATIONS.get().saturating_add(1));
+            diagnostics::event(format_args!(
+                "activation.handled count={} stage=M2",
+                ACTIVATIONS.get()
+            ));
+        }
+        Ok(false) => diagnostics::event(format_args!(
+            "activation.ignored reason=preview_already_active"
+        )),
+        Err(error) => {
+            diagnostics::event(format_args!("preview.start_failed error={error}"));
+            notify(tray, "无法开始预览", &error.to_string());
+        }
+    }
+    publish_preview_status(controller);
+}
+
+fn publish_preview_status(controller: &PreviewController) {
+    PREVIEW_ACTIVE.set(controller.active());
+    ACTIVE_TIMER.set(controller.timer_id());
+    PREVIEW_SESSION.set(controller.session_id());
+    SAMPLE_ATTEMPTS.set(controller.sample_attempts());
 }
 
 fn notify(tray: &TrayIcon, title: &str, message: &str) {
@@ -323,6 +384,27 @@ fn enqueue(hwnd: HWND, action: u16) {
     }
 }
 
+/// Capture eligibility at receipt, before a nested menu loop can stop the
+/// preview. Source bits alone must never turn into a later start request.
+fn activation_intent(source: u16, preview_active: bool) -> u16 {
+    source
+        | if preview_active {
+            ACTIVATION_IGNORED
+        } else {
+            START_REQUEST
+        }
+}
+
+fn dispatch_activation_intent(pending: u16, start: impl FnOnce(), ignored: impl FnOnce()) {
+    if pending & ACTIVATION_IGNORED != 0 {
+        ignored();
+    }
+    // An explicit stop or invalidated desktop wins over coalesced starts.
+    if pending & START_REQUEST != 0 && pending & (ENVIRONMENT_CHANGED | STOP_PREVIEW) == 0 {
+        start();
+    }
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -340,12 +422,20 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         return LRESULT(0);
     }
     match message {
-        WM_ACTIVATE_PICKER => enqueue(hwnd, ACTIVATE),
-        WM_HOTKEY if wparam.0 == hotkey::DEFAULT_HOTKEY_ID as usize => {
-            enqueue(hwnd, HOTKEY_ACTIVATE)
+        WM_TIMER if wparam.0 != 0 && wparam.0 == ACTIVE_TIMER.get() => {
+            PENDING_TIMER.set(wparam.0);
+            enqueue(hwnd, SAMPLE_TICK);
         }
+        WM_STOP_PREVIEW if DIAGNOSTICS.get() => enqueue(hwnd, STOP_PREVIEW),
+        WM_ACTIVATE_PICKER => enqueue(hwnd, activation_intent(ACTIVATE, PREVIEW_ACTIVE.get())),
+        WM_HOTKEY if wparam.0 == hotkey::DEFAULT_HOTKEY_ID as usize => enqueue(
+            hwnd,
+            activation_intent(HOTKEY_ACTIVATE, PREVIEW_ACTIVE.get()),
+        ),
         WM_TRAY => match (lparam.0 as u32) & 0xffff {
-            NIN_SELECT | NIN_KEYSELECT => enqueue(hwnd, TRAY_ACTIVATE),
+            NIN_SELECT | NIN_KEYSELECT => {
+                enqueue(hwnd, activation_intent(TRAY_ACTIVATE, PREVIEW_ACTIVE.get()))
+            }
             WM_CONTEXTMENU => enqueue(hwnd, MENU),
             NIN_BALLOONSHOW => enqueue(hwnd, BALLOON_SHOW),
             NIN_BALLOONHIDE => enqueue(hwnd, BALLOON_HIDE),
@@ -359,6 +449,10 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 2 => HOTKEY_REGISTERED.get() as isize,
                 3 => TRAY_ADDED.get() as isize,
                 4 => TRAY_RESTORATIONS.get() as isize,
+                5 => PREVIEW_ACTIVE.get() as isize,
+                6 => ACTIVE_TIMER.get() as isize,
+                7 => SAMPLE_ATTEMPTS.get() as isize,
+                8 => PREVIEW_SESSION.get() as isize,
                 _ => -1,
             });
         }
@@ -440,5 +534,109 @@ impl SessionNotifications {
 impl Drop for SessionNotifications {
     fn drop(&mut self) {
         let _ = unsafe { WTSUnRegisterSessionNotification(self.0) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The real receipt/dispatch helpers run against a controlled preview owner.
+    /// No window, input, timer, capture operation, or nested native menu is created.
+    struct DeferredPreview {
+        active: Cell<bool>,
+        sessions_started: Cell<u32>,
+        ignored: Cell<u32>,
+    }
+
+    impl DeferredPreview {
+        fn new(active: bool) -> Self {
+            Self {
+                active: Cell::new(active),
+                sessions_started: Cell::new(u32::from(active)),
+                ignored: Cell::new(0),
+            }
+        }
+
+        fn receive(&self, pending: &mut u16, source: u16) {
+            *pending |= activation_intent(source, self.active.get());
+        }
+
+        fn stop(&self) {
+            self.active.set(false);
+        }
+
+        fn drain(&self, pending: u16) {
+            dispatch_activation_intent(
+                pending,
+                || {
+                    if !self.active.replace(true) {
+                        self.sessions_started.set(self.sessions_started.get() + 1);
+                    }
+                },
+                || self.ignored.set(self.ignored.get() + 1),
+            );
+        }
+    }
+
+    #[test]
+    fn activation_received_in_a_paused_menu_does_not_restart_after_stop() {
+        for source in [ACTIVATE, HOTKEY_ACTIVATE, TRAY_ACTIVATE] {
+            let preview = DeferredPreview::new(true);
+            let mut pending = 0;
+            // Pausing a menu removes the timer but leaves the preview active.
+            // Simulate nested dispatch, then selecting Stop before the outer loop resumes.
+            preview.receive(&mut pending, source);
+            preview.stop();
+            preview.drain(pending);
+            assert!(
+                !preview.active.get(),
+                "a queued repeat reopened the preview"
+            );
+            assert_eq!(preview.sessions_started.get(), 1);
+            assert_eq!(preview.ignored.get(), 1);
+        }
+    }
+
+    #[test]
+    fn a_fresh_activation_after_menu_stop_can_start_the_next_session() {
+        let preview = DeferredPreview::new(true);
+        let mut old_request = 0;
+        preview.receive(&mut old_request, HOTKEY_ACTIVATE);
+        preview.stop();
+        preview.drain(old_request);
+        assert!(!preview.active.get());
+
+        let mut fresh_request = 0;
+        preview.receive(&mut fresh_request, HOTKEY_ACTIVATE);
+        preview.drain(fresh_request);
+        assert!(preview.active.get());
+        assert_eq!(preview.sessions_started.get(), 2);
+        assert_eq!(preview.ignored.get(), 1);
+    }
+
+    #[test]
+    fn coalesced_activation_sources_start_only_one_session() {
+        let preview = DeferredPreview::new(false);
+        let mut pending = 0;
+        for source in [ACTIVATE, HOTKEY_ACTIVATE, TRAY_ACTIVATE] {
+            preview.receive(&mut pending, source);
+        }
+        preview.drain(pending);
+        assert!(preview.active.get());
+        assert_eq!(preview.sessions_started.get(), 1);
+        assert_eq!(preview.ignored.get(), 0);
+    }
+
+    #[test]
+    fn stop_or_desktop_change_cancels_a_coalesced_start() {
+        for cancellation in [STOP_PREVIEW, ENVIRONMENT_CHANGED] {
+            let preview = DeferredPreview::new(false);
+            let mut pending = 0;
+            preview.receive(&mut pending, ACTIVATE);
+            preview.drain(pending | cancellation);
+            assert!(!preview.active.get());
+            assert_eq!(preview.sessions_started.get(), 0);
+        }
     }
 }

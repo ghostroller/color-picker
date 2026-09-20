@@ -2,7 +2,7 @@
 
 //! Explicit desktop smoke tests. Run separately with:
 //! cargo test --test windows_shell --locked -- --ignored --test-threads=1
-//! These tests create tray icons and reserve the default hotkey temporarily.
+//! These tests create tray icons/previews and reserve the default hotkey temporarily.
 //! They never synthesize input, install hooks, open menus, or touch the clipboard.
 
 use std::{
@@ -20,7 +20,7 @@ use std::{
 };
 
 use color_picker::platform::windows::{
-    host::{HOST_CLASS, WM_DIAGNOSTICS, WM_TRAY},
+    host::{HOST_CLASS, WM_DIAGNOSTICS, WM_STOP_PREVIEW, WM_TRAY},
     hotkey::DEFAULT_HOTKEY_ID,
     instance::{InstanceStatus, SingleInstance, instance_key},
 };
@@ -37,7 +37,7 @@ use windows::{
                 FindWindowExW, FindWindowW, GWL_STYLE, GetParent, GetWindowLongPtrW,
                 GetWindowThreadProcessId, IsWindowVisible, PostMessageW, RegisterWindowMessageW,
                 SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, SendMessageTimeoutW, WM_CLOSE,
-                WM_HOTKEY, WS_CHILD,
+                WM_DISPLAYCHANGE, WM_HOTKEY, WM_TIMER, WS_CHILD,
             },
         },
     },
@@ -48,6 +48,10 @@ use windows::{
 static DESKTOP_TEST: Mutex<()> = Mutex::new(());
 const WAIT_LIMIT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+const DIAG_PREVIEW_ACTIVE: usize = 5;
+const DIAG_ACTIVE_TIMER: usize = 6;
+const DIAG_SAMPLE_ATTEMPTS: usize = 7;
+const DIAG_PREVIEW_SESSION: usize = 8;
 
 #[test]
 #[ignore = "requires an interactive Windows desktop, Explorer, and a free Ctrl+Alt+C hotkey"]
@@ -79,6 +83,7 @@ fn resident_shell_smoke() {
         InstanceStatus::Existing
     ));
     assert_eq!(matching_hosts(&title), vec![hwnd]);
+    assert_preview_idle_and_quiet(hwnd);
 
     let activations = diagnostic(hwnd, 1);
     let mut second = AppChild::spawn();
@@ -90,6 +95,12 @@ fn resident_shell_smoke() {
     assert_logged(&second_log, "instance.existing");
     assert_logged(&second_log, "instance.activation_forwarded");
     wait_counter(hwnd, 1, activations + 1);
+    wait_diagnostic(hwnd, DIAG_PREVIEW_ACTIVE, 1);
+    let first_session = diagnostic(hwnd, DIAG_PREVIEW_SESSION);
+    let first_timer = diagnostic(hwnd, DIAG_ACTIVE_TIMER);
+    assert_ne!(first_session, 0);
+    assert_ne!(first_timer, 0);
+    assert!(diagnostic(hwnd, DIAG_SAMPLE_ATTEMPTS) > 0);
     assert_eq!(
         matching_hosts(&title),
         vec![hwnd],
@@ -98,7 +109,10 @@ fn resident_shell_smoke() {
     primary.assert_owns(hwnd);
 
     // This only checks WM_HOTKEY routing. It does not press a key or prove physical input delivery.
+    // Wait for its logged receipt before asserting no change: sent diagnostics
+    // can otherwise overtake the posted hotkey and accidentally pass too early.
     let activations = diagnostic(hwnd, 1);
+    let received = event_count(&primary.log_contents(), "hotkey.received");
     let packed_hotkey = (u32::from(VK_C.0) << 16) | (MOD_CONTROL | MOD_ALT).0;
     primary.post(
         hwnd,
@@ -106,15 +120,70 @@ fn resident_shell_smoke() {
         WPARAM(DEFAULT_HOTKEY_ID as usize),
         LPARAM(packed_hotkey as isize),
     );
+    wait_logged_count(&primary, "hotkey.received", received + 1);
+    assert_eq!(
+        diagnostic(hwnd, 1),
+        activations,
+        "repeat activation nested a preview session"
+    );
+    assert_eq!(diagnostic(hwnd, DIAG_PREVIEW_ACTIVE), 1);
+    assert_eq!(diagnostic(hwnd, DIAG_PREVIEW_SESSION), first_session);
+    assert_eq!(diagnostic(hwnd, DIAG_ACTIVE_TIMER), first_timer);
+
+    primary.post(hwnd, WM_STOP_PREVIEW, WPARAM(0), LPARAM(0));
+    wait_diagnostic(hwnd, DIAG_PREVIEW_ACTIVE, 0);
+    wait_diagnostic(hwnd, DIAG_ACTIVE_TIMER, 0);
+    let stopped_samples = assert_preview_idle_and_quiet(hwnd);
+
+    primary.post(
+        hwnd,
+        WM_HOTKEY,
+        WPARAM(DEFAULT_HOTKEY_ID as usize),
+        LPARAM(packed_hotkey as isize),
+    );
     wait_counter(hwnd, 1, activations + 1);
+    wait_diagnostic(hwnd, DIAG_PREVIEW_ACTIVE, 1);
+    let second_session = diagnostic(hwnd, DIAG_PREVIEW_SESSION);
+    let second_timer = diagnostic(hwnd, DIAG_ACTIVE_TIMER);
+    assert!(
+        second_session > first_session,
+        "preview reused an old session ID"
+    );
+    assert!(second_timer > first_timer, "preview reused an old timer ID");
+    assert!(diagnostic(hwnd, DIAG_SAMPLE_ATTEMPTS) > stopped_samples);
 
     // Target only our window. Do not restart Explorer or broadcast to other applications.
+    // The posted TaskbarCreated message also provides an observable barrier:
+    // reaching its restoration counter means the preceding stale timer was dequeued.
     let restorations = diagnostic(hwnd, 4);
     let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     assert_ne!(taskbar_created, 0, "could not register TaskbarCreated");
+    primary.post(hwnd, WM_TIMER, WPARAM(first_timer), LPARAM(0));
     primary.post(hwnd, taskbar_created, WPARAM(0), LPARAM(0));
     wait_counter(hwnd, 4, restorations + 1);
     assert_eq!(diagnostic(hwnd, 3), 1);
+    assert_eq!(diagnostic(hwnd, 1), activations + 1);
+    assert_eq!(diagnostic(hwnd, DIAG_PREVIEW_ACTIVE), 1);
+    assert_eq!(diagnostic(hwnd, DIAG_PREVIEW_SESSION), second_session);
+    assert_eq!(diagnostic(hwnd, DIAG_ACTIVE_TIMER), second_timer);
+
+    // Simulate only the notification to our host, without changing display settings.
+    primary.post(hwnd, WM_DISPLAYCHANGE, WPARAM(32), LPARAM(0));
+    wait_diagnostic(hwnd, DIAG_PREVIEW_ACTIVE, 0);
+    wait_diagnostic(hwnd, DIAG_ACTIVE_TIMER, 0);
+    let stopped_samples = assert_preview_idle_and_quiet(hwnd);
+    for stale_timer in [first_timer, second_timer] {
+        primary.post(hwnd, WM_TIMER, WPARAM(stale_timer), LPARAM(0));
+    }
+    primary.post(hwnd, taskbar_created, WPARAM(0), LPARAM(0));
+    wait_counter(hwnd, 4, restorations + 2);
+    assert_eq!(diagnostic(hwnd, 3), 1);
+    assert_eq!(diagnostic(hwnd, 1), activations + 1);
+    assert_eq!(
+        assert_preview_idle_and_quiet(hwnd),
+        stopped_samples,
+        "stale timers sampled after the display change stopped the session"
+    );
 
     primary.close();
     let primary_log = primary.log_contents();
@@ -122,11 +191,16 @@ fn resident_shell_smoke() {
         "hotkey.registered",
         "hotkey.received",
         "activation.handled",
-        "tray.notification_accepted",
+        "activation.ignored",
+        "preview.started",
+        "preview.stopped",
+        "environment.changed",
         "host.stopped",
     ] {
         assert_logged(&primary_log, event);
     }
+    assert_eq!(event_count(&primary_log, "preview.started"), 2);
+    assert_eq!(event_count(&primary_log, "preview.stopped"), 2);
     assert!(
         matching_hosts(&title).is_empty(),
         "host survived normal shutdown"
@@ -140,6 +214,7 @@ fn resident_shell_smoke() {
     );
     assert_eq!(diagnostic(restarted_hwnd, 3), 1);
     assert_eq!(diagnostic(restarted_hwnd, 1), 0);
+    assert_preview_idle_and_quiet(restarted_hwnd);
     restarted.close();
     assert!(matching_hosts(&title).is_empty());
 }
@@ -165,6 +240,7 @@ fn hotkey_conflict_keeps_tray_activation_available() {
         1,
         "a hotkey conflict must not remove the tray entry"
     );
+    assert_preview_idle_and_quiet(hwnd);
 
     let activations = diagnostic(hwnd, 1);
     // Version-4 tray callback: icon ID in the high word, NIN_SELECT in the low word.
@@ -175,11 +251,21 @@ fn hotkey_conflict_keeps_tray_activation_available() {
         LPARAM(((1_u32 << 16) | NIN_SELECT) as isize),
     );
     wait_counter(hwnd, 1, activations + 1);
+    wait_diagnostic(hwnd, DIAG_PREVIEW_ACTIVE, 1);
+    assert_ne!(diagnostic(hwnd, DIAG_ACTIVE_TIMER), 0);
+    assert_ne!(diagnostic(hwnd, DIAG_PREVIEW_SESSION), 0);
+    assert!(diagnostic(hwnd, DIAG_SAMPLE_ATTEMPTS) > 0);
     assert_eq!(diagnostic(hwnd, 2), 0);
+    child.post(hwnd, WM_STOP_PREVIEW, WPARAM(0), LPARAM(0));
+    wait_diagnostic(hwnd, DIAG_PREVIEW_ACTIVE, 0);
+    wait_diagnostic(hwnd, DIAG_ACTIVE_TIMER, 0);
+    assert_preview_idle_and_quiet(hwnd);
     child.close();
     let conflict_log = child.log_contents();
     assert_logged(&conflict_log, "hotkey.registration_failed");
     assert_logged(&conflict_log, "tray.activation_received");
+    assert_logged(&conflict_log, "preview.started");
+    assert_logged(&conflict_log, "preview.stopped");
     assert!(
         !contains_event(&conflict_log, "hotkey.registered"),
         "conflicting hotkey was incorrectly logged as registered:\n{conflict_log}"
@@ -259,11 +345,75 @@ fn wait_counter(hwnd: HWND, field: usize, expected: usize) {
     }
 }
 
+fn wait_diagnostic(hwnd: HWND, field: usize, expected: usize) {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        if diagnostic(hwnd, field) == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host diagnostic {field} did not become {expected}"
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn assert_preview_idle_and_quiet(hwnd: HWND) -> usize {
+    assert_eq!(diagnostic(hwnd, DIAG_PREVIEW_ACTIVE), 0);
+    assert_eq!(diagnostic(hwnd, DIAG_ACTIVE_TIMER), 0);
+    assert_eq!(diagnostic(hwnd, DIAG_PREVIEW_SESSION), 0);
+    let samples = diagnostic(hwnd, DIAG_SAMPLE_ATTEMPTS);
+    // Multiple requested 17ms ticks must pass without any new sampling at idle.
+    let deadline = Instant::now() + Duration::from_millis(125);
+    while Instant::now() < deadline {
+        thread::sleep(POLL_INTERVAL);
+        assert_eq!(
+            diagnostic(hwnd, DIAG_PREVIEW_ACTIVE),
+            0,
+            "preview resumed without activation"
+        );
+        assert_eq!(
+            diagnostic(hwnd, DIAG_ACTIVE_TIMER),
+            0,
+            "a timer survived session cleanup"
+        );
+        assert_eq!(diagnostic(hwnd, DIAG_PREVIEW_SESSION), 0);
+        assert_eq!(
+            diagnostic(hwnd, DIAG_SAMPLE_ATTEMPTS),
+            samples,
+            "sampling continued while idle"
+        );
+    }
+    samples
+}
+
+fn wait_logged_count(child: &AppChild, event: &str, expected: usize) {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        let count = event_count(&child.log_contents(), event);
+        if count >= expected {
+            assert_eq!(count, expected, "unexpected extra {event} log event");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host did not log {event} {expected} times"
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
 fn contains_event(log: &str, event: &str) -> bool {
+    event_count(log, event) != 0
+}
+
+fn event_count(log: &str, event: &str) -> usize {
     // Each record starts with unix_ms, pid and elapsed_ms, followed by its event.
     // Match the event token rather than text that might occur in a message field.
     log.lines()
-        .any(|line| line.split_whitespace().nth(3) == Some(event))
+        .filter(|line| line.split_whitespace().nth(3) == Some(event))
+        .count()
 }
 
 fn assert_logged(log: &str, event: &str) {

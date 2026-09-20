@@ -21,6 +21,7 @@ const COMMAND_EXIT: usize = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayCommand {
     Start,
+    Stop,
     Settings,
     Exit,
 }
@@ -107,13 +108,18 @@ impl TrayIcon {
 
     /// The host decodes the low 16 bits of a version-4 callback's lParam.
     /// Call for WM_CONTEXTMENU; NIN_SELECT/NIN_KEYSELECT may activate directly.
-    pub fn show_menu(&self) -> Result<Option<TrayCommand>> {
+    pub fn show_menu(&self, preview_active: bool) -> Result<Option<TrayCommand>> {
         // Copy before TrackPopupMenu starts its nested message loop. This method
         // does not access the tray's Rust state while that loop is active.
         let data = self.data;
         let menu = PopupMenu(unsafe { CreatePopupMenu()? });
         unsafe {
-            AppendMenuW(menu.0, MF_STRING, COMMAND_START, w!("开始取色"))?;
+            let start_text = if preview_active {
+                w!("停止预览")
+            } else {
+                w!("开始取色")
+            };
+            AppendMenuW(menu.0, MF_STRING, COMMAND_START, start_text)?;
             AppendMenuW(menu.0, MF_STRING, COMMAND_SETTINGS, w!("设置"))?;
             AppendMenuW(menu.0, MF_STRING, COMMAND_EXIT, w!("退出"))?;
         }
@@ -146,7 +152,11 @@ impl TrayIcon {
         // Windows returns 0 for either cancellation or a tracking failure.
         match command as usize {
             0 => Ok(None),
-            COMMAND_START => Ok(Some(TrayCommand::Start)),
+            COMMAND_START => Ok(Some(if preview_active {
+                TrayCommand::Stop
+            } else {
+                TrayCommand::Start
+            })),
             COMMAND_SETTINGS => Ok(Some(TrayCommand::Settings)),
             COMMAND_EXIT => Ok(Some(TrayCommand::Exit)),
             _ => Err(Error::new(E_FAIL, "Unexpected notification menu command")),
