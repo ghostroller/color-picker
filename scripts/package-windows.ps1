@@ -34,10 +34,11 @@ try {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'LICENSE-STATUS.md') -Destination $package
     $docs = Join-Path $package 'docs'
     New-Item -ItemType Directory -Path $docs | Out-Null
-    foreach ($name in @('validation.md', 'known-limitations.md', 'resource-probe.md', 'performance-running-app.md')) {
+    foreach ($name in @('validation.md', 'known-limitations.md', 'resource-probe.md', 'performance-running-app.md', 'ui-preview.md')) {
         Copy-Item -LiteralPath (Join-Path $repositoryRoot "docs/$name") -Destination $docs
     }
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'docs/measurements') -Destination $docs -Recurse
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'docs/images') -Destination $docs -Recurse
     $readme = @'
 # color-picker 0.1.0 本地预览版（Windows x64）
 
