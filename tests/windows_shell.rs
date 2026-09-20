@@ -1,0 +1,353 @@
+#![cfg(windows)]
+
+//! Explicit desktop smoke tests. Run separately with:
+//! cargo test --test windows_shell --locked -- --ignored --test-threads=1
+//! These tests create tray icons and reserve the default hotkey temporarily.
+//! They never synthesize input, install hooks, open menus, or touch the clipboard.
+
+use std::{
+    os::windows::process::CommandExt,
+    process::{Child, Command, ExitStatus},
+    sync::Mutex,
+    thread,
+    time::{Duration, Instant},
+};
+
+use color_picker::platform::windows::{
+    host::{HOST_CLASS, WM_DIAGNOSTICS, WM_TRAY},
+    hotkey::DEFAULT_HOTKEY_ID,
+    instance::{InstanceStatus, SingleInstance, instance_key},
+};
+use windows::{
+    Win32::{
+        Foundation::{HWND, LPARAM, WPARAM},
+        System::Threading::CREATE_NO_WINDOW,
+        UI::{
+            Input::KeyboardAndMouse::{
+                MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_C,
+            },
+            Shell::NIN_SELECT,
+            WindowsAndMessaging::{
+                FindWindowExW, FindWindowW, GWL_STYLE, GetParent, GetWindowLongPtrW,
+                GetWindowThreadProcessId, IsWindowVisible, PostMessageW, RegisterWindowMessageW,
+                SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, SendMessageTimeoutW, WM_CLOSE,
+                WM_HOTKEY, WS_CHILD,
+            },
+        },
+    },
+    core::{PCWSTR, w},
+};
+
+// The two desktop tests share a process and must not race each other's hosts or hotkeys.
+static DESKTOP_TEST: Mutex<()> = Mutex::new(());
+const WAIT_LIMIT: Duration = Duration::from_secs(5);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+#[test]
+#[ignore = "requires an interactive Windows desktop, Explorer, and a free Ctrl+Alt+C hotkey"]
+fn resident_shell_smoke() {
+    let _serial = DESKTOP_TEST
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let title = host_title_without_existing_instance();
+    let mut primary = AppChild::spawn();
+    let hwnd = primary.wait_ready(&title);
+
+    assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
+    assert!(
+        unsafe { GetParent(hwnd) }.is_err(),
+        "host must have no parent"
+    );
+    assert_eq!(
+        unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32 & WS_CHILD.0,
+        0
+    );
+    assert_eq!(
+        diagnostic(hwnd, 2),
+        1,
+        "Ctrl+Alt+C is already in use or registration failed; this is not a passing hotkey check"
+    );
+    assert_eq!(diagnostic(hwnd, 3), 1, "tray icon was not registered");
+    assert!(matches!(
+        SingleInstance::acquire().unwrap(),
+        InstanceStatus::Existing
+    ));
+    assert_eq!(matching_hosts(&title), vec![hwnd]);
+
+    let activations = diagnostic(hwnd, 1);
+    let mut second = AppChild::spawn();
+    assert!(
+        second.wait_exit().success(),
+        "second launch did not exit successfully"
+    );
+    wait_counter(hwnd, 1, activations + 1);
+    assert_eq!(
+        matching_hosts(&title),
+        vec![hwnd],
+        "second launch created another host"
+    );
+    primary.assert_owns(hwnd);
+
+    // This only checks WM_HOTKEY routing. It does not press a key or prove physical input delivery.
+    let activations = diagnostic(hwnd, 1);
+    let packed_hotkey = (u32::from(VK_C.0) << 16) | (MOD_CONTROL | MOD_ALT).0;
+    primary.post(
+        hwnd,
+        WM_HOTKEY,
+        WPARAM(DEFAULT_HOTKEY_ID as usize),
+        LPARAM(packed_hotkey as isize),
+    );
+    wait_counter(hwnd, 1, activations + 1);
+
+    // Target only our window. Do not restart Explorer or broadcast to other applications.
+    let restorations = diagnostic(hwnd, 4);
+    let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+    assert_ne!(taskbar_created, 0, "could not register TaskbarCreated");
+    primary.post(hwnd, taskbar_created, WPARAM(0), LPARAM(0));
+    wait_counter(hwnd, 4, restorations + 1);
+    assert_eq!(diagnostic(hwnd, 3), 1);
+
+    primary.close();
+    assert!(
+        matching_hosts(&title).is_empty(),
+        "host survived normal shutdown"
+    );
+    let mut restarted = AppChild::spawn();
+    let restarted_hwnd = restarted.wait_ready(&title);
+    assert_eq!(
+        diagnostic(restarted_hwnd, 2),
+        1,
+        "hotkey was not released on exit"
+    );
+    assert_eq!(diagnostic(restarted_hwnd, 3), 1);
+    assert_eq!(diagnostic(restarted_hwnd, 1), 0);
+    restarted.close();
+    assert!(matching_hosts(&title).is_empty());
+}
+
+#[test]
+#[ignore = "temporarily reserves Ctrl+Alt+C; requires an interactive Windows desktop and Explorer"]
+fn hotkey_conflict_keeps_tray_activation_available() {
+    let _serial = DESKTOP_TEST
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let title = host_title_without_existing_instance();
+    let reservation = HotkeyReservation::new();
+    // Declared after the reservation so unwinding closes the child before releasing the hotkey.
+    let mut child = AppChild::spawn();
+    let hwnd = child.wait_ready(&title);
+    assert_eq!(
+        diagnostic(hwnd, 2),
+        0,
+        "application unexpectedly registered the reserved hotkey"
+    );
+    assert_eq!(
+        diagnostic(hwnd, 3),
+        1,
+        "a hotkey conflict must not remove the tray entry"
+    );
+
+    let activations = diagnostic(hwnd, 1);
+    // Version-4 tray callback: icon ID in the high word, NIN_SELECT in the low word.
+    child.post(
+        hwnd,
+        WM_TRAY,
+        WPARAM(0),
+        LPARAM(((1_u32 << 16) | NIN_SELECT) as isize),
+    );
+    wait_counter(hwnd, 1, activations + 1);
+    assert_eq!(diagnostic(hwnd, 2), 0);
+    child.close();
+    assert!(matching_hosts(&title).is_empty());
+    drop(reservation);
+}
+
+fn host_title_without_existing_instance() -> Vec<u16> {
+    let title: Vec<u16> = instance_key()
+        .unwrap()
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    assert!(
+        matching_hosts(&title).is_empty(),
+        "An existing color-picker host is running. Close it yourself before this desktop test; the test will not close your instance."
+    );
+    title
+}
+
+fn matching_hosts(title: &[u16]) -> Vec<HWND> {
+    let mut result = Vec::new();
+    let mut previous = None;
+    while let Ok(hwnd) =
+        unsafe { FindWindowExW(None, previous, HOST_CLASS, PCWSTR(title.as_ptr())) }
+    {
+        result.push(hwnd);
+        assert!(result.len() < 16, "unexpectedly many matching host windows");
+        previous = Some(hwnd);
+    }
+    result
+}
+
+fn window_process(hwnd: HWND) -> u32 {
+    let mut process = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process)) };
+    process
+}
+
+fn try_diagnostic(hwnd: HWND, field: usize) -> Option<usize> {
+    let mut result = 0;
+    let sent = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_DIAGNOSTICS,
+            WPARAM(field),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+            300,
+            Some(&mut result),
+        )
+    };
+    (sent.0 != 0).then_some(result)
+}
+
+fn diagnostic(hwnd: HWND, field: usize) -> usize {
+    try_diagnostic(hwnd, field).expect("host diagnostics timed out or the window exited")
+}
+
+fn wait_counter(hwnd: HWND, field: usize, expected: usize) {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        let value = diagnostic(hwnd, field);
+        if value >= expected {
+            assert_eq!(
+                value, expected,
+                "host processed an unexpected extra activation/event"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host diagnostic {field} never reached {expected}"
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+struct AppChild {
+    child: Child,
+    hwnd: Option<HWND>,
+}
+
+impl AppChild {
+    fn spawn() -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_color-picker"))
+            .arg("--diagnostics")
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .spawn()
+            .expect("could not start the color-picker test child");
+        Self { child, hwnd: None }
+    }
+
+    fn wait_ready(&mut self, title: &[u16]) -> HWND {
+        let deadline = Instant::now() + WAIT_LIMIT;
+        loop {
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "test child exited before becoming ready"
+            );
+            if let Ok(hwnd) = unsafe { FindWindowW(HOST_CLASS, PCWSTR(title.as_ptr())) } {
+                self.assert_owns(hwnd);
+                self.hwnd = Some(hwnd);
+                if try_diagnostic(hwnd, 0) == Some(1) {
+                    return hwnd;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test child did not become ready within five seconds"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    fn assert_owns(&self, hwnd: HWND) {
+        assert_eq!(
+            window_process(hwnd),
+            self.child.id(),
+            "host belongs to another process; refusing to send messages or close it"
+        );
+    }
+
+    fn post(&self, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
+        self.assert_owns(hwnd);
+        unsafe { PostMessageW(Some(hwnd), message, wparam, lparam) }.unwrap();
+    }
+
+    fn wait_exit(&mut self) -> ExitStatus {
+        let deadline = Instant::now() + WAIT_LIMIT;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test child did not exit within five seconds"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    fn close(&mut self) {
+        let hwnd = self.hwnd.expect("test child has no ready host");
+        self.post(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+        assert!(
+            self.wait_exit().success(),
+            "test child failed during normal shutdown"
+        );
+        self.hwnd = None;
+    }
+}
+
+impl Drop for AppChild {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if let Some(hwnd) = self.hwnd
+            && window_process(hwnd) == self.child.id()
+        {
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+        }
+        // This Child handle was created by this test. Never enumerate or kill user processes.
+        if self.child.kill().is_ok() {
+            let _ = self.child.wait();
+        }
+    }
+}
+
+const CONFLICT_HOTKEY_ID: i32 = 0x43a1;
+
+struct HotkeyReservation;
+
+impl HotkeyReservation {
+    fn new() -> Self {
+        unsafe {
+            RegisterHotKey(None, CONFLICT_HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, u32::from(VK_C.0))
+        }
+        .expect("Ctrl+Alt+C is already in use on this desktop; cannot run a controlled conflict test or claim it passed");
+        Self
+    }
+}
+
+impl Drop for HotkeyReservation {
+    fn drop(&mut self) {
+        let _ = unsafe { UnregisterHotKey(None, CONFLICT_HOTKEY_ID) };
+    }
+}

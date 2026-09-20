@@ -24,9 +24,44 @@
 | 完整验证脚本 | PASS | `scripts/verify-windows.ps1` 全部完成，Release 运行时 DPI 检查通过 |
 | Linux 纯逻辑测试 | NOT TESTED | 已配置 CI，当前机器未执行 Linux 作业 |
 
+## M1 检查 · 2026-09-20
+
+基于 `5044e3c` 之后的 M1 阶段代码（对应 `feat(windows): add M1 resident shell and desktop smoke tests` 提交）。
+
+| 检查 | 结果 | 证据 / 边界 |
+|---|---|---|
+| 格式、Clippy、默认测试、Release、manifest、运行时 DPI | PASS | `scripts/verify-windows.ps1`；40 项默认测试，桌面测试默认忽略 |
+| 隐藏的顶层宿主 | PASS | 桌面测试确认不可见、无 parent、无 WS_CHILD |
+| 单实例与重复启动 | PASS | 二次进程退出码 0，原实例激活 +1，唯一宿主，mutex 返回 Existing |
+| 默认热键注册及释放 | PASS | 注册成功；退出后新实例可再次注册 |
+| WM_HOTKEY 路由 | PASS | 向自有测试窗口发送消息，激活计数恰好 +1；不是实际键盘输入测试 |
+| 受控热键冲突 | PASS | 测试预先占用 Ctrl+Alt+C；应用保持托盘并从托盘通知激活 |
+| 托盘恢复处理 | PASS | 仅向自有宿主发送 TaskbarCreated，重建成功；未重启 Explorer |
+| 退出 / 重启 | PASS | WM_CLOSE 后正常退出，宿主消失，再启动成功 |
+| EXE 动态依赖初查 | PASS | MSVC dumpbin /dependents 未列出 VCRUNTIME / MSVCP / UCRT DLL；不能替代干净机器验收 |
+| 待机结构 | PASS（代码检查） | 阻塞 GetMessage；无 SetTimer / hooks / 应用线程创建 / GDI 采样 / 网络调用 |
+| 实际快捷键、重复按住与通知可见性 | NOT TESTED | 自动测试不生成输入；系统通知策略可能抑制提示 |
+| 托盘菜单实际点击与键盘导航 | NOT TESTED | 自动测试不打开用户菜单 |
+| Explorer 真实重启、锁屏、电源、显示变化 | NOT TESTED | M1 只验证接线，M6 再验证完整采样恢复行为 |
+| 长时间 CPU / 句柄 / 内存测量 | NOT TESTED | M7 执行，不以结构检查代替测量 |
+
+桌面测试命令：
+
+```powershell
+cargo test --locked --test windows_shell -- --ignored --test-threads=1 --nocapture
+```
+
+首次在受限沙箱桌面执行失败：`Shell_NotifyIconW(NIM_ADD)` 返回失败，应用未就绪。
+在当前用户交互桌面执行后，2 项均 PASS。测试已正常关闭自己的全部临时进程；
+没有操作用户已有的 color-picker、重启 Explorer、生成键鼠输入或改变剪贴板。
+
+进入 M2 前剩余人工验证：启动 Release EXE，确认托盘出现；按 Ctrl+Alt+C 显示阶段提示，
+按住不重复触发；通过托盘“开始取色”激活、“设置”查看阶段说明、“退出”结束进程。
+系统允许显示通知时检查可见效果，再记录 PASS/FAIL。此处不把尚未执行的步骤记为完成。
+
 ## 发布前实机矩阵
 
-M0 不含桌面取色功能，下列项目均尚未执行，不代表支持已经验证。
+当前阶段不含桌面取色功能，下列完整发布场景均尚未执行，不代表支持已经验证。
 
 | 编号 | 场景 | 结果 |
 |---|---|---|

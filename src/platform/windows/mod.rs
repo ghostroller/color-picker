@@ -3,7 +3,12 @@ use windows::Win32::UI::HiDpi::{
     GetThreadDpiAwarenessContext,
 };
 
-pub fn run() -> windows::core::Result<()> {
+pub mod host;
+pub mod hotkey;
+pub mod instance;
+pub mod tray;
+
+pub fn check_environment() -> windows::core::Result<()> {
     // No DPI override: this checks the context supplied by the embedded manifest.
     let is_pmv2 = unsafe {
         AreDpiAwarenessContextsEqual(
@@ -18,6 +23,5 @@ pub fn run() -> windows::core::Result<()> {
             "The embedded PerMonitorV2 DPI manifest is not active",
         ));
     }
-    println!("color-picker: PerMonitorV2 active; M0 core ready");
     Ok(())
 }
