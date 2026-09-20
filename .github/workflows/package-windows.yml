@@ -14,15 +14,17 @@ jobs:
     defaults:
       run:
         shell: pwsh
-    env:
-      PACKAGE_MANIFEST: ${{ runner.temp }}/color-picker-package.json
-      INNO_COMPILER: ${{ runner.temp }}/Inno Setup 6/ISCC.exe
     steps:
       - name: Check out selected commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+
+      - name: Define runner-local packaging paths
+        run: |
+          "PACKAGE_MANIFEST=$(Join-Path $env:RUNNER_TEMP 'color-picker-package.json')" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "INNO_COMPILER=$(Join-Path $env:RUNNER_TEMP 'Inno Setup 6/ISCC.exe')" | Add-Content -LiteralPath $env:GITHUB_ENV
 
       - name: Install pinned Rust components and x64 target
         run: |
