@@ -2,6 +2,7 @@
 param(
     # Use only after verification passed for these exact sources/toolchain.
     [switch] $SkipChecks,
+    [switch] $Release,
     [string] $OutputManifestPath,
     [string] $CompilerPath
 )
@@ -27,7 +28,7 @@ try {
     $scratch = Join-Path $repositoryRoot 'target/installer-manifests'
     New-Item -ItemType Directory -Path $scratch -Force | Out-Null
     $portableManifest = Join-Path $scratch "$([Guid]::NewGuid().ToString('N')).json"
-    & (Join-Path $PSScriptRoot 'package-windows.ps1') -SkipChecks:$SkipChecks -OutputManifestPath $portableManifest
+    & (Join-Path $PSScriptRoot 'package-windows.ps1') -SkipChecks:$SkipChecks -Release:$Release -OutputManifestPath $portableManifest
     $package = Get-Content -LiteralPath $portableManifest -Raw | ConvertFrom-Json
     $exe = Join-Path $package.package_directory 'color-picker.exe'
     if ((Get-Item -LiteralPath $exe).VersionInfo.ProductVersion -cne $version) {

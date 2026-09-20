@@ -1,12 +1,12 @@
 # color-picker
 
-Windows 原生桌面取色工具，按 [实现计划](docs/implementation-plan.md) 分阶段开发。
-技术栈固定为 Rust、`windows` crate、Win32 原生控件和 GDI。
+Windows 原生桌面取色工具。安装包与便携 ZIP 下载见 [GitHub Releases](https://github.com/ghostroller/color-picker/releases)，
+初始公开版本为 `v0.1.0`。技术栈为 Rust、`windows` crate、Win32 原生控件和 GDI。
 
 当前进展与验收证据见 [开发记录](docs/progress.md) 和 [验证记录](docs/validation.md)。
-当前是开发版本，尚未完成 v0.1 发布验收。
+完整实机发布验收尚未完成，平台与采样限制见 [已知限制](docs/known-limitations.md)。
 
-当前已实现 M0–M6 功能及 M7 测量、打包工具；完整实机发布验收尚未完成。启动后在托盘显示图标；
+当前已实现 [实现计划](docs/implementation-plan.md) 的 M0–M6 功能及 M7 测量、打包工具。启动后在托盘显示图标；
 按 `Ctrl + Alt + C`、激活托盘或重复启动，开始显示鼠标所在物理像素的颜色、HEX 和坐标。
 取色中重复激活不会叠加会话；右键或 Esc 取消，退出程序请使用托盘菜单。
 鼠标静止时仍检查画面变化，停止预览后释放采样资源和定时器。
@@ -98,7 +98,7 @@ cargo test --locked --test windows_capture --test windows_preview --test windows
 仅保证普通 SDR 桌面的 8 位 RGB 采样设计，不承诺 HDR、原始 alpha 或受保护内容的颜色。
 不联网、不遥测；屏幕图像只保留在内存中。
 
-## 资源测量与预览打包
+## 资源测量与打包
 
 [资源探针说明](docs/resource-probe.md) 提供 100 / 500 / 1000 次受控启动、取消测量，
 输出 CPU、工作集、私有提交、句柄、GDI/USER、线程和首帧提交延迟的原始 JSON。
@@ -123,7 +123,14 @@ winget install --id JRSoftware.InnoSetup -e --version 6.7.3 --source winget --sc
 
 详见 [Windows 安装与维护](docs/windows-installer.md)。GitHub 的 **Package Windows** 和
 **Verify** 工作流都只允许手动运行：Actions → 选择工作流 → Run workflow。
-打包工作流输出安装 EXE、便携 ZIP 和 SHA256，见 [CI 打包说明](docs/ci-packaging.md)。
+打包工作流默认输出安装 EXE、便携 ZIP 和 SHA256 至 Actions 产物。
+维护者先创建并推送与 Cargo 版本一致的标签，再手动启用 `publish_release`，即可将同一次构建发布至 GitHub Release：
+
+```powershell
+gh workflow run package-windows.yml --ref v0.1.0 -f publish_release=true
+```
+
+推送代码或标签均不会自动运行 CI。发布命名、版本校验与失败处理见 [CI 打包说明](docs/ci-packaging.md)。
 
 无需管理员权限，不包含后台自动更新。许可状态与发布边界见
 [LICENSE-STATUS.md](LICENSE-STATUS.md) 和 [已知限制](docs/known-limitations.md)。

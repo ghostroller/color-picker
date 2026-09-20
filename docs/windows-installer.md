@@ -19,7 +19,7 @@
 
 ## 使用安装包
 
-运行 `*-setup.exe`，支持简体中文和英文。默认目录是
+从 [GitHub Releases](https://github.com/ghostroller/color-picker/releases) 下载 `*-setup.exe`，支持简体中文和英文。默认目录是
 `%LOCALAPPDATA%\Programs\Color Picker`，无需管理员权限。
 目标平台是 Windows 11 x64，安装器最低允许 Windows 10 22H2 x64；
 最低版本门槛不等于已完成该平台的全部兼容性验收，见 [已知限制](known-limitations.md)。
@@ -71,12 +71,18 @@ winget install --id JRSoftware.InnoSetup -e --version 6.7.3 --source winget --sc
 
 打包默认先运行格式、Clippy、单元/非交互测试、Release 和清单/DPI 检查。
 同一源码刚验证通过可用 `-SkipChecks`，仍会确认 Release 构建和 EXE 版本。
-输出保存在 `dist/`，每次使用独立名称，包含版本、时间及短提交号：
+输出保存在 `dist/`，默认预览包每次使用独立名称，包含版本、时间及短提交号：
 
 - `*-setup.exe` 与 `.exe.sha256`：安装包和校验。
 - `*.zip` 与 `.zip.sha256`：保留的便携包和校验。
 - `*-setup.build.json`：源码、构建器和产物路径；程序包内部 `build-info.json`
   还包含是否有未提交改动、工具链、EXE 校验值和检查状态。
+
+显式使用 `./scripts/package-installer.ps1 -Release` 可生成发布名称；
+`package-windows.ps1` 同样支持 `-Release`。以 `0.1.0` 为例，安装包为
+`color-picker-0.1.0-windows-x64-setup.exe`，便携包为 `color-picker-0.1.0-windows-x64.zip`，
+各自附带 `.sha256`。发布包不含时间或短提交号；已有输出不会被覆盖。
+`-Release` 只控制打包模式，不创建 Git 标签或发布 GitHub Release。
 
 EXE、安装器显示版本和降级比较版本都来自 `Cargo.toml`。
 安装包接受 `major.minor.patch`，每段 0–65535，Windows 资源版本为 `major.minor.patch.0`。
@@ -84,7 +90,8 @@ EXE、安装器显示版本和降级比较版本都来自 `Cargo.toml`。
 
 ## 后续维护约定
 
-1. 每次面向用户发布升级，递增 `Cargo.toml` 版本并更新 `Cargo.lock`，提交后手动运行 CI。
+1. 每次面向用户发布升级，递增 `Cargo.toml` 版本并更新 `Cargo.lock`，提交并推送代码后，
+   创建和推送 `v<版本>` 标签，再手动运行发布工作流。
    不把不同源码的同版本预览包当作有序升级渠道。
 2. 不改 `installer/color-picker.iss` 的生产 AppId、用户范围、启动值名或配置路径。
    文件移除/重命名若需升级清理，加入明确的旧文件路径清单，不递归清空程序或配置目录。
@@ -96,9 +103,10 @@ EXE、安装器显示版本和降级比较版本都来自 `Cargo.toml`。
    Inno 的签名配置应覆盖卸载器与安装器，最终签名后重新计算校验值。
    不把签名证书或私钥提交到仓库。
 
-CI 仅手动触发，产物保留 30 天，操作见 [CI 打包说明](ci-packaging.md)。
-CI 不自动创建标签、推送版本或发布 GitHub Release；确认产物后可将同一次构建的
-EXE、ZIP、校验文件放入对应版本 Release，作为长期下载来源。
+CI 仅手动触发，默认 Actions 产物保留 30 天。维护者可在对应版本标签上启用
+`publish_release`，通过构建和安装生命周期检查后，将本次 EXE、ZIP、两个校验文件发布到 GitHub Release，
+作为长期下载来源。CI 不自动创建标签或推送版本；同标签已有 Release（包括草稿）时拒绝发布。
+失败留下的草稿需要人工排查，不会在重跑时覆盖。完整操作见 [CI 打包说明](ci-packaging.md)。
 
 许可证状态见 [LICENSE-STATUS.md](../LICENSE-STATUS.md)。
 Inno Setup 自身使用条件见 [官方许可](https://jrsoftware.org/files/is/license.txt)，

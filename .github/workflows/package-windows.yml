@@ -2,6 +2,16 @@ name: Package Windows
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish packages to the selected version tag's GitHub Release
+        type: boolean
+        required: true
+        default: false
+
+concurrency:
+  group: package-windows-${{ github.ref }}-${{ inputs.publish_release }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -11,6 +21,9 @@ jobs:
     name: Windows x64 installer and portable package
     runs-on: windows-2022
     timeout-minutes: 40
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      artifact_name: color-picker-windows-x64-${{ github.run_id }}-${{ github.run_attempt }}
     defaults:
       run:
         shell: pwsh
@@ -19,6 +32,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Define runner-local packaging paths
@@ -36,6 +50,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed: $LASTEXITCODE" }
           rustc -Vv
           if ($LASTEXITCODE -ne 0) { throw "rustc -Vv failed: $LASTEXITCODE" }
+
+      - name: Validate release tag and source version
+        if: inputs.publish_release
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadataJson = cargo metadata --no-deps --locked --format-version 1
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read Cargo version.' }
+          $metadata = ($metadataJson -join "`n") | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object { $_.name -eq 'color-picker' }).version
+          $tag = "v$version"
+          if ($env:GITHUB_REF -cne "refs/tags/$tag") {
+            throw "Release must be dispatched on tag $tag, matching Cargo.toml."
+          }
+          $commit = git rev-parse --verify ("refs/tags/{0}^{{commit}}" -f $tag)
+          if ($LASTEXITCODE -ne 0 -or $commit -cne $env:GITHUB_SHA) {
+            throw 'Release tag does not point to the selected workflow commit.'
+          }
 
       # Only the disposable runner downloads tools; local packaging never does.
       - name: Download official pinned Inno Setup package
@@ -63,11 +94,17 @@ jobs:
 
       - name: Verify and build packages
         id: package
+        env:
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
         run: |
           $ErrorActionPreference = 'Stop'
-          ./scripts/package-installer.ps1 -OutputManifestPath $env:PACKAGE_MANIFEST -CompilerPath $env:INNO_COMPILER
+          $release = $env:PUBLISH_RELEASE -eq 'true'
+          ./scripts/package-installer.ps1 -Release:$release -OutputManifestPath $env:PACKAGE_MANIFEST -CompilerPath $env:INNO_COMPILER
           $manifest = Get-Content -LiteralPath $env:PACKAGE_MANIFEST -Raw | ConvertFrom-Json
           if ($manifest.source_commit -ne $env:GITHUB_SHA) { throw 'Packaged commit differs from the selected workflow commit.' }
+          if ($manifest.source_dirty) { throw 'Packaged sources contain uncommitted changes.' }
+          if ($release -and $env:GITHUB_REF -cne "refs/tags/v$($manifest.version)") { throw 'Package version differs from the release tag.' }
+          "version=$($manifest.version)" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
           foreach ($field in @('installer_path', 'installer_sha256_path', 'archive_path', 'archive_sha256_path')) {
             $path = $manifest.$field
             if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -119,3 +156,66 @@ jobs:
             $lines += '| {0} | `{1}` |' -f $name, $sha256
           }
           $lines | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+  publish:
+    name: Publish verified packages to GitHub Release
+    needs: package
+    if: inputs.publish_release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download, verify, and publish this run's packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.package.outputs.version }}
+          PACKAGE_ARTIFACT_NAME: ${{ needs.package.outputs.artifact_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" == "v$RELEASE_VERSION" ]]
+          [[ "$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)" == "$GITHUB_SHA" ]]
+          existing_release_ids=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            | jq -r '.[] | select(.tag_name == env.RELEASE_TAG) | .id')
+          if [[ -n "$existing_release_ids" ]]; then
+            echo "Release $RELEASE_TAG already exists (possibly as a draft); refusing to replace it." >&2
+            exit 1
+          fi
+          assets_dir="$RUNNER_TEMP/release-assets"
+          gh run download "$GITHUB_RUN_ID" --repo "$GH_REPO" --name "$PACKAGE_ARTIFACT_NAME" --dir "$assets_dir"
+          cd "$assets_dir"
+          base="color-picker-$RELEASE_VERSION-windows-x64"
+          assets=("$base-setup.exe" "$base-setup.exe.sha256" "$base.zip" "$base.zip.sha256")
+          for file in "${assets[@]}"; do test -s "$file"; done
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 4
+          sha256sum --check "$base-setup.exe.sha256" "$base.zip.sha256"
+
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          tag_object=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object | select(.type == "tag") | .sha')
+          if [[ -n "$tag_object" ]]; then
+            gh api "repos/$GH_REPO/git/tags/$tag_object" --jq .message > "$notes_file"
+          else
+            printf 'Color Picker %s\n' "$RELEASE_VERSION" > "$notes_file"
+          fi
+          printf '\nSource commit: `%s`\n\n[CI build](%s/%s/actions/runs/%s)\n' \
+            "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GH_REPO" "$GITHUB_RUN_ID" >> "$notes_file"
+
+          # Existing releases (including drafts) fail instead of replacing assets.
+          # A failed upload leaves an unpublished draft for maintainer inspection.
+          gh release create "$RELEASE_TAG" "${assets[@]}" --repo "$GH_REPO" \
+            --verify-tag --draft --title "Color Picker $RELEASE_VERSION" --notes-file "$notes_file"
+          release_id=$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json databaseId --jq .databaseId)
+          release_json=$(gh api "repos/$GH_REPO/releases/$release_id")
+          expected_names=$(printf '%s\n' "${assets[@]}" | jq -R . | jq -s 'sort')
+          jq -e --argjson names "$expected_names" \
+            '.draft == true and ([.assets[].name] | sort) == $names and all(.assets[]; .state == "uploaded" and .size > 0)' \
+            <<< "$release_json"
+          [[ "$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)" == "$GITHUB_SHA" ]]
+          gh release edit "$RELEASE_TAG" --repo "$GH_REPO" --draft=false
+          release_url=$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json url --jq .url)
+          printf '### Published release\n\n[%s](%s)\n\nSource commit: `%s`\n' \
+            "$RELEASE_TAG" "$release_url" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"

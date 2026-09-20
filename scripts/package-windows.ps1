@@ -2,6 +2,8 @@
 param(
     # Use only after verify-windows.ps1 passed for these same sources/toolchain.
     [switch] $SkipChecks,
+    # Stable names and metadata for an explicitly requested public release.
+    [switch] $Release,
     # Optional machine-readable output for the installer and CI; never scrape console text.
     [string] $OutputManifestPath
 )
@@ -25,8 +27,13 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Could not identify source commit.' }
     $changes = @(& git -c "safe.directory=$repositoryRoot" status --porcelain)
     if ($LASTEXITCODE -ne 0) { throw 'Could not read source state.' }
-    $packageName = 'color-picker-{0}-windows-x64-preview-{1}-{2}' -f $project.version,
-        (Get-Date -Format 'yyyyMMdd-HHmmss'), $commit.Substring(0, 7)
+    if ($Release -and $changes.Count -ne 0) { throw 'Release packaging requires a clean working tree.' }
+    $packageName = if ($Release) {
+        'color-picker-{0}-windows-x64' -f $project.version
+    } else {
+        'color-picker-{0}-windows-x64-preview-{1}-{2}' -f $project.version,
+            (Get-Date -Format 'yyyyMMdd-HHmmss'), $commit.Substring(0, 7)
+    }
     $dist = Join-Path $repositoryRoot 'dist'
     $package = Join-Path $dist $packageName
     # New unique output only. No recursive deletion and no overwriting older packages.
@@ -43,7 +50,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'docs/measurements') -Destination $docs -Recurse
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'docs/images') -Destination $docs -Recurse
     $readme = @'
-# color-picker __VERSION__ 预览版（Windows x64）
+# color-picker __VERSION____CHANNEL__（Windows x64）
 
 解压后双击 color-picker.exe；默认 Ctrl + Alt + C 或托盘开始取色。
 左键确认，右键 / Esc 取消，滚轮向上冻结放大、向下缩小；缩出 4× 返回实时。
@@ -68,6 +75,7 @@ build-info.json 记录源码、工具链和 EXE 校验值，包外 .sha256 校�
 licenses/ 与 THIRD-PARTY-NOTICES.md 提供依赖许可；项目许可状态见 LICENSE-STATUS.md。
 '@
     $readme = $readme.Replace('__VERSION__', $project.version)
+    $readme = $readme.Replace('__CHANNEL__', $(if ($Release) { '' } else { ' 预览版' }))
     Set-Content -LiteralPath (Join-Path $package 'README.md') -Value $readme -Encoding UTF8
     $licenses = Join-Path $package 'licenses'
     New-Item -ItemType Directory -Path $licenses | Out-Null
@@ -104,7 +112,7 @@ licenses/ 与 THIRD-PARTY-NOTICES.md 提供依赖许可；项目许可状态见 
     if ($LASTEXITCODE -ne 0) { throw 'Could not identify compiler.' }
     $info = [ordered]@{
         version = $project.version
-        channel = 'local-preview'
+        channel = $(if ($Release) { 'release' } else { 'local-preview' })
         source_commit = $commit
         source_dirty = ($changes.Count -ne 0)
         built_at_utc = [DateTime]::UtcNow.ToString('o')
