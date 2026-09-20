@@ -167,6 +167,15 @@ impl Drop for Font {
 
 /// Draw only native push buttons. Checkboxes keep Windows' themed rendering.
 pub(super) fn custom_draw(lparam: LPARAM, primary_id: usize) -> Option<LRESULT> {
+    draw_button(lparam, primary_id, false)
+}
+
+/// Borderless neutral buttons for the result's plain white value list.
+pub(super) fn custom_draw_minimal(lparam: LPARAM, primary_id: usize) -> Option<LRESULT> {
+    draw_button(lparam, primary_id, true)
+}
+
+fn draw_button(lparam: LPARAM, primary_id: usize, minimal: bool) -> Option<LRESULT> {
     if lparam.0 == 0 {
         return None;
     }
@@ -200,6 +209,34 @@ pub(super) fn custom_draw(lparam: LPARAM, primary_id: usize) -> Option<LRESULT> 
     let primary = header.idFrom == primary_id;
     let (fill, border, text) = if disabled {
         (rgb(0xe9edf3), BORDER, rgb(0x94a3b8))
+    } else if minimal {
+        if primary {
+            let fill = if pressed {
+                rgb(0x0b101a)
+            } else if hot {
+                rgb(0x334155)
+            } else {
+                INK
+            };
+            (fill, fill, PANEL)
+        } else {
+            let fill = if pressed {
+                rgb(0xe9edf2)
+            } else if hot {
+                rgb(0xf4f6f8)
+            } else {
+                PANEL
+            };
+            (
+                fill,
+                fill,
+                if (100..104).contains(&header.idFrom) && !hot {
+                    MUTED
+                } else {
+                    INK
+                },
+            )
+        }
     } else if primary {
         let fill = if pressed {
             rgb(0x1e40af)
@@ -225,7 +262,7 @@ pub(super) fn custom_draw(lparam: LPARAM, primary_id: usize) -> Option<LRESULT> 
         // Row copy / key-capture buttons sit on white cards; footer on canvas.
         SetDCBrushColor(
             hdc,
-            if (100..=104).contains(&header.idFrom) {
+            if minimal || (100..=104).contains(&header.idFrom) {
                 PANEL
             } else {
                 CANVAS

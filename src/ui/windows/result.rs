@@ -54,43 +54,14 @@ const PICK_AGAIN: usize = 200;
 const COPY_ROW: usize = 100;
 const RETRY_MS: u32 = 50;
 const MAX_RETRIES: u8 = 3;
-const CLIENT_WIDTH: i32 = 500;
-const CLIENT_HEIGHT: i32 = 416;
+const CLIENT_WIDTH: i32 = 420;
+const CLIENT_HEIGHT: i32 = 390;
+const SWATCH_HEIGHT: i32 = 112;
+const ROW_TOP: i32 = 156;
+const ROW_HEIGHT: i32 = 36;
 const STYLE: WINDOW_STYLE =
     WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0);
 const EX_STYLE: WINDOW_EX_STYLE = WINDOW_EX_STYLE(WS_EX_APPWINDOW.0 | WS_EX_CONTROLPARENT.0);
-const PANELS: [RECT; 5] = [
-    RECT {
-        left: 24,
-        top: 24,
-        right: 476,
-        bottom: 120,
-    },
-    RECT {
-        left: 24,
-        top: 136,
-        right: 476,
-        bottom: 174,
-    },
-    RECT {
-        left: 24,
-        top: 180,
-        right: 476,
-        bottom: 218,
-    },
-    RECT {
-        left: 24,
-        top: 224,
-        right: 476,
-        bottom: 262,
-    },
-    RECT {
-        left: 24,
-        top: 268,
-        right: 476,
-        bottom: 306,
-    },
-];
 static NEXT_COPY_TOKEN: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,8 +122,6 @@ struct Row {
 #[derive(Default)]
 struct Controls {
     swatch: HWND,
-    hero_caption: HWND,
-    hero_hex: HWND,
     source: HWND,
     rows: [Row; 4],
     default_copy: HWND,
@@ -165,8 +134,6 @@ impl Controls {
     fn handles(&self) -> impl Iterator<Item = HWND> + '_ {
         [
             self.swatch,
-            self.hero_caption,
-            self.hero_hex,
             self.source,
             self.default_copy,
             self.pick_again,
@@ -188,7 +155,6 @@ struct Resources {
     _font: Option<Font>,
     _small_font: Option<Font>,
     _value_font: Option<Font>,
-    _hero_font: Option<Font>,
 }
 
 #[derive(Clone, Copy)]
@@ -397,20 +363,6 @@ impl ResultWindow {
             WINDOW_STYLE(SS_OWNERDRAW.0),
             WINDOW_EX_STYLE::default(),
         )?;
-        self.controls.hero_caption = self.control(
-            w!("STATIC"),
-            "已选颜色",
-            13,
-            WINDOW_STYLE(SS_NOPREFIX.0),
-            WINDOW_EX_STYLE::default(),
-        )?;
-        self.controls.hero_hex = self.control(
-            w!("STATIC"),
-            &format_color(self.picked.rgb, ColorFormat::Hex),
-            14,
-            WINDOW_STYLE(SS_NOPREFIX.0),
-            WINDOW_EX_STYLE::default(),
-        )?;
         let source = match self.picked.kind {
             SampleKind::Live => "实时屏幕",
             SampleKind::Frozen => "冻结画面",
@@ -473,7 +425,7 @@ impl ResultWindow {
         )?;
         self.controls.status = self.control(
             w!("STATIC"),
-            "点击复制，或选中文本按 Ctrl+C。",
+            "",
             12,
             WINDOW_STYLE(SS_NOPREFIX.0),
             WINDOW_EX_STYLE::default(),
@@ -602,29 +554,39 @@ impl ResultWindow {
                 true,
             )
         };
-        place(self.controls.swatch, 40, 40, 64, 64)?;
-        place(self.controls.hero_caption, 128, 38, 328, 17)?;
-        place(self.controls.hero_hex, 126, 54, 330, 35)?;
-        place(self.controls.source, 128, 91, 328, 18)?;
-        for (index, row) in self.controls.rows.iter().enumerate() {
-            let y = 136 + index as i32 * 44;
-            place(row.label, 40, y + 11, 68, 18)?;
-            place(row.edit, 118, y + 9, 264, 22)?;
-            place(row.copy, 394, y + 6, 68, 26)?;
+        // Use the actual client width so fractional DPI changes cannot leave a
+        // one-pixel gap at the right edge of the full-width color field.
+        let mut client = RECT::default();
+        unsafe {
+            GetClientRect(self.hwnd, &mut client)?;
+            MoveWindow(
+                self.controls.swatch,
+                0,
+                0,
+                client.right,
+                dip(SWATCH_HEIGHT, dpi),
+                true,
+            )?;
         }
-        place(self.controls.default_copy, 24, 320, 192, 38)?;
-        place(self.controls.pick_again, 228, 320, 146, 38)?;
-        place(self.controls.close, 386, 320, 90, 38)?;
-        place(self.controls.status, 24, 370, 452, 30)?;
+        place(self.controls.source, 20, 128, 380, 18)?;
+        for (index, row) in self.controls.rows.iter().enumerate() {
+            let y = ROW_TOP + index as i32 * ROW_HEIGHT;
+            place(row.label, 20, y + 9, 60, 18)?;
+            place(row.edit, 88, y + 7, 252, 22)?;
+            place(row.copy, 352, y + 4, 48, 28)?;
+        }
+        place(self.controls.default_copy, 20, 316, 160, 32)?;
+        place(self.controls.pick_again, 196, 316, 126, 32)?;
+        place(self.controls.close, 336, 316, 64, 32)?;
+        place(self.controls.status, 20, 358, 380, 28)?;
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
         Ok(())
     }
 
     fn update_resources(&self, dpi: u32) -> Result<()> {
-        let font = Font::new(14, dpi, 400, false)?;
-        let small_font = Font::new(12, dpi, 400, false)?;
+        let font = Font::new(13, dpi, 400, false)?;
+        let small_font = Font::new(11, dpi, 400, false)?;
         let value_font = Font::new(14, dpi, 400, true)?;
-        let hero_font = Font::new(28, dpi, 600, true)?;
         let set_font = |hwnd, font: &Font| {
             unsafe {
                 SendMessageW(
@@ -638,18 +600,14 @@ impl ResultWindow {
         for hwnd in self.controls.handles() {
             set_font(hwnd, &font);
         }
-        for hwnd in [
-            self.controls.hero_caption,
-            self.controls.source,
-            self.controls.status,
-        ] {
+        for hwnd in [self.controls.source, self.controls.status] {
             set_font(hwnd, &small_font);
         }
         for row in self.controls.rows {
             set_font(row.label, &small_font);
             set_font(row.edit, &value_font);
+            set_font(row.copy, &small_font);
         }
-        set_font(self.controls.hero_hex, &hero_font);
         // All controls now borrow the new handles, so previous DPI fonts can
         // be released without retaining a RefCell borrow across window messages.
         let old = self.resources.replace(Resources {
@@ -657,7 +615,6 @@ impl ResultWindow {
             _font: Some(font),
             _small_font: Some(small_font),
             _value_font: Some(value_font),
-            _hero_font: Some(hero_font),
         });
         drop(old);
         Ok(())
@@ -782,25 +739,41 @@ fn draw_swatch(lparam: LPARAM, color: COLORREF) -> LRESULT {
     if saved == 0 {
         return LRESULT(0);
     }
-    let dpi = unsafe { GetDpiForWindow(draw.hwndItem) }.max(96);
     unsafe {
-        FillRect(hdc, &draw.rcItem, HBRUSH(GetStockObject(WHITE_BRUSH).0));
-        SelectObject(hdc, GetStockObject(DC_BRUSH));
-        SelectObject(hdc, GetStockObject(DC_PEN));
         SetDCBrushColor(hdc, color);
-        SetDCPenColor(hdc, COLORREF(0x00f0e8e2));
-        let _ = RoundRect(
-            hdc,
-            draw.rcItem.left,
-            draw.rcItem.top,
-            draw.rcItem.right,
-            draw.rcItem.bottom,
-            dip(12, dpi),
-            dip(12, dpi),
-        );
+        FillRect(hdc, &draw.rcItem, HBRUSH(GetStockObject(DC_BRUSH).0));
         let _ = RestoreDC(hdc, saved);
     }
     LRESULT(1)
+}
+
+fn paint_result(hwnd: HWND) -> LRESULT {
+    let mut paint = PAINTSTRUCT::default();
+    let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
+    if !hdc.is_invalid() {
+        let mut client = RECT::default();
+        let _ = unsafe { GetClientRect(hwnd, &mut client) };
+        unsafe { FillRect(hdc, &client, HBRUSH(GetStockObject(WHITE_BRUSH).0)) };
+        let saved = unsafe { SaveDC(hdc) };
+        if saved != 0 {
+            let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+            unsafe { SetDCBrushColor(hdc, COLORREF(0x00f0eeeb)) };
+            // One continuous value list, separated only by quiet hairlines.
+            for index in 1..=4 {
+                let top = dip(ROW_TOP + index * ROW_HEIGHT, dpi);
+                let line = RECT {
+                    left: dip(20, dpi),
+                    top,
+                    right: client.right - dip(20, dpi),
+                    bottom: top + 1,
+                };
+                unsafe { FillRect(hdc, &line, HBRUSH(GetStockObject(DC_BRUSH).0)) };
+            }
+            let _ = unsafe { RestoreDC(hdc, saved) };
+        }
+    }
+    let _ = unsafe { EndPaint(hwnd, &paint) };
+    LRESULT(0)
 }
 
 unsafe extern "system" fn window_proc(
@@ -832,25 +805,21 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
     };
     match message {
         WM_ERASEBKGND => LRESULT(1),
-        WM_PAINT => state.theme.paint(hwnd, &PANELS),
+        WM_PAINT => paint_result(hwnd),
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {
             let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut _)) } as usize;
-            let panel = matches!(id, 10 | 11 | 13 | 14)
-                || (20..24).contains(&id)
-                || (30..34).contains(&id)
-                || (COPY_ROW..COPY_ROW + 4).contains(&id);
             let tone = if id == 12 {
                 state.status_tone.get()
-            } else if matches!(id, 11 | 13) || (20..24).contains(&id) {
+            } else if id == 11 || (20..24).contains(&id) {
                 Tone::Muted
             } else {
                 Tone::Text
             };
             state
                 .theme
-                .control_color(HDC(wparam.0 as *mut _), panel, tone)
+                .control_color(HDC(wparam.0 as *mut _), true, tone)
         }
-        WM_NOTIFY => theme::custom_draw(lparam, COPY_DEFAULT)
+        WM_NOTIFY => theme::custom_draw_minimal(lparam, COPY_DEFAULT)
             .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }),
         WM_DRAWITEM if wparam.0 == 10 => draw_swatch(lparam, state.swatch_color),
         WM_CLOSE => {
