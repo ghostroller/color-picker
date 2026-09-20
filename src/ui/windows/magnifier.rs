@@ -608,15 +608,22 @@ impl Surface {
         let source = view.source_view();
         let drawn = local_rect(view.drawn_rect(), bounds);
         let viewport = local_rect(view.viewport(), bounds);
+        // Give GDI only the selected top-down rows, with ySrc = 0. Passing a
+        // nonzero top-origin ySrc against the full negative-height DIB selects
+        // the vertically opposite crop on the GDI path. A row slice avoids
+        // that convention without flipping pixels or changing hit mapping.
+        // compact_rows already made every source row image.width * 4 bytes.
+        let rows = &image.bgrx[source.y as usize * image.stride_bytes
+            ..(source.y + source.height) as usize * image.stride_bytes];
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: image.width as i32,
-                biHeight: -(image.height as i32),
+                biHeight: -(source.height as i32),
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB.0,
-                biSizeImage: (image.width * image.height * 4),
+                biSizeImage: (image.width * source.height * 4),
                 ..Default::default()
             },
             ..Default::default()
@@ -634,10 +641,10 @@ impl Surface {
                 drawn.right - drawn.left,
                 drawn.bottom - drawn.top,
                 source.x as i32,
-                source.y as i32,
+                0,
                 source.width as i32,
                 source.height as i32,
-                Some(image.bgrx.as_ptr().cast()),
+                Some(rows.as_ptr().cast()),
                 &info,
                 DIB_RGB_COLORS,
                 SRCCOPY,
@@ -904,6 +911,101 @@ fn failure(message: &'static str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_rows_follow_upper_and_lower_cursor_anchors_at_every_zoom() {
+        let bounds = ScreenRectPx {
+            left: -500,
+            top: -300,
+            right: -240,
+            bottom: 2,
+        };
+        let viewport = ScreenRectPx {
+            bottom: -40,
+            ..bounds
+        };
+        let surface = Surface::new(
+            260,
+            302,
+            168,
+            false,
+            AppearanceConfig {
+                border_width_dip: 0,
+                background_transparency_percent: 0,
+            },
+        )
+        .unwrap();
+        for anchor_y in [52, 208] {
+            let mut snapshot = image(65, 65);
+            for y in 0..65 {
+                for x in 0..65 {
+                    let offset = (y * 65 + x) * 4;
+                    snapshot.bgrx[offset..offset + 4].copy_from_slice(&[
+                        (x ^ y) as u8,
+                        y as u8,
+                        x as u8,
+                        0,
+                    ]);
+                }
+            }
+            let mut view = ZoomView::new(
+                snapshot,
+                viewport,
+                ZoomScale::X4,
+                CachePoint { x: 32, y: 32 },
+            )
+            .unwrap();
+            let anchor = ScreenPointPx {
+                x: bounds.left + 130,
+                y: bounds.top + anchor_y,
+            };
+            let expected_anchor = view.hit_test(anchor).unwrap();
+            for scale in [
+                ZoomScale::X4,
+                ZoomScale::X8,
+                ZoomScale::X16,
+                ZoomScale::X32,
+                ZoomScale::X16,
+                ZoomScale::X8,
+                ZoomScale::X4,
+            ] {
+                view.change_scale(scale, anchor);
+                assert_eq!(view.hit_test(anchor), Some(expected_anchor));
+                // Paint through the real GDI path into its own offscreen buffer.
+                // No desktop capture, visible window or synthesized input.
+                surface
+                    .draw(surface.dc.0, &view, bounds, &Footer::default())
+                    .unwrap();
+                let source = view.source_view();
+                for y in [
+                    source.y,
+                    source.y + source.height / 2,
+                    source.y + source.height - 1,
+                ] {
+                    for x in [
+                        source.x,
+                        source.x + source.width / 2,
+                        source.x + source.width - 1,
+                    ] {
+                        let point = view.cell_center(CachePoint { x, y }).unwrap();
+                        let pixel = view.hit_test(point).unwrap();
+                        let rendered = unsafe {
+                            GetPixel(surface.dc.0, point.x - bounds.left, point.y - bounds.top)
+                        };
+                        let expected = COLORREF(
+                            u32::from(pixel.rgb.r)
+                                | (u32::from(pixel.rgb.g) << 8)
+                                | (u32::from(pixel.rgb.b) << 16),
+                        );
+                        assert_eq!(
+                            rendered, expected,
+                            "anchor y={anchor_y}, scale={scale:?}, cache=({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn frozen_layout_uses_target_dpi_and_stays_inside_work_area() {
