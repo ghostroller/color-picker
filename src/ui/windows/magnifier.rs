@@ -53,28 +53,19 @@ struct State {
 struct Footer {
     rgb: Option<Rgb8>,
     hex: Vec<u16>,
-    coordinates: Vec<u16>,
-    help: Vec<u16>,
     scale: Vec<u16>,
 }
 
 impl State {
     fn refresh_text(&mut self) {
         let factor = self.view.as_ref().map_or(4, |view| view.scale().factor());
-        let (hex, coordinates) = self.hover.map_or_else(
-            || ("选择像素".to_owned(), "移动到像素格内".to_owned()),
-            |pixel| {
-                (
-                    format_color(pixel.rgb, ColorFormat::Hex),
-                    format!("X {}   Y {}", pixel.source.x, pixel.source.y),
-                )
-            },
+        let hex = self.hover.map_or_else(
+            || "—".to_owned(),
+            |pixel| format_color(pixel.rgb, ColorFormat::Hex),
         );
         self.footer = Footer {
             rgb: self.hover.map(|pixel| pixel.rgb),
             hex: hex.encode_utf16().collect(),
-            coordinates: coordinates.encode_utf16().collect(),
-            help: "左键取色 · 滚轮缩放 · Esc 取消".encode_utf16().collect(),
             scale: format!("{factor}×").encode_utf16().collect(),
         };
     }
@@ -146,7 +137,11 @@ impl MagnifierWindow {
         // its actual DPI before any DIP-sized layout is tested against work area.
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT,
                 CLASS_NAME,
                 w!("color-picker magnifier"),
                 WS_POPUP,
@@ -332,11 +327,11 @@ fn window_layout(
     if dpi == 0 || dpi > 9600 || work.is_empty() {
         return Err(failure("Invalid magnifier DPI/work area"));
     }
-    let padding = dip(8, dpi);
-    let footer = dip(54, dpi);
+    let padding = dip(6, dpi);
+    let footer = dip(36, dpi);
     let available_width = i64::from(work.width()) - i64::from(2 * padding);
     let available_height = i64::from(work.height()) - i64::from(2 * padding + footer);
-    let side = i64::from(dip(320, dpi))
+    let side = i64::from(dip(240, dpi))
         .min(available_width)
         .min(available_height);
     if side < 32 {
@@ -460,7 +455,6 @@ struct Surface {
     _bitmap: OwnedBitmap,
     heading_font: OwnedFont,
     body_font: OwnedFont,
-    help_font: OwnedFont,
     old_bitmap: HGDIOBJ,
     width: i32,
     height: i32,
@@ -481,9 +475,8 @@ impl Surface {
         if bitmap.0.is_invalid() {
             return Err(failure("Could not create magnifier buffer"));
         }
-        let heading_font = OwnedFont::new(18, 600, dpi)?;
-        let body_font = OwnedFont::new(12, 400, dpi)?;
-        let help_font = OwnedFont::new(11, 400, dpi)?;
+        let heading_font = OwnedFont::new(16, 600, dpi)?;
+        let body_font = OwnedFont::new(11, 400, dpi)?;
         let old_bitmap = unsafe { SelectObject(dc.0, bitmap.0.into()) };
         if old_bitmap.is_invalid() {
             return Err(failure("Could not select magnifier bitmap"));
@@ -493,7 +486,6 @@ impl Surface {
             _bitmap: bitmap,
             heading_font,
             body_font,
-            help_font,
             old_bitmap,
             width,
             height,
@@ -643,11 +635,11 @@ impl Surface {
     }
 
     fn draw_footer(&self, top: i32, footer: &Footer) -> Result<()> {
-        let pad = dip(12, self.dpi);
+        let pad = dip(10, self.dpi);
         self.fill(
             RECT {
                 left: 1,
-                top: top + dip(7, self.dpi),
+                top: top + dip(5, self.dpi),
                 right: self.width - 1,
                 bottom: self.height - 1,
             },
@@ -656,21 +648,21 @@ impl Surface {
         self.fill(
             RECT {
                 left: pad,
-                top: top + dip(7, self.dpi),
+                top: top + dip(5, self.dpi),
                 right: self.width - pad,
-                bottom: top + dip(8, self.dpi),
+                bottom: top + dip(6, self.dpi),
             },
             palette::BORDER,
         )?;
         let swatch = RECT {
             left: pad,
-            top: top + dip(15, self.dpi),
-            right: dip(48, self.dpi).min(self.width - pad),
-            bottom: top + dip(51, self.dpi),
+            top: top + dip(13, self.dpi),
+            right: dip(30, self.dpi).min(self.width - pad),
+            bottom: top + dip(33, self.dpi),
         };
         if swatch.right > swatch.left {
             self.fill(swatch, palette::SWATCH_BORDER)?;
-            let inset = dip(2, self.dpi).max(1);
+            let inset = dip(1, self.dpi).max(1);
             let interior = RECT {
                 left: swatch.left + inset,
                 top: swatch.top + inset,
@@ -689,14 +681,16 @@ impl Surface {
             }
         }
         let right = self.width - pad;
+        let badge_width = dip(32, self.dpi);
+        let badge_left = (right - badge_width).max(dip(40, self.dpi));
         draw_text(
             self.dc.0,
             &self.heading_font,
             RECT {
-                left: dip(60, self.dpi),
-                top: top + dip(12, self.dpi),
-                right: dip(152, self.dpi).min(right),
-                bottom: top + dip(36, self.dpi),
+                left: dip(40, self.dpi),
+                top: top + dip(10, self.dpi),
+                right: badge_left - dip(6, self.dpi),
+                bottom: top + dip(34, self.dpi),
             },
             palette::TEXT,
             &footer.hex,
@@ -705,36 +699,10 @@ impl Surface {
             self.dc.0,
             &self.body_font,
             RECT {
-                left: dip(160, self.dpi),
-                top: top + dip(17, self.dpi),
-                right,
-                bottom: top + dip(35, self.dpi),
-            },
-            palette::SECONDARY,
-            &footer.coordinates,
-        )?;
-        let badge_width = dip(38, self.dpi);
-        let badge_left = (right - badge_width).max(dip(60, self.dpi));
-        draw_text(
-            self.dc.0,
-            &self.help_font,
-            RECT {
-                left: dip(60, self.dpi),
-                top: top + dip(39, self.dpi),
-                right: badge_left - dip(6, self.dpi),
-                bottom: top + dip(55, self.dpi),
-            },
-            palette::MUTED,
-            &footer.help,
-        )?;
-        draw_text(
-            self.dc.0,
-            &self.body_font,
-            RECT {
                 left: badge_left,
-                top: top + dip(38, self.dpi),
+                top: top + dip(15, self.dpi),
                 right,
-                bottom: top + dip(56, self.dpi),
+                bottom: top + dip(32, self.dpi),
             },
             palette::ACCENT,
             &footer.scale,
@@ -808,7 +776,14 @@ mod tests {
                 window_layout(ScreenPointPx { x: -1199, y: -699 }, work, dpi).unwrap();
             assert_eq!(window.intersection(work), Some(window));
             assert_eq!(viewport.width(), viewport.height());
-            assert_eq!(viewport.width(), dip(320, dpi) as u32);
+            assert_eq!(viewport.width(), dip(240, dpi) as u32);
+            assert_eq!(viewport.left - window.left, dip(6, dpi));
+            assert_eq!(viewport.top - window.top, dip(6, dpi));
+            assert_eq!(window.width(), viewport.width() + 2 * dip(6, dpi) as u32);
+            assert_eq!(
+                window.height(),
+                viewport.height() + (2 * dip(6, dpi) + dip(36, dpi)) as u32
+            );
             assert!(viewport.width() >= 32);
             assert!(viewport.bottom < window.bottom);
         }

@@ -276,12 +276,12 @@ fn assert_visible_beside(preview: &PreviewWindow, point: ScreenPointPx, work_are
     assert!(dpi > 0);
     assert_eq!(
         rect.width(),
-        (280 * dpi + 48) / 96,
+        (208 * dpi + 48) / 96,
         "preview width must use its current window DPI"
     );
     assert_eq!(
         rect.height(),
-        (108 * dpi + 48) / 96,
+        (58 * dpi + 48) / 96,
         "preview height must use its current window DPI"
     );
     assert!(

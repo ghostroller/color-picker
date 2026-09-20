@@ -28,9 +28,10 @@ use windows::{
         Graphics::Gdi::UpdateWindow,
         UI::WindowsAndMessaging::{
             BM_CLICK, BM_SETCHECK, CB_GETCOUNT, CreateWindowExW, DestroyWindow, ES_READONLY,
-            GWL_STYLE, GetDlgItem, GetWindowLongW, GetWindowTextW, IsDialogMessageW, IsWindow, MSG,
-            SendMessageW, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND, WM_GETDLGCODE, WM_KEYDOWN,
-            WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_OVERLAPPED,
+            GWL_EXSTYLE, GWL_STYLE, GetDlgItem, GetWindowLongW, GetWindowTextW, IsDialogMessageW,
+            IsWindow, MSG, SendMessageW, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND, WM_GETDLGCODE,
+            WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+            WS_OVERLAPPED,
         },
     },
     core::w,
@@ -70,6 +71,11 @@ fn cached_selection_and_native_result_controls_smoke() {
     )
     .unwrap();
     let magnifier_hwnd = magnifier.hwnd();
+    let overlay_style = unsafe { GetWindowLongW(magnifier_hwnd, GWL_EXSTYLE) } as u32;
+    assert_eq!(
+        overlay_style & (WS_EX_TOPMOST | WS_EX_NOACTIVATE).0,
+        (WS_EX_TOPMOST | WS_EX_NOACTIVATE).0
+    );
     let bounds = magnifier.rect().unwrap();
     // The square viewport center uses the window width; its text footer sits
     // below the square and must never produce a color selection.

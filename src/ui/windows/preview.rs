@@ -64,7 +64,13 @@ impl PreviewWindow {
         let pointer = state.as_ref() as *const RefCell<State>;
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                // Establish the intended z-order at creation; some desktops
+                // suppress a later TOPMOST promotion of nonactivating windows.
+                WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT,
                 CLASS_NAME,
                 w!("color-picker preview"),
                 WS_POPUP,
@@ -147,7 +153,6 @@ impl PreviewWindow {
                 coordinates: format!("X: {}    Y: {}", point.x, point.y)
                     .encode_utf16()
                     .collect(),
-                help: "左键取色 · 滚轮放大 · Esc 取消".encode_utf16().collect(),
             };
             let mut state = self.state.borrow_mut();
             state.sample = Some((point, rgb));
@@ -161,8 +166,8 @@ impl PreviewWindow {
             if dpi == 0 || dpi > 9600 {
                 return Err(Error::new(E_FAIL, "Could not determine preview DPI"));
             }
-            let width = dip(280, dpi);
-            let height = dip(108, dpi);
+            let width = dip(208, dpi);
+            let height = dip(58, dpi);
             let Some(rect) = place_preview(
                 point,
                 work_area,

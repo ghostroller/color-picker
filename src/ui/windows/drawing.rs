@@ -25,7 +25,6 @@ pub(super) mod palette {
     pub const SWATCH_BORDER: COLORREF = rgb(0x64748b);
     pub const TEXT: COLORREF = rgb(0xf8fafc);
     pub const SECONDARY: COLORREF = rgb(0xcbd5e1);
-    pub const MUTED: COLORREF = rgb(0x94a3b8);
     pub const ACCENT: COLORREF = rgb(0x93c5fd);
     pub const EMPTY: COLORREF = rgb(0x475569);
 }
@@ -34,7 +33,6 @@ pub(super) struct Content {
     pub rgb: Option<Rgb8>,
     pub color_text: Vec<u16>,
     pub coordinates: Vec<u16>,
-    pub help: Vec<u16>,
 }
 
 struct MemoryDc(HDC);
@@ -102,7 +100,6 @@ pub(super) struct Surface {
     _bitmap: OwnedBitmap,
     heading_font: OwnedFont,
     body_font: OwnedFont,
-    help_font: OwnedFont,
     old_bitmap: HGDIOBJ,
     pub width: i32,
     pub height: i32,
@@ -126,9 +123,8 @@ impl Surface {
                 "Could not create the preview back buffer",
             ));
         }
-        let heading_font = OwnedFont::new(18, 600, dpi)?;
-        let body_font = OwnedFont::new(12, 400, dpi)?;
-        let help_font = OwnedFont::new(11, 400, dpi)?;
+        let heading_font = OwnedFont::new(16, 600, dpi)?;
+        let body_font = OwnedFont::new(11, 400, dpi)?;
         let old_bitmap = unsafe { SelectObject(dc.0, HGDIOBJ(bitmap.0.0)) };
         if invalid_selection(old_bitmap) {
             return Err(Error::new(E_FAIL, "Could not select the preview bitmap"));
@@ -138,7 +134,6 @@ impl Surface {
             _bitmap: bitmap,
             heading_font,
             body_font,
-            help_font,
             old_bitmap,
             width,
             height,
@@ -175,29 +170,29 @@ impl Surface {
             swatch_brush,
             palette::SWATCH_BORDER,
             RECT {
-                left: 16,
-                top: 16,
-                right: 72,
-                bottom: 72,
+                left: 10,
+                top: 11,
+                right: 46,
+                bottom: 47,
             },
         )?;
         self.swatch(
             swatch_brush,
             color,
             RECT {
-                left: 18,
-                top: 18,
-                right: 70,
-                bottom: 70,
+                left: 11,
+                top: 12,
+                right: 45,
+                bottom: 46,
             },
         )?;
         self.text(
             &self.heading_font,
             RECT {
-                left: 88,
-                top: 19,
-                right: 264,
-                bottom: 45,
+                left: 58,
+                top: 9,
+                right: 198,
+                bottom: 32,
             },
             palette::TEXT,
             &content.color_text,
@@ -205,34 +200,13 @@ impl Surface {
         self.text(
             &self.body_font,
             RECT {
-                left: 88,
-                top: 49,
-                right: 264,
-                bottom: 70,
+                left: 58,
+                top: 34,
+                right: 198,
+                bottom: 50,
             },
             palette::SECONDARY,
             &content.coordinates,
-        )?;
-        self.swatch(
-            swatch_brush,
-            palette::BORDER,
-            RECT {
-                left: 16,
-                top: 80,
-                right: 264,
-                bottom: 81,
-            },
-        )?;
-        self.text(
-            &self.help_font,
-            RECT {
-                left: 16,
-                top: 89,
-                right: 264,
-                bottom: 104,
-            },
-            palette::MUTED,
-            &content.help,
         )?;
         unsafe {
             BitBlt(
