@@ -28,6 +28,7 @@ use windows::{
 use crate::{
     app::{controller::PreviewController, diagnostics},
     core::format::{ColorFormat, format_color},
+    ui::windows::result::{ResultAction, ResultWindow, WM_RESULT_WAKE},
 };
 
 use super::{
@@ -62,6 +63,7 @@ const STOP_PREVIEW: u16 = 2048;
 const START_REQUEST: u16 = 4096;
 const ACTIVATION_IGNORED: u16 = 8192;
 const INPUT_WAKE: u16 = 16384;
+const RESULT_WAKE: u16 = 32768;
 // shellapi.h defines this expression; windows 0.62.2 does not emit that macro.
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 
@@ -167,7 +169,7 @@ pub fn run(diagnostics: bool) -> Result<()> {
     };
     READY.set(true);
     diagnostics::event(format_args!(
-        "host.ready hotkey_registered={} stage=M4; left click picks, wheel zooms, right click or Esc cancels",
+        "host.ready hotkey_registered={} stage=M5; left click picks, wheel zooms, right click or Esc cancels",
         hotkey.is_some()
     ));
 
@@ -186,6 +188,7 @@ pub fn run(diagnostics: bool) -> Result<()> {
 
 fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
     let mut controller = PreviewController::new(hwnd);
+    let mut result_window: Option<ResultWindow> = None;
     let mut exiting = false;
     let mut deferred_menu = false;
     loop {
@@ -200,17 +203,39 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
         if let Some(picked) = controller.take_result()
             && !exiting
         {
-            // M5 replaces this temporary shell result with the native result window.
-            notify(
-                tray,
-                "已取色",
-                &format!(
-                    "{}  X: {}  Y: {}",
-                    format_color(picked.rgb, ColorFormat::Hex),
-                    picked.source.x,
-                    picked.source.y
+            result_window.take();
+            match ResultWindow::new(picked, hwnd) {
+                Ok(window) => {
+                    result_window = Some(window);
+                    diagnostics::event(format_args!(
+                        "result.shown resources_released_before_show=true"
+                    ));
+                }
+                Err(error) => notify(
+                    tray,
+                    "结果窗口无法显示",
+                    &format!(
+                        "已取色 {}。{error}",
+                        format_color(picked.rgb, ColorFormat::Hex)
+                    ),
                 ),
-            );
+            }
+        }
+        if let Some(window) = result_window.as_ref() {
+            match window.process_pending() {
+                Ok(Some(action)) => {
+                    result_window.take();
+                    controller.close_result()?;
+                    if action == ResultAction::PickAgain && !exiting {
+                        activate(tray, &mut controller, &mut result_window);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    diagnostics::event(format_args!("result.failed error={error}"));
+                    notify(tray, "结果窗口操作失败", &error.to_string());
+                }
+            }
         }
         if exiting && !controller.active() {
             return Ok(());
@@ -231,6 +256,7 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
             if pending & EXIT != 0 {
                 diagnostics::event(format_args!("host.exit_requested"));
                 exiting = true;
+                result_window.take();
                 controller.stop("host_exit");
                 publish_preview_status(&controller);
             }
@@ -286,7 +312,7 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
             }
             dispatch_activation_intent(
                 pending,
-                || activate(tray, &mut controller),
+                || activate(tray, &mut controller, &mut result_window),
                 || {
                     diagnostics::event(format_args!(
                         "activation.ignored reason=preview_already_active"
@@ -306,7 +332,7 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
                 match tray.show_menu(false)? {
                     Some(TrayCommand::Start) => {
                         diagnostics::event(format_args!("tray.menu_selected command=start"));
-                        activate(tray, &mut controller);
+                        activate(tray, &mut controller, &mut result_window);
                     }
                     Some(TrayCommand::Stop) => {
                         controller.stop("tray_menu");
@@ -314,6 +340,7 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
                     }
                     Some(TrayCommand::Settings) => {
                         controller.stop("settings");
+                        result_window.take();
                         controller.close_result()?;
                         notify(tray, "设置", "快捷键和复制设置将在后续版本接入。");
                     }
@@ -369,7 +396,13 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
         }
         if status == 0 {
             exiting = true;
+            result_window.take();
             controller.stop("quit_message");
+            continue;
+        }
+        if let Some(window) = result_window.as_ref()
+            && unsafe { IsDialogMessageW(window.hwnd(), &message) }.as_bool()
+        {
             continue;
         }
         unsafe {
@@ -379,12 +412,26 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon) -> Result<()> {
     }
 }
 
-fn activate(tray: &TrayIcon, controller: &mut PreviewController) {
+fn activate(
+    tray: &TrayIcon,
+    controller: &mut PreviewController,
+    result_window: &mut Option<ResultWindow>,
+) {
+    if !controller.active() {
+        // Destroy the result and flush before sampling so it cannot become part
+        // of the next pick, including a hotkey pressed over that same window.
+        result_window.take();
+        if let Err(error) = super::session::flush_composition() {
+            notify(tray, "无法开始取色", &error.to_string());
+            let _ = controller.close_result();
+            return;
+        }
+    }
     match controller.start() {
         Ok(true) => {
             ACTIVATIONS.set(ACTIVATIONS.get().saturating_add(1));
             diagnostics::event(format_args!(
-                "activation.handled count={} stage=M4",
+                "activation.handled count={} stage=M5",
                 ACTIVATIONS.get()
             ));
         }
@@ -492,6 +539,7 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
     }
     match message {
         WM_INPUT_WAKE => enqueue(hwnd, INPUT_WAKE),
+        WM_RESULT_WAKE => enqueue(hwnd, RESULT_WAKE),
         WM_TIMER if wparam.0 != 0 && wparam.0 == ACTIVE_TIMER.get() => {
             PENDING_TIMER.set(wparam.0);
             enqueue(hwnd, SAMPLE_TICK);

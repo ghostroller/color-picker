@@ -102,9 +102,33 @@ cargo test --locked --test windows_capture --test windows_preview --test windows
 原定完成真实混合 DPI 与负坐标副屏验收后进入 M3；用户随后明确授权直接实现到 M5、减少测试，
 这些项目继续如实保留未测，不阻塞此次实现。
 
+## M3–M5 必要验证 · 2026-09-20
+
+用户授权直接实现到 M5，减少测试；此次不等待完整多屏矩阵或执行压力测试。
+
+| 检查 | 结果 | 证据 / 边界 |
+|---|---|---|
+| 最终构建验证 | PASS | `CARGO_TARGET_DIR=target/m2`，完整 `scripts/verify-windows.ps1`：格式、全目标 Clippy、72 项默认测试、Release、实际 manifest 与应用 / 示例 PMv2 |
+| 输入配对协议 | PASS（逻辑） | 部分安装不拦截、完整 down/up、候选等待 / 拒绝、Esc 重复、右键取消、多按钮释放；不等于实际不同程序的穿透矩阵 |
+| 实际线程 / 钩子生命周期 | PASS（宿主冒烟） | 两项既有 Windows 宿主测试在 M5 版本通过，异步等到 Live，再停止 / 重开 / 显示变化取消；停止后无采样、旧 timer 不串会话 |
+| 冻结快照准确性 | PASS（受控窗口） | 原采样器测试增补 65×65 全像素通道 / 行序、超过范围拒绝、桌面像素变化后快照不变、截图后 1×1 继续采样 |
+| 放大镜与结果控件 | PASS（单次桌面冒烟） | 4/8/16/32 倍缓存命中与锚点、固定窗口、无效文字栏、缩回 Live 信号；4 个原生只读 EDIT 文本与 formatter 一致、关闭后 HWND 销毁 |
+| 剪贴板内存及重试 | PASS（局部） | GlobalAlloc/Lock/最终 Unlock；最多 3 次重试、新复制 / 关闭使旧 token 失效；未写用户剪贴板 |
+| 实际按键选择 / 鼠标滚轮 / 复制粘贴全流程 | NOT TESTED | 此次未合成输入或改剪贴板，留待用户体验反馈 |
+| 混合 DPI、多屏负坐标、长时间资源 / 延迟、1000 次会话 | NOT TESTED | 按用户要求留待 M6–M7 / 发布前验收 |
+
+仅执行一次以下短桌面冒烟（约 3 秒，4 项通过；测试关闭自己的全部临时窗口 / 进程）：
+
+```powershell
+cargo test --locked --test windows_capture --test windows_selection_ui --test windows_shell -- --ignored --test-threads=1 --nocapture
+```
+
+M2 旧预览资源压力测试本次未重复执行。最终构建为
+`target/m2/x86_64-pc-windows-msvc/release/color-picker.exe`；日常启动脚本会在独立 diagnostic 目录重新构建当前版本。
+
 ## 发布前实机矩阵
 
-当前有实时预览，完整输入与结果流程尚未实现。下列是端到端发布矩阵；
+当前实现到 M5，已接入输入与结果流程。下列是端到端发布矩阵；
 局部测试通过不等于对应完整场景已通过。
 
 | 编号 | 场景 | 结果 |
@@ -118,10 +142,10 @@ cargo test --locked --test windows_capture --test windows_preview --test windows
 | W07 | 点击 / 滚轮不穿透 | NOT TESTED |
 | W08 | 动态画面冻结 | NOT TESTED |
 | W09 | 旧提示窗口自污染 | 部分：M2 受控隐藏路径 PASS；跨屏动态移动待测 |
-| W10 | 全倍率与格边界实机命中 | NOT TESTED |
+| W10 | 全倍率与格边界实机命中 | 部分：缓存倍率 / 控件冒烟 PASS；实际鼠标全边界待测 |
 | W11 | 放大镜外 / 文字栏 / 留白点击 | NOT TESTED |
 | W12 | 按住启动 / 长按 / 双击 / Esc | NOT TESTED |
-| W13 | 快速启停会话隔离 | 部分：M2 timer / 会话隔离 PASS；完整输入流程待测 |
+| W13 | 快速启停会话隔离 | 部分：M5 timer / 钩子生命周期冒烟 PASS；真实快速输入待测 |
 | W14 | 配置冲突 / 损坏 / 保存失败 | NOT TESTED |
 | W15 | 剪贴板占用 | NOT TESTED |
 | W16 | Explorer 重启 | NOT TESTED |

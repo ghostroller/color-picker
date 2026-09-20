@@ -4,6 +4,7 @@ use windows::Win32::UI::HiDpi::{
 };
 
 pub mod capture;
+pub mod clipboard;
 pub mod host;
 pub mod hotkey;
 pub mod input;

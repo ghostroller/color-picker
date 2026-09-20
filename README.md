@@ -6,14 +6,16 @@ Windows 原生桌面取色工具，按 [实现计划](docs/implementation-plan.m
 当前进展与验收证据见 [开发记录](docs/progress.md) 和 [验证记录](docs/validation.md)。
 当前是开发版本，尚未完成 v0.1 发布验收。
 
-当前已实现 M0 核心、M1 常驻外壳和 M2 实时颜色预览。启动后在托盘显示图标；
+当前已实现 M0–M5：实时取色、冻结放大、结果展示和复制。启动后在托盘显示图标；
 按 `Ctrl + Alt + C`、激活托盘或重复启动，开始显示鼠标所在物理像素的颜色、HEX 和坐标。
-预览中重复激活不会叠加会话；右键托盘可“停止预览”或“退出”。
+取色中重复激活不会叠加会话；右键或 Esc 取消，退出程序请使用托盘菜单。
 鼠标静止时仍检查画面变化，停止预览后释放采样资源和定时器。
-M3 已接入左键确认、Esc / 右键取消；取色期间消耗鼠标点击和滚轮，结束后释放输入钩子。
+左键确认颜色；取色期间消费鼠标点击和滚轮，结束后释放输入钩子。
 滚轮向上冻结并放大，倍率为 4× / 8× / 16× / 32×；向下滚出 4× 恢复实时取色。
-冻结后在像素格内点击确认，边框 / 文字栏 / 留白点击不取色。当前确认结果以托盘通知显示，
-原生结果窗口与复制将在 M5 接入。
+冻结后在像素格内点击确认，边框 / 文字栏 / 留白点击不取色。
+确认后打开原生结果窗口，显示 HEX、RGB、CSS RGB、HSL、原始坐标及实时 / 冻结来源。
+每行可单独复制，也可复制默认 HEX；支持 Tab、Enter、Esc、文本选择和“重新取色”。
+默认不自动复制。自定义快捷键、默认格式、自动复制和配置保存属于后续 M6。
 
 ## 构建
 
@@ -28,11 +30,12 @@ cargo run --locked
 在交互 Windows 桌面单独执行桌面测试（开始前关闭已有 color-picker）：
 
 ```powershell
-cargo test --locked --test windows_capture --test windows_preview --test windows_shell -- --ignored --test-threads=1 --nocapture
+cargo test --locked --test windows_capture --test windows_preview --test windows_shell --test windows_selection_ui -- --ignored --test-threads=1 --nocapture
 ```
 
 这些测试显示小型已知像素窗口和预览，检查采样、非激活窗口、资源释放以及停止后不再采样；
 临时启动并关闭自己的实例、占用默认热键验证冲突，并模拟托盘恢复及显示变化消息。
+宿主测试会短暂安装取色钩子；结果窗口测试核对原生控件和文本，不改剪贴板。
 不生成真实键鼠输入，也不重启 Explorer；不能替代人工热键、菜单、多屏 DPI 和 Explorer 重启验收。
 运行时请保持测试窗口无遮挡，不切换前台程序或修改显示设置。
 
@@ -69,6 +72,9 @@ cargo test --locked --test windows_capture --test windows_preview --test windows
 | `activation.ignored` | 预览已开启，忽略重复激活 |
 | `preview.started` | 采样会话及定时器已建立 |
 | `preview.stopped` | 会话结束，定时器和预览资源已释放 |
+| `session.starting` / `session.finishing` | 等待输入就绪 / 正在释放已消费的手势 |
+| `session.frozen` / `session.resumed_live` | 进入冻结放大 / 恢复实时取色 |
+| `result.shown` | 输入与采样资源清理完毕，结果窗口已显示 |
 | `preview.sample_unavailable` / `preview.failed` | 采样暂不可用或预览因错误停止 |
 | `tray.notification_accepted` | Windows 已接受通知请求，不保证用户看到了通知 |
 | `tray.balloon_show` | 收到 Shell 的通知显示回调 |
