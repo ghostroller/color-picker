@@ -59,6 +59,7 @@ const COPY_ROW: usize = 100;
 const CAPTION_MINIMIZE: usize = 40;
 const CAPTION_CLOSE: usize = 41;
 const RETRY_MS: u32 = 50;
+const COPIED_FEEDBACK_MS: u32 = 1600;
 const MAX_RETRIES: u8 = 3;
 const CLIENT_WIDTH: i32 = 420;
 const CLIENT_HEIGHT: i32 = 364;
@@ -80,8 +81,9 @@ pub enum ResultAction {
 #[derive(Clone, Copy, Default)]
 struct Pending {
     action: Option<ResultAction>,
-    copy: Option<ColorFormat>,
+    copy: Option<CopyTarget>,
     timer: Option<usize>,
+    feedback_timer: Option<usize>,
     dpi_rect: Option<RECT>,
     layout: bool,
     default_style: bool,
@@ -100,6 +102,7 @@ struct CallbackState {
     wake_failed: Cell<bool>,
     closing: Cell<bool>,
     active_timer: Cell<usize>,
+    feedback_timer: Cell<usize>,
     default_id: Cell<usize>,
 }
 
@@ -170,10 +173,16 @@ struct Resources {
     _value_font: Option<Font>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CopyTarget {
+    format: ColorFormat,
+    button_id: usize,
+}
+
 #[derive(Clone, Copy)]
 struct CopyRequest {
     token: usize,
-    format: ColorFormat,
+    target: CopyTarget,
     retries_left: u8,
 }
 
@@ -181,10 +190,10 @@ struct CopyRequest {
 struct CopyState(Option<CopyRequest>);
 
 impl CopyState {
-    fn replace(&mut self, token: usize, format: ColorFormat) {
+    fn replace(&mut self, token: usize, target: CopyTarget) {
         self.0 = Some(CopyRequest {
             token,
-            format,
+            target,
             retries_left: MAX_RETRIES,
         });
     }
@@ -213,6 +222,7 @@ pub struct ResultWindow {
     picked: PickedColor,
     resources: RefCell<Resources>,
     copy: RefCell<CopyState>,
+    copied_target: Cell<Option<CopyTarget>>,
     status_visible: Cell<bool>,
     _thread_affinity: PhantomData<Rc<()>>,
 }
@@ -273,6 +283,7 @@ impl ResultWindow {
             wake_failed: Cell::new(false),
             closing: Cell::new(false),
             active_timer: Cell::new(0),
+            feedback_timer: Cell::new(0),
             default_id: Cell::new(COPY_DEFAULT),
         });
         let pointer = callback.as_ref() as *const CallbackState;
@@ -301,6 +312,7 @@ impl ResultWindow {
             picked,
             resources: RefCell::new(Resources::default()),
             copy: RefCell::new(CopyState::default()),
+            copied_target: Cell::new(None),
             status_visible: Cell::new(false),
             _thread_affinity: PhantomData,
         };
@@ -338,9 +350,12 @@ impl ResultWindow {
         if auto_copy {
             // The host constructs this window only after capture/input cleanup.
             // Clipboard access stays in process_pending, just like button copies.
-            window
-                .callback
-                .queue(|pending| pending.copy = Some(default_format));
+            window.callback.queue(|pending| {
+                pending.copy = Some(CopyTarget {
+                    format: default_format,
+                    button_id: COPY_DEFAULT,
+                })
+            });
         }
         Ok(window)
     }
@@ -360,6 +375,7 @@ impl ResultWindow {
         if let Some(action) = pending.action {
             self.callback.closing.set(true);
             self.cancel_copy();
+            self.clear_copy_feedback()?;
             return Ok(Some(action));
         }
         if let Some(rect) = pending.dpi_rect {
@@ -384,10 +400,11 @@ impl ResultWindow {
         if pending.minimize {
             let _ = unsafe { ShowWindow(self.hwnd, SW_MINIMIZE) };
         }
-        if let Some(format) = pending.copy {
+        if let Some(target) = pending.copy {
             self.cancel_copy();
+            self.clear_copy_feedback()?;
             let token = next_copy_token()?;
-            self.copy.borrow_mut().replace(token, format);
+            self.copy.borrow_mut().replace(token, target);
             self.attempt_copy(token)?;
         } else if let Some(token) = pending.timer
             && self.callback.active_timer.get() == token
@@ -397,6 +414,11 @@ impl ResultWindow {
             if let Some(request) = request {
                 self.attempt_copy(request.token)?;
             }
+        }
+        if let Some(timer) = pending.feedback_timer
+            && self.callback.feedback_timer.get() == timer
+        {
+            self.clear_copy_feedback()?;
         }
         Ok(None)
     }
@@ -750,8 +772,8 @@ impl ResultWindow {
         let text = wide(text);
         unsafe { SetWindowTextW(self.controls.status, PCWSTR(text.as_ptr()))? };
         if !self.status_visible.get() {
-            // Expand only once, keeping the existing two-line success/error
-            // area. Clamp upwards at the work-area edge so feedback stays on
+            // Only a final failure needs this two-line detail area. Clamp
+            // upwards at the work-area edge so feedback stays on
             // screen when the picked pixel was close to the taskbar.
             let dpi = self.dpi()?;
             let mut bounds = RECT::default();
@@ -779,11 +801,67 @@ impl ResultWindow {
                     height,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 )?;
-                let _ = ShowWindow(self.controls.status, SW_SHOWNA);
             }
             self.status_visible.set(true);
             self.layout()?;
         }
+        let _ = unsafe { ShowWindow(self.controls.status, SW_SHOWNA) };
+        Ok(())
+    }
+
+    fn copy_button(&self, target: CopyTarget) -> HWND {
+        if target.button_id == COPY_DEFAULT {
+            self.controls.default_copy
+        } else {
+            self.controls.rows[target.button_id - COPY_ROW].copy
+        }
+    }
+
+    fn clear_copy_feedback(&self) -> Result<()> {
+        let timer = self.callback.feedback_timer.replace(0);
+        if timer != 0 {
+            let _ = unsafe { KillTimer(Some(self.hwnd), timer) };
+        }
+        if let Some(target) = self.copied_target.take() {
+            let label = wide(&format!("复制 {}", target.format.label()));
+            unsafe { SetWindowTextW(self.copy_button(target), PCWSTR(label.as_ptr()))? };
+        }
+        Ok(())
+    }
+
+    fn show_copy_feedback(&self, target: CopyTarget) -> Result<()> {
+        self.clear_copy_feedback()?;
+        // Normal success never reveals or resizes the detail area. Recovery
+        // from a final failure removes its now-empty footer at the same origin.
+        unsafe { SetWindowTextW(self.controls.status, w!(""))? };
+        let _ = unsafe { ShowWindow(self.controls.status, SW_HIDE) };
+        if self.status_visible.get() {
+            let mut bounds = RECT::default();
+            unsafe {
+                GetWindowRect(self.hwnd, &mut bounds)?;
+                SetWindowPos(
+                    self.hwnd,
+                    None,
+                    0,
+                    0,
+                    bounds.right - bounds.left,
+                    dip(CLIENT_HEIGHT, self.dpi()?),
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )?;
+            }
+            self.status_visible.set(false);
+            self.layout()?;
+        }
+        let timer = next_copy_token()?;
+        // Never leave a permanent "copied" label if Windows cannot arm its
+        // short-lived reset timer. Retry and feedback IDs share one generator.
+        if unsafe { SetTimer(Some(self.hwnd), timer, COPIED_FEEDBACK_MS, None) } == 0 {
+            return Ok(());
+        }
+        self.callback.feedback_timer.set(timer);
+        self.copied_target.set(Some(target));
+        let label = wide(&format!("已复制 {}", target.format.label()));
+        unsafe { SetWindowTextW(self.copy_button(target), PCWSTR(label.as_ptr()))? };
         Ok(())
     }
 
@@ -803,14 +881,11 @@ impl ResultWindow {
         let Some(request) = self.copy.borrow().matching(token) else {
             return Ok(());
         };
-        let text = format_color(self.picked.rgb, request.format);
+        let text = format_color(self.picked.rgb, request.target.format);
         match Clipboard::copy_text(self.hwnd, &text) {
             Ok(()) => {
                 self.copy.borrow_mut().0 = None;
-                self.status(
-                    &format!("已复制 {}：{text}", request.format.label()),
-                    Tone::Success,
-                )
+                self.show_copy_feedback(request.target)
             }
             Err(ClipboardError::Busy) => {
                 let retry = self.copy.borrow_mut().reserve_retry(token);
@@ -825,7 +900,7 @@ impl ResultWindow {
                             .status("剪贴板被占用，无法安排重试。请再次点击复制。", Tone::Error);
                     }
                     self.callback.active_timer.set(timer);
-                    self.status("剪贴板被占用，正在重试…", Tone::Muted)
+                    Ok(())
                 } else {
                     self.status("复制失败：剪贴板仍被占用。请再次点击复制。", Tone::Error)
                 }
@@ -842,6 +917,7 @@ impl Drop for ResultWindow {
     fn drop(&mut self) {
         self.callback.closing.set(true);
         self.cancel_copy();
+        let _ = self.clear_copy_feedback();
         // Child controls release their borrowed fonts before these fields
         // and callback userdata are dropped. Only the owner destroys the HWND.
         let _ = unsafe { DestroyWindow(self.hwnd) };
@@ -1129,16 +1205,28 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                 }
                 CAPTION_MINIMIZE => state.queue(|pending| pending.minimize = true),
                 PICK_AGAIN => state.queue(|pending| pending.action = Some(ResultAction::PickAgain)),
-                COPY_DEFAULT => state.queue(|pending| pending.copy = Some(state.default_format)),
-                id if (COPY_ROW..COPY_ROW + 4).contains(&id) => {
-                    state.queue(|pending| pending.copy = Some(ColorFormat::ALL[id - COPY_ROW]))
-                }
+                COPY_DEFAULT => state.queue(|pending| {
+                    pending.copy = Some(CopyTarget {
+                        format: state.default_format,
+                        button_id: COPY_DEFAULT,
+                    })
+                }),
+                id if (COPY_ROW..COPY_ROW + 4).contains(&id) => state.queue(|pending| {
+                    pending.copy = Some(CopyTarget {
+                        format: ColorFormat::ALL[id - COPY_ROW],
+                        button_id: id,
+                    })
+                }),
                 _ => {}
             }
             LRESULT(0)
         }
         WM_TIMER if wparam.0 != 0 && state.active_timer.get() == wparam.0 => {
             state.queue(|pending| pending.timer = Some(wparam.0));
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 != 0 && state.feedback_timer.get() == wparam.0 => {
+            state.queue(|pending| pending.feedback_timer = Some(wparam.0));
             LRESULT(0)
         }
         WM_DPICHANGED => {
@@ -1238,19 +1326,29 @@ mod tests {
             "copy feedback must not clip the widest supported bottom border"
         );
         assert!(status.top >= after.top);
-        result.status("已复制 HEX：#F4F2F2", Tone::Success).unwrap();
+        result
+            .show_copy_feedback(CopyTarget {
+                format: ColorFormat::Hex,
+                button_id: COPY_DEFAULT,
+            })
+            .unwrap();
         let mut repeated = RECT::default();
         unsafe { GetWindowRect(result.hwnd, &mut repeated) }.unwrap();
         assert_eq!(
-            repeated, after,
-            "later copies must not grow the window again"
+            repeated.bottom - repeated.top,
+            before.bottom - before.top,
+            "successful recovery removes the stale error footer"
         );
+        assert_eq!(repeated.left, after.left);
+        assert_eq!(repeated.top, after.top);
+        assert!(!result.status_visible.get());
+        assert!(!unsafe { IsWindowVisible(result.controls.status) }.as_bool());
     }
 
     #[test]
     fn clipboard_contention_has_three_retries_and_then_goes_idle() {
         let mut copy = CopyState::default();
-        copy.replace(1, ColorFormat::Hex);
+        copy.replace(1, target(ColorFormat::Hex, COPY_DEFAULT));
         for _ in 0..3 {
             assert!(copy.reserve_retry(1));
         }
@@ -1261,15 +1359,74 @@ mod tests {
     #[test]
     fn replacing_or_canceling_copy_rejects_queued_old_timer() {
         let mut copy = CopyState::default();
-        copy.replace(1, ColorFormat::Hex);
+        copy.replace(1, target(ColorFormat::Hex, COPY_DEFAULT));
         assert!(copy.reserve_retry(1));
-        copy.replace(2, ColorFormat::Hsl);
+        copy.replace(2, target(ColorFormat::Hsl, COPY_ROW + 3));
         assert!(copy.matching(1).is_none());
         assert!(!copy.reserve_retry(1));
         assert_eq!(copy.matching(2).unwrap().retries_left, 3);
-        assert_eq!(copy.matching(2).unwrap().format, ColorFormat::Hsl);
+        assert_eq!(
+            copy.matching(2).unwrap().target,
+            target(ColorFormat::Hsl, COPY_ROW + 3)
+        );
         copy.0 = None;
         assert!(copy.matching(2).is_none());
         assert!(!copy.reserve_retry(2));
+    }
+
+    fn target(format: ColorFormat, button_id: usize) -> CopyTarget {
+        CopyTarget { format, button_id }
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; displays a result window without copying"]
+    fn copy_feedback_preserves_layout_and_rejects_old_reset_timers() {
+        let result = ResultWindow::new(
+            PickedColor {
+                rgb: crate::core::color::Rgb8::new(244, 242, 242),
+                source: crate::core::geometry::ScreenPointPx { x: 0, y: 0 },
+                kind: SampleKind::Live,
+            },
+            HWND::default(),
+        )
+        .unwrap();
+        let rect = || {
+            let mut rect = RECT::default();
+            unsafe { GetWindowRect(result.hwnd, &mut rect) }.unwrap();
+            rect
+        };
+        let text = |hwnd| {
+            let mut text = [0_u16; 128];
+            let len = unsafe { GetWindowTextW(hwnd, &mut text) } as usize;
+            String::from_utf16_lossy(&text[..len])
+        };
+        let before = rect();
+        let css = target(ColorFormat::CssRgb, COPY_ROW + 2);
+        result.show_copy_feedback(css).unwrap();
+        let old_timer = result.callback.feedback_timer.get();
+        assert_ne!(old_timer, 0);
+        assert_eq!(text(result.copy_button(css)), "已复制 CSS RGB");
+        assert_eq!(text(result.controls.default_copy), "复制 HEX");
+        assert_eq!(rect(), before);
+        assert!(!result.status_visible.get());
+        assert!(!unsafe { IsWindowVisible(result.controls.status) }.as_bool());
+
+        let hex = target(ColorFormat::Hex, COPY_DEFAULT);
+        result.show_copy_feedback(hex).unwrap();
+        let current_timer = result.callback.feedback_timer.get();
+        assert_ne!(current_timer, old_timer);
+        assert_eq!(text(result.copy_button(css)), "复制 CSS RGB");
+        assert_eq!(text(result.controls.default_copy), "已复制 HEX");
+        // A timer already queued before the second copy must not clear it.
+        result
+            .callback
+            .queue(|pending| pending.feedback_timer = Some(old_timer));
+        result.process_pending().unwrap();
+        assert_eq!(text(result.controls.default_copy), "已复制 HEX");
+        unsafe { SendMessageW(result.hwnd, WM_TIMER, Some(WPARAM(current_timer)), None) };
+        result.process_pending().unwrap();
+        assert_eq!(text(result.controls.default_copy), "复制 HEX");
+        assert_eq!(result.callback.feedback_timer.get(), 0);
+        assert_eq!(rect(), before);
     }
 }

@@ -313,7 +313,14 @@ fn draw_button(lparam: LPARAM, primary_id: usize, minimal: bool) -> Option<LRESU
         SetTextColor(hdc, text);
         let mut label = [0_u16; 128];
         let mut length = GetWindowTextW(header.hwndFrom, &mut label) as usize;
-        if (100..104).contains(&header.idFrom) {
+        let copied_label = [0x5df2, 0x590d, 0x5236]; // 已复制
+        if minimal
+            && (primary || (100..104).contains(&header.idFrom))
+            && label[..length].starts_with(&copied_label)
+        {
+            // The accessible native name still includes the copied format.
+            length = copied_label.len();
+        } else if (100..104).contains(&header.idFrom) {
             // Keep the full native name (e.g. "复制 CSS RGB") for screen readers,
             // while the visible row already identifies the target format.
             label[..2].copy_from_slice(&[0x590d, 0x5236]);
