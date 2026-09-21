@@ -1,0 +1,259 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-20",
+  "environment": {
+    "executable_sha256": "FE25DF05AFCDCCADF08897DAC3D8188F7272F6EB4E023DB16F550878A8EE01C2",
+    "executable_file_version": null,
+    "os_version": "Microsoft Windows NT 10.0.26200.0",
+    "cpu_model": ["11th Gen Intel(R) Core(TM) i7-11700K @ 3.60GHz"],
+    "logical_processors": 16,
+    "powershell_version": "7.4.1",
+    "source_git_head": "3220327133310cba6df2f736ed5a330df4eeb55b",
+    "source_worktree_dirty": true,
+    "source_note": "Checkout HEAD at measurement time does not independently prove the binary build revision."
+  },
+  "resource_bounds_order": ["first", "last", "minimum", "maximum"],
+  "notes": [
+    "Summaries retain aggregate measurements; original files are local-only under logs/measurements/.",
+    "Resource sizes are bytes; CPU percentages are process CPU time / wall time, with machine CPU divided by logical processors.",
+    "Zero CPU means no increment at the process timer resolution. Working set and private bytes must not be added.",
+    "Completed collection does not establish performance thresholds or absence of long-term leaks.",
+    "Environment metadata describes the running-app measurements; the standalone resource-probe executable is identified separately."
+  ],
+  "methods": {
+    "running_app": [
+      "Existing diagnostic application; no process launch/exit, synthetic input, screenshots or clipboard access.",
+      "Actual session input hooks are active during Live; avoid input while measuring.",
+      "Latency is PostMessage to queried Live + sample counter growth + visible preview with empty update region.",
+      "Latency includes message delivery, polling and queries; it is not real-hotkey or display presentation latency.",
+      "CPU and memory belong to the target process; diagnostic messages add a small amount of target work.",
+      "State/session/timer invariants are observed at sample boundaries; cancellation rechecks the owned session.",
+      "This does not test complete pick/zoom/copy workflows or establish performance threshold compliance."
+    ]
+  },
+  "runs": [
+    {
+      "raw_file": "windows11-running-app-20260920.json",
+      "raw_sha256": "C76837730C35918F45A7CF6C68DB9697CD76DA0316D9C510EE28148EE3D9FEB1",
+      "status": "COMPLETED",
+      "started_utc": "2026-09-20T15:54:14.8851894Z",
+      "finished_utc": "2026-09-20T15:55:47.2127566Z",
+      "requested": {"seconds_per_stable_phase": 30, "activation_cycles": 20},
+      "phases": [
+        {
+          "name": "idle_before",
+          "status": "COMPLETED",
+          "sample_count": 31,
+          "metrics": {"duration_seconds": 30.005470000000003, "cpu_delta_ms": 0.0, "cpu_user_delta_ms": 0.0, "cpu_kernel_delta_ms": 0.0, "cpu_single_core_percent": 0.0, "cpu_machine_percent": 0.0, "sample_attempts_delta": 0, "sample_attempts_per_second": 0.0, "working_set_delta_bytes": 0, "private_delta_bytes": 0, "handles_delta": 0, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [22552576, 22552576, 22552576, 22552576], "private_bytes": [3170304, 3170304, 3170304, 3170304], "handles": [216, 216, 216, 216], "threads": [1, 1, 1, 1], "gdi_objects": [19, 19, 19, 19], "user_objects": [13, 13, 13, 13]},
+          "observed_states": [0],
+          "all_sampled_timers_zero": true
+        },
+        {
+          "name": "activation_cycles",
+          "status": "COMPLETED",
+          "sample_count": 2,
+          "metrics": {"duration_seconds": 0.4178601999999998, "cpu_delta_ms": 93.75, "cpu_user_delta_ms": 0.0, "cpu_kernel_delta_ms": 93.75, "cpu_single_core_percent": 22.435733290703457, "cpu_machine_percent": 1.402233330668966, "sample_attempts_delta": 20, "sample_attempts_per_second": 47.86289768683404, "working_set_delta_bytes": 12288, "private_delta_bytes": 106496, "handles_delta": 0, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [22552576, 22564864, 22552576, 22564864], "private_bytes": [3170304, 3276800, 3170304, 3276800], "handles": [216, 216, 216, 216], "threads": [1, 1, 1, 1], "gdi_objects": [19, 19, 19, 19], "user_objects": [13, 13, 13, 13]},
+          "observed_states": [0],
+          "all_sampled_timers_zero": true
+        },
+        {
+          "name": "live",
+          "status": "COMPLETED",
+          "sample_count": 31,
+          "metrics": {"duration_seconds": 30.008513, "cpu_delta_ms": 203.125, "cpu_user_delta_ms": 0.0, "cpu_kernel_delta_ms": 203.125, "cpu_single_core_percent": 0.676891254158445, "cpu_machine_percent": 0.04230570338490281, "sample_attempts_delta": 956, "sample_attempts_per_second": 31.85762653417715, "working_set_delta_bytes": 0, "private_delta_bytes": 0, "handles_delta": 0, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [22585344, 22585344, 22585344, 22585344], "private_bytes": [3330048, 3330048, 3330048, 3330048], "handles": [220, 220, 220, 220], "threads": [2, 2, 2, 2], "gdi_objects": [25, 25, 25, 25], "user_objects": [18, 18, 18, 18]},
+          "observed_states": [2],
+          "all_sampled_timers_zero": false
+        },
+        {
+          "name": "idle_after",
+          "status": "COMPLETED",
+          "sample_count": 31,
+          "metrics": {"duration_seconds": 30.0020472, "cpu_delta_ms": 0.0, "cpu_user_delta_ms": 0.0, "cpu_kernel_delta_ms": 0.0, "cpu_single_core_percent": 0.0, "cpu_machine_percent": 0.0, "sample_attempts_delta": 0, "sample_attempts_per_second": 0.0, "working_set_delta_bytes": 0, "private_delta_bytes": 0, "handles_delta": 0, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [22564864, 22564864, 22564864, 22564864], "private_bytes": [3276800, 3276800, 3276800, 3276800], "handles": [216, 216, 216, 216], "threads": [1, 1, 1, 1], "gdi_objects": [19, 19, 19, 19], "user_objects": [13, 13, 13, 13]},
+          "observed_states": [0],
+          "all_sampled_timers_zero": true
+        }
+      ],
+      "latency": {
+        "method": "nearest-rank",
+        "count": 20,
+        "p50_ms": 14.4005,
+        "p95_ms": 19.4461,
+        "all_cycles_cancelled": true
+      },
+      "cleanup_completed": true,
+      "method": "running_app"
+    },
+    {
+      "raw_file": "windows11-low-interference-idle-20260920.json",
+      "raw_sha256": "854C6C044AA80D0E5A4CFA443A82E71E0E71685FB8F681A3FCC5CE38FD260AAF",
+      "status": "COMPLETED",
+      "scope": "30s low-interference actual-process Idle: diagnostic/resource queries only before and after; no activation or capture by measurement",
+      "measured_utc": "2026-09-20T15:52:15.6737877Z",
+      "metrics": {"duration_ms": 30039.6616, "cpu_ms": 0.0, "cpu_one_core_percent": 0.0, "cpu_machine_percent": 0.0},
+      "resources": {
+        "working_set_bytes": [22552576, 22552576, 22552576, 22552576],
+        "private_bytes": [3170304, 3170304, 3170304, 3170304],
+        "handles": [216, 216, 216, 216],
+        "threads": [1, 1, 1, 1],
+        "gdi_objects": [19, 19, 19, 19],
+        "user_objects": [13, 13, 13, 13]
+      },
+      "sample_attempts_delta": 0,
+      "observed_states": [0, 0]
+    },
+    {
+      "raw_file": "windows11-passive-interaction-20260920.json",
+      "raw_sha256": "3C6D36515694B2335BBBEE703A255BF5B2B4E7655CCE21004CE0F1A501D4A95B",
+      "scope": "Passive monitoring of actual user interaction: states Live (2) and Frozen (3), not idle. Existing warmed process with logging; no activation/cancel/input synthesis by measurement.",
+      "observed_utc": "2026-09-20T15:48:54.2023416Z",
+      "metrics": {
+        "duration_ms": 29990.917299999997,
+        "cpu_ms": 906.25,
+        "cpu_one_core_percent": 3.0217481877421606,
+        "cpu_machine_percent": 0.18885926173388504
+      },
+      "sample_count": 31,
+      "observed_states": [2, 3],
+      "resources": {
+        "working_set_bytes": [23605248, 25710592, 23605248, 25710592],
+        "private_bytes": [3354624, 3354624, 3354624, 3358720],
+        "handles": [220, 220, 220, 220],
+        "threads": [3, 3, 3, 3],
+        "gdi_objects": [22, 22, 22, 25],
+        "user_objects": [18, 17, 17, 18]
+      }
+    },
+    {
+      "raw_file": "windows11-actual-hotkey-log-20260920.json",
+      "raw_sha256": "0D62B93D80EFCC002710FF153AD85F3EBC458A69EA41E7CB6B7CC6641BDA0AE0",
+      "scope": "Existing user-session event log: host main-loop hotkey.received logging (after WM_HOTKEY receipt and queueing) through initial sampling/preview update. Excludes earlier key delivery/queueing and does not prove visible presentation.",
+      "latency": {"sample_count": 11, "p50_ms": 14, "p95_ms": 26, "minimum_ms": 12, "maximum_ms": 26},
+      "definition_source": "src/app/controller.rs InputEvent::Ready calls sample_at before logging preview.started; WM_PAINT may follow later."
+    },
+    {
+      "raw_file": "windows11-start-cancel-1000.json",
+      "raw_sha256": "620D8126CF89975A14AEDBA72C6058DD0E52A89780000F4EA850AC13BCF4453D",
+      "status": "COMPLETED",
+      "scope": "This-process, this-machine controlled start -> one Live preview frame -> cancel -> joined Idle. Includes measurement-harness overhead; no tray or registered hotkey.",
+      "package_version": "0.1.0",
+      "pinned_toolchain": "[toolchain]\nchannel = \"1.95.0\"\nprofile = \"minimal\"\ncomponents = [\"rustfmt\", \"clippy\"]",
+      "architecture": "x86_64",
+      "debug_assertions": false,
+      "started_unix_ms": 1789918148955,
+      "elapsed_ms": 133291.5069,
+      "parameters": {"cycles": 1000, "warmup_cycles": 20, "idle_seconds": 60},
+      "not_measured": [
+        "physical input gesture correctness or hotkey event delivery",
+        "frozen magnifier idle resources or freeze latency",
+        "result/settings windows and clipboard copy flows",
+        "actual on-screen presentation latency or universal performance guarantees",
+        "complete 1000-use workflow or clean-machine deployment acceptance"
+      ],
+      "warmup_completed": 20,
+      "cycles_completed": 1000,
+      "cold_idle": {
+        "before": {
+          "working_set_bytes": 10383360,
+          "private_commit_bytes": 1576960,
+          "thread_count": 4,
+          "handle_count": 142,
+          "gdi_objects": 0,
+          "user_objects": 3,
+          "process_kernel_100ns": 468750,
+          "process_user_100ns": 156250,
+          "controller_idle": true,
+          "active_timer_id": 0,
+          "input_worker_attached": false
+        },
+        "after": {
+          "working_set_bytes": 10338304,
+          "private_commit_bytes": 1478656,
+          "thread_count": 1,
+          "handle_count": 142,
+          "gdi_objects": 0,
+          "user_objects": 3,
+          "process_kernel_100ns": 937500,
+          "process_user_100ns": 156250,
+          "controller_idle": true,
+          "active_timer_id": 0,
+          "input_worker_attached": false
+        },
+        "wall_ms": 60013.1224,
+        "cpu_kernel_ms": 0.0,
+        "cpu_user_ms": 0.0,
+        "cpu_percent_of_one_core": 0.0
+      },
+      "after_warmup": {
+        "working_set_bytes": 11669504,
+        "private_commit_bytes": 1871872,
+        "thread_count": 2,
+        "handle_count": 145,
+        "gdi_objects": 1,
+        "user_objects": 3,
+        "process_kernel_100ns": 2343750,
+        "process_user_100ns": 312500,
+        "controller_idle": true,
+        "active_timer_id": 0,
+        "input_worker_attached": false
+      },
+      "checkpoints": [
+        {
+          "completed_cycles": 100,
+          "resources": {"working_set_bytes": 11698176, "private_commit_bytes": 1871872, "thread_count": 2, "handle_count": 145, "gdi_objects": 1, "user_objects": 3, "process_kernel_100ns": 8281250, "process_user_100ns": 1093750, "controller_idle": true, "active_timer_id": 0, "input_worker_attached": false}
+        },
+        {
+          "completed_cycles": 500,
+          "resources": {"working_set_bytes": 11718656, "private_commit_bytes": 1871872, "thread_count": 2, "handle_count": 145, "gdi_objects": 1, "user_objects": 3, "process_kernel_100ns": 26718750, "process_user_100ns": 2812500, "controller_idle": true, "active_timer_id": 0, "input_worker_attached": false}
+        },
+        {
+          "completed_cycles": 1000,
+          "resources": {"working_set_bytes": 11833344, "private_commit_bytes": 1900544, "thread_count": 2, "handle_count": 145, "gdi_objects": 1, "user_objects": 3, "process_kernel_100ns": 45937500, "process_user_100ns": 4687500, "controller_idle": true, "active_timer_id": 0, "input_worker_attached": false}
+        }
+      ],
+      "used_idle": {
+        "before": {
+          "working_set_bytes": 11833344,
+          "private_commit_bytes": 1900544,
+          "thread_count": 2,
+          "handle_count": 145,
+          "gdi_objects": 1,
+          "user_objects": 3,
+          "process_kernel_100ns": 46406250,
+          "process_user_100ns": 4687500,
+          "controller_idle": true,
+          "active_timer_id": 0,
+          "input_worker_attached": false
+        },
+        "after": {
+          "working_set_bytes": 11812864,
+          "private_commit_bytes": 1765376,
+          "thread_count": 1,
+          "handle_count": 145,
+          "gdi_objects": 1,
+          "user_objects": 3,
+          "process_kernel_100ns": 47031250,
+          "process_user_100ns": 4687500,
+          "controller_idle": true,
+          "active_timer_id": 0,
+          "input_worker_attached": false
+        },
+        "wall_ms": 60013.6274,
+        "cpu_kernel_ms": 0.0,
+        "cpu_user_ms": 0.0,
+        "cpu_percent_of_one_core": 0.0
+      },
+      "cleanup_completed": true,
+      "executable": "resource-probe.exe (standalone harness, not the application binary)",
+      "activation": {
+        "definition": "Elapsed from PreviewController::start to its first successful Live sample and synchronous preview UpdateWindow submission; nearest-rank percentiles, excluding warmup. Not input-to-visible-screen latency.",
+        "sample_count": 1000,
+        "p50_ms": 11.4276,
+        "p95_ms": 12.3253
+      }
+    }
+  ]
+}

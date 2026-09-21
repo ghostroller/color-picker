@@ -1,0 +1,342 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-21",
+  "environment": {
+    "executable_sha256": "E4A461B4C12E0FCD65E53C3F94A9843858C25F84C980BE84745E9663026AB4AC",
+    "executable_file_version": "0.1.0",
+    "os_version": "Microsoft Windows NT 10.0.19045.0",
+    "cpu_model": ["11th Gen Intel(R) Core(TM) i9-11900K @ 3.50GHz"],
+    "logical_processors": 16,
+    "powershell_version": "7.6.5",
+    "source_git_head": "dce3d25ea532e54f4921977525af4427c7947469",
+    "source_worktree_dirty": true,
+    "source_note": "Checkout HEAD at measurement time does not independently prove the binary build revision.",
+    "app_settings": {
+      "language": "en",
+      "border_width_dip": 2,
+      "background_transparency_percent": 35,
+      "quick_pick": false
+    }
+  },
+  "resource_bounds_order": ["first", "last", "minimum", "maximum"],
+  "notes": [
+    "Summaries retain aggregate measurements; original files are local-only under logs/measurements/.",
+    "Resource sizes are bytes; CPU percentages are process CPU time / wall time, with machine CPU divided by logical processors.",
+    "Zero CPU means no increment at the process timer resolution. Working set and private bytes must not be added.",
+    "Completed collection does not establish performance thresholds or absence of long-term leaks.",
+    "Environment metadata describes the running-app measurements; the standalone resource-probe executable is identified separately."
+  ],
+  "methods": {
+    "passive_app": [
+      "Passive observation of one existing diagnostic process; no application/session activation, cancellation or termination.",
+      "No synthetic input, screen capture, cursor reads, clipboard access or configuration changes.",
+      "CPU is process CPU time / elapsed wall time; machine CPU additionally divides by logical processor count.",
+      "Approximately one sample per second. Read-only diagnostic messages add a small amount of target work.",
+      "State/session reads are checked for transitions; state invariants are checked only at sample boundaries.",
+      "Working set and private committed bytes are distinct counters and must not be added together.",
+      "No GPU measurement. No process restart, working-set trim or system timer-resolution change.",
+      "COMPLETED means collection completed, not that performance thresholds passed."
+    ],
+    "running_app": [
+      "Existing diagnostic application; no process launch/exit, synthetic input, screenshots or clipboard access.",
+      "Actual session input hooks are active during Live; avoid input while measuring.",
+      "Latency is PostMessage to queried Live + sample counter growth + visible preview with empty update region.",
+      "Latency includes message delivery, polling and queries; it is not real-hotkey or display presentation latency.",
+      "CPU and memory belong to the target process; diagnostic messages add a small amount of target work.",
+      "State/session/timer invariants are observed at sample boundaries; cancellation rechecks the owned session.",
+      "This does not test complete pick/zoom/copy workflows or establish performance threshold compliance."
+    ]
+  },
+  "runs": [
+    {
+      "raw_file": "windows10-frozen-first-attempt-20260921.json",
+      "raw_sha256": "BA4610A1CCF2C46E1068B591FEAC9E3119B2F32903630A51D5539B8ED783A8F3",
+      "status": "NOT_COMPLETED",
+      "started_utc": "2026-09-21T10:22:56.3456523Z",
+      "finished_utc": "2026-09-21T10:22:59.5055792Z",
+      "label": "frozen-still",
+      "requested": {"seconds": 30, "wait_for_state_seconds": 0, "expected_state": 3},
+      "sample_count": 0,
+      "excluded_reason": "Expected Frozen; observed Idle before sampling.",
+      "cleanup_completed": true,
+      "method": "passive_app"
+    },
+    {
+      "raw_file": "windows10-frozen-still-20260921.json",
+      "raw_sha256": "20790231D7F20FA8743D6A50E42D9DD164CC30C559BB4727F179CFD1861F2C57",
+      "status": "COMPLETED",
+      "started_utc": "2026-09-21T10:23:29.2688392Z",
+      "finished_utc": "2026-09-21T10:24:18.2676588Z",
+      "label": "frozen-still",
+      "requested": {"seconds": 30, "wait_for_state_seconds": 180, "expected_state": 3},
+      "measurement": {
+        "name": "frozen-still",
+        "status": "COMPLETED",
+        "sample_count": 31,
+        "metrics": {
+          "duration_seconds": 29.9916516,
+          "sample_count": 31,
+          "cpu_delta_ms": 46.875,
+          "cpu_user_delta_ms": 31.25,
+          "cpu_kernel_delta_ms": 15.625,
+          "cpu_single_core_percent": 0.15629349335333037,
+          "cpu_machine_percent": 0.009768343334583148,
+          "sample_attempts_delta": 0,
+          "sample_attempts_per_second": 0.0,
+          "working_set_delta_bytes": -8192,
+          "private_delta_bytes": -32768,
+          "handles_delta": -4,
+          "threads_delta": -1,
+          "gdi_objects_delta": 0,
+          "user_objects_delta": 0
+        },
+        "resources": {
+          "working_set_bytes": [18911232, 18903040, 18903040, 18911232],
+          "private_bytes": [2904064, 2871296, 2871296, 2904064],
+          "handles": [243, 239, 239, 243],
+          "threads": [6, 5, 5, 6],
+          "gdi_objects": [27, 27, 27, 27],
+          "user_objects": [17, 17, 17, 17]
+        },
+        "observed_states": [3],
+        "all_sampled_timers_zero": true
+      },
+      "cleanup_completed": true,
+      "method": "passive_app"
+    },
+    {
+      "raw_file": "windows10-repeat-cycles-20260921.json",
+      "raw_sha256": "DB8B697DF8B81E90AEABB9FB7C1FFFC29E8CD6AE503A40B2C3992F18EC3DD050",
+      "status": "COMPLETED",
+      "started_utc": "2026-09-21T10:39:49.9487196Z",
+      "finished_utc": "2026-09-21T10:40:23.9747137Z",
+      "requested": {"activation_cycles": 100, "seconds_per_stable_phase": 10},
+      "phases": [
+        {
+          "name": "idle_before",
+          "status": "COMPLETED",
+          "sample_count": 11,
+          "metrics": {"duration_seconds": 9.9931954, "cpu_delta_ms": 0.0, "cpu_user_delta_ms": 0.0, "cpu_kernel_delta_ms": 0.0, "cpu_single_core_percent": 0.0, "cpu_machine_percent": 0.0, "sample_attempts_delta": 0, "sample_attempts_per_second": 0.0, "working_set_delta_bytes": 0, "private_delta_bytes": 0, "handles_delta": 0, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [18833408, 18833408, 18833408, 18833408], "private_bytes": [2965504, 2965504, 2965504, 2965504], "handles": [231, 231, 231, 231], "threads": [4, 4, 4, 4], "gdi_objects": [22, 22, 22, 22], "user_objects": [13, 13, 13, 13]},
+          "observed_states": [0],
+          "all_sampled_timers_zero": true
+        },
+        {
+          "name": "activation_cycles",
+          "status": "COMPLETED",
+          "sample_count": 4,
+          "metrics": {"duration_seconds": 2.1085756999999994, "cpu_delta_ms": 312.5, "cpu_user_delta_ms": 15.625, "cpu_kernel_delta_ms": 296.875, "cpu_single_core_percent": 14.820430682189883, "cpu_machine_percent": 0.9262769176368677, "sample_attempts_delta": 104, "sample_attempts_per_second": 49.32239331032793, "working_set_delta_bytes": 36864, "private_delta_bytes": 0, "handles_delta": 0, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [18833408, 18870272, 18833408, 18870272], "private_bytes": [2965504, 2965504, 2965504, 2965504], "handles": [231, 231, 231, 231], "threads": [4, 4, 4, 4], "gdi_objects": [22, 22, 22, 22], "user_objects": [13, 13, 13, 13]},
+          "observed_states": [0],
+          "all_sampled_timers_zero": true
+        },
+        {
+          "name": "live",
+          "status": "COMPLETED",
+          "sample_count": 11,
+          "metrics": {"duration_seconds": 10.0090132, "cpu_delta_ms": 15.625, "cpu_user_delta_ms": 0.0, "cpu_kernel_delta_ms": 15.625, "cpu_single_core_percent": 0.15610929556971712, "cpu_machine_percent": 0.00975683097310732, "sample_attempts_delta": 321, "sample_attempts_per_second": 32.07109368184268, "working_set_delta_bytes": 0, "private_delta_bytes": 0, "handles_delta": 0, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [18919424, 18919424, 18919424, 18919424], "private_bytes": [3043328, 3043328, 3043328, 3043328], "handles": [235, 235, 235, 235], "threads": [5, 5, 5, 5], "gdi_objects": [32, 32, 32, 32], "user_objects": [18, 18, 18, 18]},
+          "observed_states": [2],
+          "all_sampled_timers_zero": false
+        },
+        {
+          "name": "idle_after",
+          "status": "COMPLETED",
+          "sample_count": 11,
+          "metrics": {"duration_seconds": 10.015163900000001, "cpu_delta_ms": 0.0, "cpu_user_delta_ms": 0.0, "cpu_kernel_delta_ms": 0.0, "cpu_single_core_percent": 0.0, "cpu_machine_percent": 0.0, "sample_attempts_delta": 0, "sample_attempts_per_second": 0.0, "working_set_delta_bytes": 0, "private_delta_bytes": 0, "handles_delta": 0, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [18870272, 18870272, 18870272, 18870272], "private_bytes": [2965504, 2965504, 2965504, 2965504], "handles": [231, 231, 231, 231], "threads": [4, 4, 4, 4], "gdi_objects": [22, 22, 22, 22], "user_objects": [13, 13, 13, 13]},
+          "observed_states": [0],
+          "all_sampled_timers_zero": true
+        }
+      ],
+      "latency": {
+        "method": "nearest-rank",
+        "count": 100,
+        "p50_ms": 16.7747,
+        "p95_ms": 21.8559,
+        "all_cycles_cancelled": true
+      },
+      "cleanup_completed": true,
+      "method": "running_app"
+    },
+    {
+      "raw_file": "windows10-running-app-20260921.json",
+      "raw_sha256": "3061B4A6A3342984B0247F3DC61ECBBE5EBF2851E5D61E7F341A35B6A7FEFECF",
+      "status": "COMPLETED",
+      "started_utc": "2026-09-21T10:15:24.7378607Z",
+      "finished_utc": "2026-09-21T10:16:57.4736393Z",
+      "requested": {"activation_cycles": 20, "seconds_per_stable_phase": 30},
+      "phases": [
+        {
+          "name": "idle_before",
+          "status": "COMPLETED",
+          "sample_count": 31,
+          "metrics": {"duration_seconds": 30.003311500000002, "cpu_delta_ms": 15.625, "cpu_user_delta_ms": 0.0, "cpu_kernel_delta_ms": 15.625, "cpu_single_core_percent": 0.05207758483592719, "cpu_machine_percent": 0.0032548490522454495, "sample_attempts_delta": 0, "sample_attempts_per_second": 0.0, "working_set_delta_bytes": -49152, "private_delta_bytes": -90112, "handles_delta": 0, "threads_delta": -3, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [10735616, 10686464, 10686464, 10735616], "private_bytes": [1925120, 1835008, 1835008, 1925120], "handles": [153, 153, 153, 153], "threads": [5, 2, 2, 5], "gdi_objects": [7, 7, 7, 7], "user_objects": [4, 4, 4, 4]},
+          "observed_states": [0],
+          "all_sampled_timers_zero": true
+        },
+        {
+          "name": "activation_cycles",
+          "status": "COMPLETED",
+          "sample_count": 2,
+          "metrics": {"duration_seconds": 0.42126239999999626, "cpu_delta_ms": 46.875, "cpu_user_delta_ms": 0.0, "cpu_kernel_delta_ms": 46.875, "cpu_single_core_percent": 11.12726889463679, "cpu_machine_percent": 0.6954543059147994, "sample_attempts_delta": 20, "sample_attempts_per_second": 47.47634728378364, "working_set_delta_bytes": 454656, "private_delta_bytes": 114688, "handles_delta": 1, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [10686464, 11141120, 10686464, 11141120], "private_bytes": [1835008, 1949696, 1835008, 1949696], "handles": [153, 154, 153, 154], "threads": [2, 2, 2, 2], "gdi_objects": [7, 7, 7, 7], "user_objects": [4, 4, 4, 4]},
+          "observed_states": [0],
+          "all_sampled_timers_zero": true
+        },
+        {
+          "name": "live",
+          "status": "COMPLETED",
+          "sample_count": 31,
+          "metrics": {"duration_seconds": 30.001673500000003, "cpu_delta_ms": 109.375, "cpu_user_delta_ms": 15.625, "cpu_kernel_delta_ms": 93.75, "cpu_single_core_percent": 0.3645629967941621, "cpu_machine_percent": 0.02278518729963513, "sample_attempts_delta": 960, "sample_attempts_per_second": 31.998215032904746, "working_set_delta_bytes": 0, "private_delta_bytes": 0, "handles_delta": 0, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [11190272, 11190272, 11190272, 11190272], "private_bytes": [2027520, 2027520, 2027520, 2027520], "handles": [158, 158, 158, 158], "threads": [3, 3, 3, 3], "gdi_objects": [17, 17, 17, 17], "user_objects": [9, 9, 9, 9]},
+          "observed_states": [2],
+          "all_sampled_timers_zero": false
+        },
+        {
+          "name": "idle_after",
+          "status": "COMPLETED",
+          "sample_count": 31,
+          "metrics": {"duration_seconds": 30.0082472, "cpu_delta_ms": 15.625, "cpu_user_delta_ms": 0.0, "cpu_kernel_delta_ms": 15.625, "cpu_single_core_percent": 0.05206901921282493, "cpu_machine_percent": 0.0032543137008015583, "sample_attempts_delta": 0, "sample_attempts_per_second": 0.0, "working_set_delta_bytes": 0, "private_delta_bytes": 0, "handles_delta": 0, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [11141120, 11141120, 11141120, 11141120], "private_bytes": [1949696, 1949696, 1949696, 1949696], "handles": [154, 154, 154, 154], "threads": [2, 2, 2, 2], "gdi_objects": [7, 7, 7, 7], "user_objects": [4, 4, 4, 4]},
+          "observed_states": [0],
+          "all_sampled_timers_zero": true
+        }
+      ],
+      "latency": {
+        "method": "nearest-rank",
+        "count": 20,
+        "p50_ms": 16.7699,
+        "p95_ms": 22.0144,
+        "all_cycles_cancelled": true
+      },
+      "cleanup_completed": true,
+      "method": "running_app"
+    },
+    {
+      "raw_file": "windows10-settings-first-attempt-20260921.json",
+      "raw_sha256": "72A3C99E5C4640908B813904FEB4AE1B05FBEE59AE22B8ADBE56B8F6A920DBD6",
+      "status": "NOT_COMPLETED",
+      "started_utc": "2026-09-21T10:25:38.0904271Z",
+      "finished_utc": "2026-09-21T10:28:42.5753589Z",
+      "label": "settings-still",
+      "requested": {"wait_for_state_seconds": 180, "expected_state": 6, "seconds": 30},
+      "sample_count": 0,
+      "excluded_reason": "Timed out waiting for Settings before sampling; final state was Frozen.",
+      "cleanup_completed": true,
+      "method": "passive_app"
+    },
+    {
+      "raw_file": "windows10-settings-observation-20260921.json",
+      "raw_sha256": "EFE21EA87D1E79C968ECF939C00C1FFB34711FD1DFC3BA5615280B202CF760C7",
+      "status": "COMPLETED",
+      "started_utc": "2026-09-21T10:34:23.4711100Z",
+      "finished_utc": "2026-09-21T10:35:25.0389943Z",
+      "label": "after-frozen-observation",
+      "requested": {"wait_for_state_seconds": 0, "expected_state": -1, "seconds": 60},
+      "measurement": {
+        "name": "after-frozen-observation",
+        "status": "COMPLETED",
+        "sample_count": 61,
+        "metrics": {
+          "duration_seconds": 59.997832200000005,
+          "sample_count": 61,
+          "cpu_delta_ms": 46.875,
+          "cpu_user_delta_ms": 0.0,
+          "cpu_kernel_delta_ms": 46.875,
+          "cpu_single_core_percent": 0.07812782275823625,
+          "cpu_machine_percent": 0.004882988922389766,
+          "sample_attempts_delta": 0,
+          "sample_attempts_per_second": 0.0,
+          "working_set_delta_bytes": 0,
+          "private_delta_bytes": 0,
+          "handles_delta": 0,
+          "threads_delta": 0,
+          "gdi_objects_delta": -12,
+          "user_objects_delta": -1
+        },
+        "resources": {
+          "working_set_bytes": [18714624, 18714624, 18714624, 18714624],
+          "private_bytes": [3051520, 3051520, 3051520, 3051520],
+          "handles": [231, 231, 231, 231],
+          "threads": [2, 2, 2, 2],
+          "gdi_objects": [50, 38, 38, 50],
+          "user_objects": [51, 50, 50, 51]
+        },
+        "observed_states": [6],
+        "all_sampled_timers_zero": true
+      },
+      "cleanup_completed": true,
+      "method": "passive_app"
+    },
+    {
+      "raw_file": "windows10-settings-second-attempt-20260921.json",
+      "raw_sha256": "7EB3EECC7C2EB9D0F0B4589AC4799FCEC401B4605470AED151A554BC396FEB6D",
+      "status": "NOT_COMPLETED",
+      "started_utc": "2026-09-21T10:31:42.0952938Z",
+      "finished_utc": "2026-09-21T10:33:45.7006745Z",
+      "label": "settings-still",
+      "requested": {"seconds": 30, "expected_state": 6, "wait_for_state_seconds": 120},
+      "sample_count": 0,
+      "excluded_reason": "Timed out waiting for Settings before sampling; final state was Idle.",
+      "cleanup_completed": true,
+      "method": "passive_app"
+    },
+    {
+      "raw_file": "windows10-warmed-running-app-20260921.json",
+      "raw_sha256": "840A12DD5AF0468FC0E6ABFF4FAC6CC9002237AB061A3062E4B076546F5812E8",
+      "status": "COMPLETED",
+      "started_utc": "2026-09-21T10:37:15.2128548Z",
+      "finished_utc": "2026-09-21T10:38:48.8302126Z",
+      "requested": {"activation_cycles": 100, "seconds_per_stable_phase": 30},
+      "phases": [
+        {
+          "name": "idle_before",
+          "status": "COMPLETED",
+          "sample_count": 31,
+          "metrics": {"duration_seconds": 30.0005252, "cpu_delta_ms": 0.0, "cpu_user_delta_ms": 0.0, "cpu_kernel_delta_ms": 0.0, "cpu_single_core_percent": 0.0, "cpu_machine_percent": 0.0, "sample_attempts_delta": 0, "sample_attempts_per_second": 0.0, "working_set_delta_bytes": 16384, "private_delta_bytes": 32768, "handles_delta": 0, "threads_delta": 1, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [18530304, 18546688, 18530304, 18546688], "private_bytes": [2768896, 2801664, 2768896, 2801664], "handles": [231, 231, 231, 231], "threads": [2, 3, 2, 3], "gdi_objects": [22, 22, 22, 22], "user_objects": [13, 13, 13, 13]},
+          "observed_states": [0],
+          "all_sampled_timers_zero": true
+        },
+        {
+          "name": "activation_cycles",
+          "status": "COMPLETED",
+          "sample_count": 3,
+          "metrics": {"duration_seconds": 1.9656483000000016, "cpu_delta_ms": 328.125, "cpu_user_delta_ms": 125.0, "cpu_kernel_delta_ms": 203.125, "cpu_single_core_percent": 16.692965877975208, "cpu_machine_percent": 1.0433103673734505, "sample_attempts_delta": 101, "sample_attempts_per_second": 51.382538778681784, "working_set_delta_bytes": 270336, "private_delta_bytes": 135168, "handles_delta": 0, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [18546688, 18817024, 18546688, 18817024], "private_bytes": [2801664, 2936832, 2801664, 2936832], "handles": [231, 231, 231, 231], "threads": [3, 3, 3, 3], "gdi_objects": [22, 22, 22, 22], "user_objects": [13, 13, 13, 13]},
+          "observed_states": [0],
+          "all_sampled_timers_zero": true
+        },
+        {
+          "name": "live",
+          "status": "COMPLETED",
+          "sample_count": 31,
+          "metrics": {"duration_seconds": 30.004253900000002, "cpu_delta_ms": 140.625, "cpu_user_delta_ms": 0.0, "cpu_kernel_delta_ms": 140.625, "cpu_single_core_percent": 0.46868354223598935, "cpu_machine_percent": 0.029292721389749334, "sample_attempts_delta": 960, "sample_attempts_per_second": 31.995463149976874, "working_set_delta_bytes": 0, "private_delta_bytes": 0, "handles_delta": 0, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [18866176, 18866176, 18866176, 18866176], "private_bytes": [3010560, 3010560, 3010560, 3010560], "handles": [235, 235, 235, 235], "threads": [4, 4, 4, 4], "gdi_objects": [32, 32, 32, 32], "user_objects": [18, 18, 18, 18]},
+          "observed_states": [2],
+          "all_sampled_timers_zero": false
+        },
+        {
+          "name": "idle_after",
+          "status": "COMPLETED",
+          "sample_count": 31,
+          "metrics": {"duration_seconds": 30.0152425, "cpu_delta_ms": 0.0, "cpu_user_delta_ms": 0.0, "cpu_kernel_delta_ms": 0.0, "cpu_single_core_percent": 0.0, "cpu_machine_percent": 0.0, "sample_attempts_delta": 0, "sample_attempts_per_second": 0.0, "working_set_delta_bytes": 0, "private_delta_bytes": 0, "handles_delta": 0, "threads_delta": 0, "gdi_objects_delta": 0, "user_objects_delta": 0},
+          "resources": {"working_set_bytes": [18817024, 18817024, 18817024, 18817024], "private_bytes": [2936832, 2936832, 2936832, 2936832], "handles": [231, 231, 231, 231], "threads": [3, 3, 3, 3], "gdi_objects": [22, 22, 22, 22], "user_objects": [13, 13, 13, 13]},
+          "observed_states": [0],
+          "all_sampled_timers_zero": true
+        }
+      ],
+      "latency": {
+        "method": "nearest-rank",
+        "count": 100,
+        "p50_ms": 16.6613,
+        "p95_ms": 20.0532,
+        "all_cycles_cancelled": true
+      },
+      "cleanup_completed": true,
+      "method": "running_app"
+    }
+  ]
+}

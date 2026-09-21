@@ -12,7 +12,7 @@
 拒绝改址（退出码 7）、拒绝降级（退出码 1）、取消选项、重新启用后卸载。
 文件/许可 SHA256 一致，安装后 DPI 检查通过，卸载后 EXE、卸载器、注册项和快捷方式均清理。
 实际用户配置仅比较前后指纹，没有修改。测试不启动常驻程序、不向用户实例发退出消息。
-本机日志保留在 `target/installer-smoke/ede0823203c54bd18a75cb1b2612157f/`。
+本机日志保留在 `target/installer-smoke/` 下的独立运行目录中。
 
 待人工补充：真实注销/登录后的启动项行为，正在取色/托盘菜单/设置修改期间的
 覆盖升级退出，以及干净 Windows 10/11 机器验证。CLI/资源测试通过不能替代这些场景。
@@ -72,7 +72,7 @@ cargo test --locked --test windows_shell -- --ignored --test-threads=1 --nocaptu
 在当前用户交互桌面执行后，2 项均 PASS。测试已正常关闭自己的全部临时进程；
 没有操作用户已有的 color-picker、重启 Explorer、生成键鼠输入或改变剪贴板。
 
-2026-09-20 用户补充实测：日志 `color-picker-20260920-213810-fdaa2d1e81304c9bb11c4877854535fe.log`
+2026-09-20 用户补充实测：`logs/` 下的本机诊断日志
 与用户“正常触发了”的反馈确认实际快捷键和通知显示 PASS。进程 34612 的 elapsed_ms=8930/12464
 均有 hotkey.received → activation.handled → tray.notification_accepted → tray.balloon_show；
 48916 有 tray.activation_received，52365 有设置通知和 Shell 显示回调。无错误事件。
@@ -163,7 +163,8 @@ M2 旧预览资源压力测试本次未重复执行。最终构建为
 ## M7 本机测量与预览包 · 2026-09-20
 
 Windows 11 x64 25H2 / 26200.9457，Rust 1.95.0，静态 CRT Release；
-完整原始数据见 [1000 次启动/取消报告](measurements/windows11-start-cancel-1000.json)。
+检查点与延迟汇总见[历史测量摘要](measurements/windows11-release-20260920-summary.json)中的
+`windows11-start-cancel-1000.json` 条目；完整原始数据仅保存在本地 `logs/measurements/`。
 固定预热 20 次，随后 1000 次各采样并提交一帧再取消，前后各空闲 60 秒，
 总耗时约 133.29 秒；COMPLETED，cleanup_completed=true。
 

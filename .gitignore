@@ -1,6 +1,11 @@
 /target/
 /logs/
 /dist/
+# Keep raw measurements and local captures out of commits; publish reviewed summaries.
+/docs/measurements/*
+!/docs/measurements/README.md
+!/docs/measurements/*-summary.json
+/resource-probe-*.json
 *.log
 *.pdb
 *.ilk

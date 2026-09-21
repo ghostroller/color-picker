@@ -1,9 +1,119 @@
-# 实际程序后台与取色性能 · 2026-09-20
+# 实际 Release 程序性能复测 · 2026-09-21
 
-本次直接测正在使用的 `color-picker.exe`（PID 24472），未重启进程。
+本轮测量提交 `dce3d25` 对应的 Release，包含最新界面、设置预览、中英切换及语言下拉框修复。
+开始时未检测到运行中的 Color Picker，因此启动
+`target/x86_64-pc-windows-msvc/release/color-picker.exe --diagnostics --no-onboarding`
+并持续测量同一进程。只启用诊断查询，未启用文件日志。
+二进制 SHA256 为 `E4A461B4C12E0FCD65E53C3F94A9843858C25F84C980BE84745E9663026AB4AC`。
+使用现有 English 界面、2 DIP 边框、35% 背景透明度，Quick pick 关闭。
+
+本机为 **Windows 10 专业版 22H2（19045），i9-11900K，16 个逻辑处理器**。
+上次是 Windows 11（26200）、i7-11700K，且测量的是已使用过的带日志进程。
+硬件、系统、加载状态和日志方式不同，历史数据只作参考，不能据此量化代码变快或内存改善。
+这次能运行不等于完成 Windows 10 的完整兼容性验证。
+
+本轮未发现后台持续空转或句柄/GDI/USER 随调用次数累积。
+首次使用窗口后的后台工作集约 18 MiB；第二轮 100 次调用的私有提交增量为 0。
+结论限于此次时间窗口和已测路径，不等于长期完整工作流无泄漏。
+
+## 本次 CPU 与内存
+
+CPU 由进程 CPU 时间增量计算；整机百分比再除以 16 个逻辑处理器。
+工作集和私有提交均为 MiB，不能相加。每阶段约每秒只读采样一次，诊断查询有少量开销。
+
+| 状态 | 时长 | 平均整机 CPU | 平均单核 CPU | 工作集 | 私有提交 |
+|---|---:|---:|---:|---:|---:|
+| 首次启动后后台 | 30.00 s | 0.0033% | 0.0521% | 10.19–10.24 | 1.75–1.84 |
+| 持续实时取色，鼠标静止 | 30.00 s | 0.0228% | 0.3646% | 10.67 | 1.93 |
+| 取消后后台 | 30.01 s | 0.0033% | 0.0521% | 10.62 | 1.86 |
+| 冻结取色，用户保持静止 | 29.99 s | 0.0098% | 0.1563% | 18.03–18.04 | 2.74–2.77 |
+| 设置窗口静置 | 60.00 s | 0.0049% | 0.0781% | 17.85 | 2.91 |
+| 使用冻结/设置后的后台 | 30.00 s | 0% | 0% | 17.67–17.69 | 2.64–2.67 |
+| 使用后的实时取色，鼠标静止 | 30.00 s | 0.0293% | 0.4687% | 17.99 | 2.87 |
+| 100 次调用/取消与 Live 后后台 | 30.02 s | 0% | 0% | 17.95 | 2.80 |
+| 再补 100 次调用与 Live 后后台 | 10.02 s | 0% | 0% | 18.00 | 2.83 |
+
+实时取色 30 秒内采样 960 次，约 **32.00 次/秒**，内存及句柄/GDI/USER 数量保持不变。
+冻结样本的 31 个正式采样点均为同一会话、定时器 0、采样次数不增长；未发现持续抓屏。
+冻结窗口首次打开后加载字体及 Windows 窗口资源，不能把相对冷启动的工作集增加直接判为泄漏。
+设置采样器允许混合状态，但实际 61 个采样点全部为 Settings，取色定时器均为 0，采样计数不增长。
+设置静置期间工作集、私有提交、句柄和线程数均未变化；GDI 从 50 降到 38，USER 从 51 降到 50。
+0% 表示进程 CPU 计时粒度内没有观察到增量；并非绝对零执行成本。
+使用后的第二轮 Live 也保持约 32 次/秒，内存与资源计数在该阶段内不变。
+
+## 本次资源与响应
+
+| 状态（阶段末尾） | 句柄 | GDI | USER | 线程 |
+|---|---:|---:|---:|---:|
+| 初始后台 | 153 | 7 | 4 | 2 |
+| 20 次调用/取消后 | 154 | 7 | 4 | 2 |
+| 实时取色 | 158 | 17 | 9 | 3 |
+| 取消后后台 | 154 | 7 | 4 | 2 |
+| 冻结取色 | 239 | 27 | 17 | 5 |
+| 设置窗口 | 231 | 38 | 50 | 2 |
+| 设置关闭并静置后 | 231 | 22 | 13 | 3 |
+| 再完成 100 次调用/取消后 | 231 | 22 | 13 | 3 |
+| 使用后的实时取色 | 235 | 32 | 18 | 4 |
+| 再取消并静置后 | 231 | 22 | 13 | 3 |
+| 补测另 100 次并回后台后 | 231 | 22 | 13 | 4 |
+
+20 次自动调用/取消的可查询就绪延迟为 **p50 16.77 ms / p95 22.01 ms**。
+计时从投递应用激活消息到确认 Live、采样计数增长、预览可见且更新区为空，
+包含轮询开销，不代表真实快捷键投递或显示器呈现延迟。20 轮总计约 0.42 秒，
+其突发 CPU 不能与持续取色 CPU 混为一项。
+
+打开过冻结及设置窗口后的 100 次自动调用/取消全部完成，
+**p50 16.66 ms / p95 20.05 ms**；句柄、GDI、USER 在循环前后均为 231 / 22 / 13。
+这一轮工作集增加 264 KiB、私有提交增加 132 KiB，随后的 30 秒后台保持不变。
+当前使用后的后台占用约 18 MiB；冷启动约 10 MiB 不宜作为长期使用时的唯一预期。
+
+针对该内存增量，又完成一轮 100 次调用/取消（前后各 10 秒 Idle，中间 10 秒 Live）。
+这轮循环的私有提交没有增加，工作集仅增加 36 KiB，句柄/GDI/USER 仍为 231 / 22 / 13，
+结束后的后台也保持稳定；p50 16.77 ms / p95 21.86 ms。
+累计三轮共 **220 次**自动调用/取消正常完成。线程总数包含 Windows 维护的线程；
+两轮 100 次循环内部的线程基线分别为 3 和 4，均未随循环增长，Live 各临时增加 1 个并在结束时回落。
+第二轮补测开始前私有提交为 2.83 MiB，略高于上一轮结束的 2.80 MiB；
+不能据此声称全程内存完全不变，但此次没有观察到逐轮累积趋势。
+
+## 本次证据与限制
+
+[精简汇总](measurements/windows10-release-20260921-summary.json)保留本轮 8 次尝试的状态、
+有效阶段的 CPU/内存/资源范围、延迟分位数、二进制与原始文件 SHA256。
+逐秒采样和等待记录保存在本地 `logs/measurements/`，不随仓库或分发包发布；
+详见[采样资料保留规则](measurements/README.md)。
+
+设置静置 60 秒的观察标签为 `after-frozen-observation`，实际全部采样点为 Settings。
+冻结首次尝试在正式采样前发现已回到 Idle，为 `NOT_COMPLETED`；重新进入冻结后才开始有效样本。
+设置的前两次等待均在正式采样前超时，状态分别停留在 Frozen / Idle。
+这 3 次未完成尝试均在汇总中保留排除原因，不计入结果。
+
+新增 `scripts/measure-passive-app.ps1` 用于用户手动进入某状态后的只读采样，
+支持等待目标状态；不会启动/退出程序、激活/取消取色、改配置、截屏或访问剪贴板。
+如状态在采样点不符，会保留 `NOT_COMPLETED` 的原始证据。
+
+```powershell
+New-Item -ItemType Directory -Path .\logs\measurements -Force | Out-Null
+$pickerPid = (Get-Process color-picker).Id
+.\scripts\measure-passive-app.ps1 -ProcessId $pickerPid -Label frozen-still -ExpectedState 3 -WaitForStateSeconds 120 -Seconds 30 -OutputPath .\logs\measurements\frozen-new.json
+```
+
+状态编号为 0=Idle、2=Live、3=Frozen、5=Result、6=Settings；-1 允许混合状态。
+输出文件必须尚不存在。采样器仅观测，不自动使程序进入目标状态。
+冻结测试中应先启动等待，再用快捷键及滚轮进入冻结；点击回复可能触发窗外取消。
+
+本轮未测 GPU、长时间连续鼠标移动、实际复制、混合 DPI、多显示器切换及完整千次工作流。
+用户保持静止是操作约定，冻结的被动脚本不读取鼠标位置；状态只在采样点确认。
+Windows 原生自动化截图接口返回 `SetIsBorderRequired / E_NOINTERFACE`，
+因此冻结和设置阶段由用户手动进入，进程计数仍由脚本读取。
+
+---
+
+## 历史记录 · 2026-09-20
+
+本次直接测正在使用的 `color-picker.exe`，未重启进程。
 Windows 11 x64，i7-11700K，16 个逻辑处理器；目标为带日志的 Release，
 `target/diagnostic/x86_64-pc-windows-msvc/release/color-picker.exe`。
-完整二进制 SHA256、机器信息和时间戳保存在原始 JSON 中。
+完整二进制 SHA256、系统/CPU 信息和时间戳保存在精简汇总中。
 
 此次没有发现待机持续工作或结束后句柄/GDI/USER 未回收的现象。
 结论限于本机、当前已使用过的进程与本次时间窗口，不代表长期完整工作流无泄漏。
@@ -59,12 +169,12 @@ CPU 为目标进程的 CPU 时间增量除以墙钟时间；“整机”再除�
 20 次连续调用/取消耗时约 0.418 秒，目标 CPU 共增加 93.75 ms；
 该短暂突发区间平均整机 CPU 1.40%，不能与持续 Live 的平均 CPU 混为一项。
 
-## 原始证据与复测
+## 历史汇总与复测
 
-- [实际进程分阶段测量](measurements/windows11-running-app-20260920.json)：COMPLETED，所有阶段正常结束，cleanup.completed=true。
-- [低干扰后台基线](measurements/windows11-low-interference-idle-20260920.json)。
-- [用户实际交互样本](measurements/windows11-passive-interaction-20260920.json)。
-- [真实快捷键日志统计](measurements/windows11-actual-hotkey-log-20260920.json)。
+[历史精简汇总](measurements/windows11-release-20260920-summary.json)包含实际进程分阶段测量、
+低干扰后台基线、用户实际交互、真实快捷键日志统计，以及独立 resource-probe 的 1000 次循环。
+实际进程分阶段测量为 COMPLETED，所有阶段正常结束，cleanup.completed=true。
+汇总保留原始文件 SHA256；完整采样仅保存在本地 `logs/measurements/`。
 
 新增 `scripts/measure-running-app.ps1` 可对显式指定的已有 PID 复测。
 程序须带 `--diagnostics` 或 `--log-file` 启动，并先关闭取色、结果与设置窗口回到待机。
@@ -74,7 +184,8 @@ CPU 为目标进程的 CPU 时间增量除以墙钟时间；“整机”再除�
 
 ```powershell
 $pickerPid = (Get-Process color-picker).Id
-.\scripts\measure-running-app.ps1 -ProcessId $pickerPid -Seconds 30 -ActivationCycles 20 -OutputPath .\logs\performance-new.json
+New-Item -ItemType Directory -Path .\logs\measurements -Force | Out-Null
+.\scripts\measure-running-app.ps1 -ProcessId $pickerPid -Seconds 30 -ActivationCycles 20 -OutputPath .\logs\measurements\performance-new.json
 ```
 
 本次没有单独测 GPU、静止 Frozen、结果/设置窗口长期驻留、不同显示器配置及系统负载下的差异。

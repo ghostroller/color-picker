@@ -47,7 +47,12 @@ try {
     foreach ($name in @('validation.md', 'known-limitations.md', 'troubleshooting.md', 'resource-probe.md', 'performance-running-app.md', 'ui-preview.md', 'windows-installer.md', 'ci-packaging.md')) {
         Copy-Item -LiteralPath (Join-Path $repositoryRoot "docs/$name") -Destination $docs
     }
-    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'docs/measurements') -Destination $docs -Recurse
+    # Ship reviewed summaries only, even when local raw measurements exist beside them.
+    $measurementDocs = Join-Path $docs 'measurements'
+    New-Item -ItemType Directory -Path $measurementDocs | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'docs/measurements/README.md') -Destination $measurementDocs
+    Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'docs/measurements') -Filter '*-summary.json' -File |
+        Copy-Item -Destination $measurementDocs
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'docs/images') -Destination $docs -Recurse
     $readme = @'
 # Color Picker __VERSION____CHANNEL__ for Windows x64
