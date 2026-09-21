@@ -8,6 +8,7 @@ pub mod clipboard;
 pub mod config_path;
 pub mod host;
 pub mod hotkey;
+pub(crate) mod icon;
 pub mod input;
 pub mod instance;
 pub mod monitors;

@@ -38,10 +38,11 @@ use windows::{
 };
 
 use super::{
-    drawing::dip,
+    drawing::{border_thickness, dip, draw_bottom_right_border},
     theme::{self, Font, Theme, Tone},
 };
 use crate::{
+    app::config::AppearanceConfig,
     core::{
         format::{ColorFormat, format_color},
         state::{PickedColor, SampleKind},
@@ -60,7 +61,8 @@ const CAPTION_CLOSE: usize = 41;
 const RETRY_MS: u32 = 50;
 const MAX_RETRIES: u8 = 3;
 const CLIENT_WIDTH: i32 = 420;
-const CLIENT_HEIGHT: i32 = 390;
+const CLIENT_HEIGHT: i32 = 364;
+const CLIENT_HEIGHT_WITH_STATUS: i32 = 390;
 const SWATCH_HEIGHT: i32 = 112;
 const ROW_TOP: i32 = 156;
 const ROW_HEIGHT: i32 = 36;
@@ -91,6 +93,7 @@ struct CallbackState {
     default_format: ColorFormat,
     theme: Theme,
     swatch_color: COLORREF,
+    border_width_dip: u8,
     status_tone: Cell<Tone>,
     pending: Cell<Pending>,
     wake_posted: Cell<bool>,
@@ -210,6 +213,7 @@ pub struct ResultWindow {
     picked: PickedColor,
     resources: RefCell<Resources>,
     copy: RefCell<CopyState>,
+    status_visible: Cell<bool>,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
@@ -223,6 +227,22 @@ impl ResultWindow {
         notify_hwnd: HWND,
         default_format: ColorFormat,
         auto_copy: bool,
+    ) -> Result<Self> {
+        Self::new_with_appearance(
+            picked,
+            notify_hwnd,
+            default_format,
+            auto_copy,
+            AppearanceConfig::default(),
+        )
+    }
+
+    pub fn new_with_appearance(
+        picked: PickedColor,
+        notify_hwnd: HWND,
+        default_format: ColorFormat,
+        auto_copy: bool,
+        appearance: AppearanceConfig,
     ) -> Result<Self> {
         let instance = unsafe { GetModuleHandleW(None)? }.into();
         let class = WNDCLASSW {
@@ -246,6 +266,7 @@ impl ResultWindow {
                     | (u32::from(picked.rgb.g) << 8)
                     | (u32::from(picked.rgb.b) << 16),
             ),
+            border_width_dip: appearance.border_width_dip,
             status_tone: Cell::new(Tone::Muted),
             pending: Cell::new(Pending::default()),
             wake_posted: Cell::new(false),
@@ -280,9 +301,10 @@ impl ResultWindow {
             picked,
             resources: RefCell::new(Resources::default()),
             copy: RefCell::new(CopyState::default()),
+            status_visible: Cell::new(false),
             _thread_affinity: PhantomData,
         };
-        theme::configure_window(hwnd);
+        theme::configure_window(hwnd, &window.callback.theme);
         // Keep the window's native title for taskbar/accessibility, while the
         // client area replaces the visible frame. DWM rounding is best effort.
         let no_border = 0xffff_fffe_u32; // DWMWA_COLOR_NONE
@@ -454,6 +476,8 @@ impl ResultWindow {
             WINDOW_STYLE(SS_NOPREFIX.0),
             WINDOW_EX_STYLE::default(),
         )?;
+        // Do not reserve an empty footer before a copy has produced feedback.
+        let _ = unsafe { ShowWindow(self.controls.status, SW_HIDE) };
         self.controls.minimize = self.control(
             w!("BUTTON"),
             "最小化",
@@ -586,6 +610,7 @@ impl ResultWindow {
 
     fn layout(&self) -> Result<()> {
         let dpi = self.dpi()?;
+        self.callback.theme.update_window_icons(self.hwnd);
         if self.resources.borrow().dpi != dpi {
             self.update_resources(dpi)?;
         }
@@ -599,8 +624,8 @@ impl ResultWindow {
                 true,
             )
         };
-        // Use the actual client width so fractional DPI changes cannot leave a
-        // one-pixel gap at the right edge of the full-width color field.
+        // Leave the shared right border uncovered by this child window, even
+        // across fractional DPI changes. The parent uses WS_CLIPCHILDREN.
         let mut client = RECT::default();
         unsafe {
             GetClientRect(self.hwnd, &mut client)?;
@@ -608,7 +633,13 @@ impl ResultWindow {
                 self.controls.swatch,
                 0,
                 0,
-                client.right,
+                client.right
+                    - border_thickness(
+                        client.right,
+                        client.bottom,
+                        dpi,
+                        self.callback.border_width_dip,
+                    ),
                 dip(SWATCH_HEIGHT, dpi),
                 true,
             )?;
@@ -639,7 +670,7 @@ impl ResultWindow {
         place(self.controls.default_copy, 20, 316, 160, 32)?;
         place(self.controls.pick_again, 196, 316, 126, 32)?;
         place(self.controls.close, 336, 316, 64, 32)?;
-        place(self.controls.status, 20, 358, 380, 28)?;
+        place(self.controls.status, 20, 354, 380, 28)?;
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
         Ok(())
     }
@@ -717,7 +748,43 @@ impl ResultWindow {
     fn status(&self, text: &str, tone: Tone) -> Result<()> {
         self.callback.status_tone.set(tone);
         let text = wide(text);
-        unsafe { SetWindowTextW(self.controls.status, PCWSTR(text.as_ptr())) }
+        unsafe { SetWindowTextW(self.controls.status, PCWSTR(text.as_ptr()))? };
+        if !self.status_visible.get() {
+            // Expand only once, keeping the existing two-line success/error
+            // area. Clamp upwards at the work-area edge so feedback stays on
+            // screen when the picked pixel was close to the taskbar.
+            let dpi = self.dpi()?;
+            let mut bounds = RECT::default();
+            let mut info = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            unsafe {
+                GetWindowRect(self.hwnd, &mut bounds)?;
+                let monitor = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+                if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+                    return Err(Error::from_thread());
+                }
+                let height = dip(CLIENT_HEIGHT_WITH_STATUS, dpi);
+                let top = bounds
+                    .top
+                    .min(info.rcWork.bottom - height)
+                    .max(info.rcWork.top);
+                SetWindowPos(
+                    self.hwnd,
+                    None,
+                    bounds.left,
+                    top,
+                    bounds.right - bounds.left,
+                    height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )?;
+                let _ = ShowWindow(self.controls.status, SW_SHOWNA);
+            }
+            self.status_visible.set(true);
+            self.layout()?;
+        }
+        Ok(())
     }
 
     fn stop_timer(&self) {
@@ -967,7 +1034,7 @@ fn draw_swatch(lparam: LPARAM, color: COLORREF) -> LRESULT {
     LRESULT(1)
 }
 
-fn paint_result(hwnd: HWND) -> LRESULT {
+fn paint_result(hwnd: HWND, border_width_dip: u8) -> LRESULT {
     let mut paint = PAINTSTRUCT::default();
     let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
     if !hdc.is_invalid() {
@@ -989,6 +1056,8 @@ fn paint_result(hwnd: HWND) -> LRESULT {
                 };
                 unsafe { FillRect(hdc, &line, HBRUSH(GetStockObject(DC_BRUSH).0)) };
             }
+            let _ =
+                draw_bottom_right_border(hdc, client.right, client.bottom, dpi, border_width_dip);
             let _ = unsafe { RestoreDC(hdc, saved) };
         }
     }
@@ -1031,7 +1100,7 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         WM_NCLBUTTONDBLCLK if wparam.0 == HTCAPTION as usize => LRESULT(0),
         WM_SYSCOMMAND if matches!((wparam.0 & 0xfff0) as u32, SC_MAXIMIZE | SC_SIZE) => LRESULT(0),
         WM_ERASEBKGND => LRESULT(1),
-        WM_PAINT => paint_result(hwnd),
+        WM_PAINT => paint_result(hwnd, state.border_width_dip),
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {
             let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut _)) } as usize;
             let tone = if id == 12 {
@@ -1107,6 +1176,76 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; displays a result window without copying"]
+    fn feedback_reveals_footer_and_keeps_it_inside_the_work_area() {
+        let result = ResultWindow::new_with_appearance(
+            PickedColor {
+                rgb: crate::core::color::Rgb8::new(244, 242, 242),
+                source: crate::core::geometry::ScreenPointPx { x: 0, y: 0 },
+                kind: SampleKind::Live,
+            },
+            HWND::default(),
+            ColorFormat::Hex,
+            false,
+            AppearanceConfig {
+                border_width_dip: crate::app::config::MAX_BORDER_WIDTH_DIP,
+                ..AppearanceConfig::default()
+            },
+        )
+        .unwrap();
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mut before = RECT::default();
+        unsafe {
+            GetWindowRect(result.hwnd, &mut before).unwrap();
+            let monitor = MonitorFromWindow(result.hwnd, MONITOR_DEFAULTTONEAREST);
+            assert!(GetMonitorInfoW(monitor, &mut info).as_bool());
+            SetWindowPos(
+                result.hwnd,
+                None,
+                before.left,
+                info.rcWork.bottom - (before.bottom - before.top),
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+            .unwrap();
+        }
+        // Use the error path without touching the real clipboard.
+        result
+            .status("剪贴板被占用，无法安排重试。请再次点击复制。", Tone::Error)
+            .unwrap();
+        let mut after = RECT::default();
+        let mut status = RECT::default();
+        unsafe {
+            GetWindowRect(result.hwnd, &mut after).unwrap();
+            GetWindowRect(result.controls.status, &mut status).unwrap();
+            assert!(IsWindowVisible(result.controls.status).as_bool());
+        }
+        assert!(after.bottom - after.top > before.bottom - before.top);
+        assert!(after.bottom <= info.rcWork.bottom);
+        assert!(
+            status.bottom
+                <= after.bottom
+                    - dip(
+                        i32::from(crate::app::config::MAX_BORDER_WIDTH_DIP),
+                        result.dpi().unwrap()
+                    ),
+            "copy feedback must not clip the widest supported bottom border"
+        );
+        assert!(status.top >= after.top);
+        result.status("已复制 HEX：#F4F2F2", Tone::Success).unwrap();
+        let mut repeated = RECT::default();
+        unsafe { GetWindowRect(result.hwnd, &mut repeated) }.unwrap();
+        assert_eq!(
+            repeated, after,
+            "later copies must not grow the window again"
+        );
+    }
 
     #[test]
     fn clipboard_contention_has_three_retries_and_then_goes_idle() {

@@ -352,7 +352,7 @@ impl SettingsWindow {
                 size_of::<BOOL>() as u32,
             )?;
         }
-        theme::configure_window(hwnd);
+        theme::configure_window(hwnd, &window.callback.theme);
         window.create_controls(config)?;
         window.place_initially(cursor)?;
         window.layout()?;
@@ -746,6 +746,7 @@ impl SettingsWindow {
     }
 
     fn layout(&self) -> Result<()> {
+        self.callback.theme.update_window_icons(self.hwnd);
         let dpi = self.dpi()?;
         if self.font.borrow().dpi != dpi {
             let body = Font::new(14, dpi, 400, false)?;

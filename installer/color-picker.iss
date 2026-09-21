@@ -50,6 +50,7 @@ ArchitecturesAllowed=x64os
 ArchitecturesInstallIn64BitMode=x64os
 MinVersion=10.0.19045
 UninstallDisplayIcon={app}\color-picker.exe
+SetupIconFile=..\resources\app.ico
 OutputDir={#OutputDir}
 OutputBaseFilename={#OutputBaseName}
 Compression=lzma2

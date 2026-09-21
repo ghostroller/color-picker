@@ -7,11 +7,12 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW_0, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, IDI_APPLICATION, LoadIconW,
-    MF_STRING, PostMessageW, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_STRING, PostMessageW,
+    SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL,
 };
 use windows::core::{Error, Result, w};
+
+use super::icon::AppIcon;
 
 const ICON_ID: u32 = 1;
 const COMMAND_START: usize = 1;
@@ -26,38 +27,45 @@ pub enum TrayCommand {
     Exit,
 }
 
-/// Owns the shell registration, but never owns the shared system HICON.
+/// Owns the shell registration and the HICON it borrows.
 /// Drop this object before destroying its host window.
 pub struct TrayIcon {
     data: NOTIFYICONDATAW,
     added: bool,
+    icon: AppIcon,
 }
 
 impl TrayIcon {
     pub fn new(hwnd: HWND, callback_message: u32) -> Result<Self> {
-        // LoadIconW with no module returns a shared icon: do not DestroyIcon.
-        let icon = unsafe { LoadIconW(None, IDI_APPLICATION)? };
+        let icon = AppIcon::small_for_window(hwnd)?;
         let mut data = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
             uID: ICON_ID,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP,
             uCallbackMessage: callback_message,
-            hIcon: icon,
+            hIcon: icon.handle(),
             Anonymous: NOTIFYICONDATAW_0 {
                 uVersion: NOTIFYICON_VERSION_4,
             },
             ..Default::default()
         };
-        copy_utf16(&mut data.szTip, "color-picker");
-        let mut tray = Self { data, added: false };
+        copy_utf16(&mut data.szTip, "Color Picker — 点击取色 · 右键打开菜单");
+        let mut tray = Self {
+            data,
+            added: false,
+            icon,
+        };
         tray.add()?;
         Ok(tray)
     }
 
     /// Re-add after the host receives Explorer's registered TaskbarCreated message.
     pub fn recreate(&mut self) -> Result<()> {
+        let icon = AppIcon::small_for_window(self.data.hWnd)?;
         self.remove();
+        self.icon = icon;
+        self.data.hIcon = self.icon.handle();
         self.add()
     }
 

@@ -3,7 +3,7 @@
 //! Controls keep their native keyboard, selection and accessibility behavior.
 //! Brushes/fonts are owned by the window; paint uses stock pens and brushes.
 
-use std::mem::size_of;
+use std::{cell::RefCell, mem::size_of};
 
 use windows::{
     Win32::{
@@ -18,6 +18,7 @@ use windows::{
 };
 
 use super::drawing::dip;
+use crate::platform::windows::icon::WindowIcons;
 
 const CANVAS: COLORREF = rgb(0xf5f7fa);
 const PANEL: COLORREF = rgb(0xffffff);
@@ -54,6 +55,8 @@ impl Tone {
 pub(super) struct Theme {
     canvas: HBRUSH,
     panel: HBRUSH,
+    // The window owner calls DestroyWindow before dropping its Theme.
+    icons: RefCell<Option<WindowIcons>>,
 }
 
 impl Theme {
@@ -67,7 +70,29 @@ impl Theme {
             let _ = unsafe { DeleteObject(HGDIOBJ(canvas.0)) };
             return Err(Error::from_thread());
         }
-        Ok(Self { canvas, panel })
+        Ok(Self {
+            canvas,
+            panel,
+            icons: RefCell::new(None),
+        })
+    }
+
+    pub(super) fn update_window_icons(&self, hwnd: HWND) {
+        if self
+            .icons
+            .borrow()
+            .as_ref()
+            .is_some_and(|icons| icons.matches_window_dpi(hwnd))
+        {
+            return;
+        }
+        // Test executables that construct UI windows directly may not embed
+        // app.rc. Missing optional artwork must not prevent using the window.
+        if let Ok(icons) = WindowIcons::for_window(hwnd) {
+            icons.apply(hwnd);
+            // Replace only after Windows no longer borrows either old icon.
+            self.icons.replace(Some(icons));
+        }
     }
 
     pub(super) fn control_color(&self, hdc: HDC, panel: bool, tone: Tone) -> LRESULT {
@@ -328,7 +353,8 @@ fn draw_button(lparam: LPARAM, primary_id: usize, minimal: bool) -> Option<LRESU
 }
 
 /// Optional caption polish; unsupported attributes are harmless on Windows 10.
-pub(super) fn configure_window(hwnd: HWND) {
+pub(super) fn configure_window(hwnd: HWND, theme: &Theme) {
+    theme.update_window_icons(hwnd);
     unsafe {
         let _ = DwmSetWindowAttribute(
             hwnd,

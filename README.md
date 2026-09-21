@@ -1,136 +1,124 @@
-# color-picker
+<img src="resources/app.svg" width="64" height="64" alt="Color Picker icon">
 
-Windows 原生桌面取色工具。安装包与便携 ZIP 下载见 [GitHub Releases](https://github.com/ghostroller/color-picker/releases)，
-初始公开版本为 `v0.1.0`。技术栈为 Rust、`windows` crate、Win32 原生控件和 GDI。
+# Color Picker
 
-当前进展与验收证据见 [开发记录](docs/progress.md) 和 [验证记录](docs/validation.md)。
-完整实机发布验收尚未完成，平台与采样限制见 [已知限制](docs/known-limitations.md)。
+A native Windows color picker that stays in your system tray. Pick a pixel anywhere on your desktop, freeze and magnify a small area for precision, then copy its color into your design tool or code.
 
-当前已实现 [实现计划](docs/implementation-plan.md) 的 M0–M6 功能及 M7 测量、打包工具。启动后在托盘显示图标；
-按 `Ctrl + Alt + C`、激活托盘或重复启动，开始显示鼠标所在物理像素的颜色、HEX 和坐标。
-取色中重复激活不会叠加会话；右键或 Esc 取消，退出程序请使用托盘菜单。
-鼠标静止时仍检查画面变化，停止预览后释放采样资源和定时器。
-左键确认颜色；取色期间消费鼠标点击和滚轮，结束后释放输入钩子。
-滚轮向上冻结并放大，倍率为 4× / 8× / 16× / 32×；向下滚出 4× 恢复实时取色。
-冻结后在像素格内点击确认，窗外左键点击取消；窗口内部的边框 / 信息栏 / 留白点击不取色。
-确认后打开原生结果窗口，显示 HEX、RGB、CSS RGB、HSL、原始坐标及实时 / 冻结来源。
-每行可单独复制，也可复制默认格式；支持 Tab、Enter、Esc、文本选择和“重新取色”。
-初始默认格式为 HEX，自动复制关闭；托盘“设置”可修改快捷键、默认格式和自动复制。
-点击设置中的主键后，按 A–Z、0–9 或 F1–F11 即可修改；Esc 或离开该控件取消监听。
-取色浮窗仅显示颜色等必要信息，操作说明见设置页。
-点击“应用”才保存；设置窗口打开期间不开始取色。新键冲突或保存失败保留旧设置。
+[Download for Windows](https://github.com/ghostroller/color-picker/releases) · [简体中文](README.zh-CN.md) · [UI previews](docs/ui-preview.md)
 
-配置存储在 Windows Known Folder 对应的 `%LOCALAPPDATA%\color-picker\config.json`。
-缺失时使用默认值；损坏、无法读取或未知版本时保留原文件并禁止覆盖。
-退出程序后修复或移走该文件，再启动即可恢复设置功能；无需手工创建默认配置。
+## Get started
 
-## 构建
+1. Download the Windows x64 **installer** (`*-setup.exe`) or **portable ZIP** from [Releases](https://github.com/ghostroller/color-picker/releases).
+2. Run the installer, or extract the entire ZIP and open `color-picker.exe`. No administrator privileges are required.
+3. Find Color Picker in the system tray, including the hidden-icons area. It starts in the tray without opening a main window.
+4. Press **Ctrl + Alt + C**, move over the color you want, and **left-click** to select it.
+5. In the result window, copy HEX, RGB, CSS RGB, or HSL. Choose **重新取色** (Pick again) to select another color.
 
-需要 Windows x64、Visual Studio C++ Build Tools 和 Windows SDK。
-`rust-toolchain.toml` 固定实际使用的 Rust 版本，`Cargo.lock` 固定依赖。
+The target platform is **Windows 11 x64**. Windows 10 22H2 x64 compatibility has not yet been fully verified. The app's interface is currently **Simplified Chinese**; the installer offers English and Simplified Chinese. Builds are currently unsigned. See [known limitations](docs/known-limitations.md) for the validation status.
+
+## Pick precisely
+
+The live preview follows your pointer and shows the color, HEX value, and physical screen coordinates. It also refreshes when the content under a stationary pointer changes.
+
+| Action | Control |
+| --- | --- |
+| Start picking | **Ctrl + Alt + C**, activate the tray icon, or open the app again |
+| Select the current live pixel | **Left-click** |
+| Freeze the area and zoom in | **Scroll up**: 4× → 8× → 16× → 32× |
+| Zoom out / return to live picking | **Scroll down**; scrolling below 4× resumes live picking |
+| Select a frozen pixel | **Left-click inside the pixel grid** |
+| Cancel picking | **Esc** or **right-click**; in frozen mode, left-clicking outside the preview also cancels |
+
+The frozen preview uses a snapshot, so you can inspect a tiny target without chasing moving content. Clicking its border or information bar does not select a color. While picking, mouse clicks and scrolling are consumed by the picker; normal input resumes when the session ends.
+
+![Frozen pixel grid with a color value and zoom level](docs/images/ui-frozen.png)
+
+Starting again during an active pick does not create another session. Closing a result window leaves the app in the tray. To quit completely, right-click the tray icon and choose **退出** (Exit).
+
+## Copy the format you need
+
+Every result includes the color swatch, original coordinates, and whether it came from live or frozen picking. Values are selectable, and each row has its own **复制** (Copy) button.
+
+| Format | Example |
+| --- | --- |
+| HEX | `#FF0000` |
+| RGB | `255, 0, 0` |
+| CSS RGB | `rgb(255 0 0)` |
+| HSL | `hsl(0 100% 50%)` |
+
+The main Copy button uses your default format, initially HEX. **Automatic copying is off by default**; enable it in Settings if you want each pick copied immediately. The result window supports **Tab**, **Enter**, and **Esc** for keyboard navigation and closing.
+
+![Color result with selectable values and copy controls](docs/images/ui-result.png)
+
+## Make it yours
+
+Right-click the tray icon and open **设置** (Settings).
+
+| Setting | Options | Default |
+| --- | --- | --- |
+| Global shortcut | Ctrl and/or Alt, optional Shift, plus A–Z, 0–9, or F1–F11 | Ctrl + Alt + C |
+| Default copy format | HEX, RGB, CSS RGB, HSL | HEX |
+| Copy automatically after picking | On / off | Off |
+| Border width | 0–6 DIP; 0 hides the border | 2 DIP |
+| Picker background transparency | 0–80%; 0 is opaque | 35% |
+
+To change the shortcut, select its modifiers, click the main-key button, and press the new letter, digit, or function key. **Esc** or moving focus away cancels key recording. F12 is reserved and cannot be used.
+
+Click **应用** (Apply) to save, then close Settings before picking again. Closing without applying discards your edits. If a new shortcut is unavailable or saving fails, the previous settings remain active. Picking previews and the result window share a right and bottom border. Transparency affects the picking previews' information backgrounds; color swatches and magnified pixels stay opaque.
+
+Settings are stored in `%LOCALAPPDATA%\color-picker\config.json`, including for portable use. A missing file uses defaults. If a file is invalid, unreadable, or from an unsupported version, the app preserves it, uses defaults, and disables saving. Exit the app, repair or move that file, then restart; you do not need to create a replacement manually.
+
+## Install, update, and remove
+
+- **Installer:** installs for the current user. Starting at Windows sign-in and creating a desktop shortcut are optional. Sign-in startup is off by default and can be disabled in Windows Startup apps.
+- **Portable ZIP:** extract and run; it does not register a startup entry. Preferences still use the local app-data folder above.
+- **Update:** download and run a newer installer. It preserves preferences and remembers installation choices. There is no background updater.
+- **Uninstall:** remove Color Picker from Windows Installed apps. Your preferences are retained; move or delete `config.json` after exiting if you also want to reset them.
+
+See [Windows installation and maintenance](docs/windows-installer.md) for paths, startup behavior, and upgrade details.
+
+## Privacy and limitations
+
+Color Picker makes no network requests and collects no telemetry. Captured screen data stays in memory. Picking resources and input hooks are released when a session ends.
+
+Sampling is designed for ordinary **8-bit RGB SDR desktops**. HDR/WCG, original alpha, colors before ICC processing, protected content, and the UAC secure desktop are outside the supported scope. Mixed-DPI setups, display changes, RDP, and other edge cases still need broader testing. This version has no color history or saved palettes.
+
+If the shortcut does nothing, try the tray icon, close Settings if it is open, then choose an unused shortcut. For configuration recovery, clipboard failures, and optional file logging, see [Troubleshooting](docs/troubleshooting.md). [Known limitations](docs/known-limitations.md) and [validation records](docs/validation.md) describe what has and has not been checked.
+
+## Develop
+
+The app uses **Rust**, the `windows` crate, native **Win32 controls**, and **GDI**. No web runtime is required.
+
+Build on Windows x64 with Rust (via rustup), Visual Studio C++ Build Tools, and the Windows SDK. The repository pins Rust in [`rust-toolchain.toml`](rust-toolchain.toml) and dependencies in `Cargo.lock`.
 
 ```powershell
 cargo run --locked
 .\scripts\verify-windows.ps1
 ```
 
-在交互 Windows 桌面单独执行桌面测试（开始前关闭已有 color-picker）：
+The verification script checks formatting, Clippy, default tests, an x64 Release build, the embedded manifest, and effective PerMonitorV2 DPI awareness. The Release executable is normally written to `target/x86_64-pc-windows-msvc/release/color-picker.exe`.
+
+Desktop tests require an interactive Windows session. Exit existing Color Picker instances first, keep test windows unobscured, and run them serially:
 
 ```powershell
 cargo test --locked --test windows_capture --test windows_preview --test windows_shell --test windows_selection_ui -- --ignored --test-threads=1 --nocapture
 ```
 
-这些测试显示小型已知像素窗口和预览，检查采样、非激活窗口、资源释放以及停止后不再采样；
-临时启动并关闭自己的实例、占用默认热键验证冲突，并模拟托盘恢复及显示变化消息。
-宿主测试会短暂安装取色钩子；结果窗口测试核对原生控件和文本，不改剪贴板。
-不生成真实键鼠输入，也不重启 Explorer；不能替代人工热键、菜单、多屏 DPI 和 Explorer 重启验收。
-运行时请保持测试窗口无遮挡，不切换前台程序或修改显示设置。
+These tests create temporary windows and app instances, exercise input-hook setup, and temporarily use the default shortcut. They do not generate real keyboard/mouse input or change the clipboard, and do not replace manual display and input testing. Non-Windows systems can run the platform-independent tests with `cargo test --lib --tests --locked`; the app itself is Windows-only.
 
-人工核对像素可运行 `cargo run --locked --example pixel-fixture`：
-窗口客户区为 384×256 像素，局部 `(x, y)` 的 RGB 为 `(x % 256, y % 256, (x ^ y) % 256)`；
-底部 16 行改为每列循环红、绿、蓝的单像素条纹。标题显示客户区物理原点，关闭窗口结束。
-`--check-environment` 检查实际 DPI 上下文后退出；`--diagnostics` 启用按需的宿主状态查询，
-不增加后台采样或日志线程。
+| Location | Purpose |
+| --- | --- |
+| `src/core/` | Color formatting, geometry, zoom mapping, and session state |
+| `src/app/` | Settings, command-line options, diagnostics, and coordination |
+| `src/platform/windows/` | Capture, input, global shortcut, tray, clipboard, and process lifecycle |
+| `src/ui/windows/` | Live and frozen previews, result window, and settings |
+| `tests/`, `examples/` | Logic tests, desktop checks, UI previews, and resource probes |
+| `scripts/`, `installer/` | Verification, packaging, and the per-user installer |
 
-发布构建位于 `target/x86_64-pc-windows-msvc/release/color-picker.exe`。
-非 Windows 平台仅支持 `cargo test --lib --tests --locked` 等纯逻辑检查。
+Build a portable package with `.\scripts\package-windows.ps1`. For an installer, install the pinned Inno Setup version described in [Windows installation](docs/windows-installer.md), then run `.\scripts\package-installer.ps1`. Outputs go to `dist/` with SHA256 checksums. CI verification and packaging workflows are **manually triggered**; pushes and tags do not start them automatically.
 
-## 快捷键无响应时的日志
+Further developer documentation (primarily Chinese): [UI previews](docs/ui-preview.md), [diagnostic logging](docs/troubleshooting.md), [resource probes](docs/resource-probe.md), [running-app measurements](docs/performance-running-app.md), [CI and releases](docs/ci-packaging.md), [implementation plan](docs/implementation-plan.md), and [development records](docs/progress.md). The application icon's vector source is [`resources/app.svg`](resources/app.svg); regenerate its Windows ICO with [the icon script](scripts/generate-icon.ps1).
 
-先从托盘退出已有实例，然后运行：
+## License
 
-```powershell
-.\scripts\start-with-logs.ps1
-```
-
-脚本将构建到独立的 `target/diagnostic` 目录，启动带日志的程序，并输出日志路径及
-实时查看命令。每次启动在 `logs/` 中创建独立文件，不会关闭已有实例。
-**如果旧实例未退出，新进程只激活旧实例后退出，无法给旧版本补开日志。**
-
-也可以为 EXE 显式指定 `--log-file <路径>`，可与 `--check-environment` 或 `--diagnostics` 组合。
-`--diagnostics` 单独使用仍只开启状态查询，不写日志。Release 没有控制台，文件日志可直接读取。
-
-| 日志事件 | 含义 |
-|---|---|
-| `hotkey.registered` | 配置的快捷键已成功注册（初始为 Ctrl+Alt+C） |
-| `hotkey.registration_failed` | 注册失败，后面包含系统错误；可能已被其他程序占用 |
-| `hotkey.received` | 宿主已收到该快捷键的 WM_HOTKEY |
-| `activation.handled` | 已处理激活，开始实时预览 |
-| `activation.ignored` | 预览已开启，忽略重复激活 |
-| `preview.started` | 采样会话及定时器已建立 |
-| `preview.stopped` | 会话结束，定时器和预览资源已释放 |
-| `session.starting` / `session.finishing` | 等待输入就绪 / 正在释放已消费的手势 |
-| `session.frozen` / `session.resumed_live` | 进入冻结放大 / 恢复实时取色 |
-| `result.shown` | 输入与采样资源清理完毕，结果窗口已显示 |
-| `config.applied` / `config.apply_failed` | 设置已保存并生效 / 失败保留原设置 |
-| `preview.sample_unavailable` / `preview.failed` | 采样暂不可用或预览因错误停止 |
-| `tray.notification_accepted` | Windows 已接受通知请求，不保证用户看到了通知 |
-| `tray.balloon_show` | 收到 Shell 的通知显示回调 |
-| `instance.existing` | 发现旧实例，本次日志不会记录旧进程中的快捷键 |
-
-默认不写日志。诊断日志仅记录离散应用事件和错误，不记录一般按键、屏幕像素或剪贴板内容；
-没有日志线程或刷新定时器。单个日志上限 1 MiB，达到上限写入 `log.limit_reached` 后停止记录；
-此时换一个文件路径或重新运行脚本。
-
-## 范围
-
-目标为 Windows 11 x64，Windows 10 22H2 x64 待兼容性验证。
-仅保证普通 SDR 桌面的 8 位 RGB 采样设计，不承诺 HDR、原始 alpha 或受保护内容的颜色。
-不联网、不遥测；屏幕图像只保留在内存中。
-
-## 资源测量与打包
-
-[资源探针说明](docs/resource-probe.md) 提供 100 / 500 / 1000 次受控启动、取消测量，
-输出 CPU、工作集、私有提交、句柄、GDI/USER、线程和首帧提交延迟的原始 JSON。
-工具单独运行，日常应用不增加测量线程或周期任务。
-
-[实际程序性能记录](docs/performance-running-app.md) 另测已有进程的后台、持续实时取色、
-调用延迟和取消后的资源回落；复测工具为 `scripts/measure-running-app.ps1`。
-
-```powershell
-.\scripts\package-windows.ps1
-```
-
-脚本先执行必要检查，再构建 x64 Release，在 `dist/` 下生成独立的预览 ZIP、SHA256。
-包中包含 EXE、使用说明、已知限制、验证记录、依赖许可和源码/编译器信息。
-刚完成同一源码检查时可加 `-SkipChecks`，仍会重新确认 Release 构建。
-另提供当前用户安装版：支持可选登录启动、覆盖升级、阻止降级和保留配置的卸载。
-
-```powershell
-winget install --id JRSoftware.InnoSetup -e --version 6.7.3 --source winget --scope user
-.\scripts\package-installer.ps1
-```
-
-详见 [Windows 安装与维护](docs/windows-installer.md)。GitHub 的 **Package Windows** 和
-**Verify** 工作流都只允许手动运行：Actions → 选择工作流 → Run workflow。
-打包工作流默认输出安装 EXE、便携 ZIP 和 SHA256 至 Actions 产物。
-维护者先创建并推送与 Cargo 版本一致的标签，再手动启用 `publish_release`，即可将同一次构建发布至 GitHub Release：
-
-```powershell
-gh workflow run package-windows.yml --ref v0.1.0 -f publish_release=true
-```
-
-推送代码或标签均不会自动运行 CI。发布命名、版本校验与失败处理见 [CI 打包说明](docs/ci-packaging.md)。
-
-无需管理员权限，不包含后台自动更新。许可状态与发布边界见
-[LICENSE-STATUS.md](LICENSE-STATUS.md) 和 [已知限制](docs/known-limitations.md)。
+A project redistribution license has not yet been selected. See [LICENSE-STATUS.md](LICENSE-STATUS.md). Third-party dependencies retain their own licenses; packaged builds include their license and notice files.

@@ -32,8 +32,8 @@ use windows::{
             BM_CLICK, BM_SETCHECK, CB_GETCOUNT, CreateWindowExW, DestroyWindow, ES_READONLY,
             GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetDlgItem, GetNextDlgTabItem, GetWindowLongW,
             GetWindowRect, GetWindowTextW, HTCAPTION, HTCLIENT, IsDialogMessageW, IsIconic,
-            IsWindow, MSG, SW_RESTORE, SendMessageW, ShowWindow, WINDOW_EX_STYLE, WM_CLOSE,
-            WM_COMMAND, WM_GETDLGCODE, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_NCHITTEST,
+            IsWindow, IsWindowVisible, MSG, SW_RESTORE, SendMessageW, ShowWindow, WINDOW_EX_STYLE,
+            WM_CLOSE, WM_COMMAND, WM_GETDLGCODE, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_NCHITTEST,
             WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_OVERLAPPED,
             WS_TABSTOP,
         },
@@ -163,6 +163,23 @@ fn cached_selection_and_native_result_controls_smoke() {
         (client.right - client.left, client.bottom - client.top),
         (window.right - window.left, window.bottom - window.top),
         "the custom caption must not leave a native nonclient frame"
+    );
+    let status = unsafe { GetDlgItem(Some(result_hwnd), 12) }.unwrap();
+    assert!(!unsafe { IsWindowVisible(status) }.as_bool());
+    let mut button_bounds = RECT::default();
+    unsafe { GetWindowRect(default_copy, &mut button_bounds) }.unwrap();
+    let dpi = unsafe { GetDpiForWindow(result_hwnd) };
+    assert!(
+        window.bottom - button_bounds.bottom <= ((20 * dpi + 48) / 96) as i32,
+        "an unused copy-status footer must not leave a large blank area"
+    );
+    let swatch = unsafe { GetDlgItem(Some(result_hwnd), 10) }.unwrap();
+    let mut swatch_bounds = RECT::default();
+    unsafe { GetWindowRect(swatch, &mut swatch_bounds) }.unwrap();
+    assert_eq!(
+        window.right - swatch_bounds.right,
+        ((2 * dpi + 48) / 96) as i32,
+        "the swatch child must leave the configured right border exposed"
     );
     let hit_test = |point: POINT| {
         // WM_NCHITTEST packs signed screen coordinates into two 16-bit words.

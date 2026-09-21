@@ -230,11 +230,12 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime)
             && !exiting
         {
             result_window.take();
-            match ResultWindow::new_with_options(
+            match ResultWindow::new_with_appearance(
                 picked,
                 hwnd,
                 settings.config.default_format,
                 settings.config.auto_copy_on_pick,
+                settings.config.appearance,
             ) {
                 Ok(window) => {
                     result_window = Some(window);

@@ -44,39 +44,87 @@ try {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'LICENSE-STATUS.md') -Destination $package
     $docs = Join-Path $package 'docs'
     New-Item -ItemType Directory -Path $docs | Out-Null
-    foreach ($name in @('validation.md', 'known-limitations.md', 'resource-probe.md', 'performance-running-app.md', 'ui-preview.md', 'windows-installer.md', 'ci-packaging.md')) {
+    foreach ($name in @('validation.md', 'known-limitations.md', 'troubleshooting.md', 'resource-probe.md', 'performance-running-app.md', 'ui-preview.md', 'windows-installer.md', 'ci-packaging.md')) {
         Copy-Item -LiteralPath (Join-Path $repositoryRoot "docs/$name") -Destination $docs
     }
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'docs/measurements') -Destination $docs -Recurse
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'docs/images') -Destination $docs -Recurse
     $readme = @'
-# color-picker __VERSION____CHANNEL__（Windows x64）
+# Color Picker __VERSION____CHANNEL__ for Windows x64
 
-解压后双击 color-picker.exe；默认 Ctrl + Alt + C 或托盘开始取色。
-左键确认，右键 / Esc 取消，滚轮向上冻结放大、向下缩小；缩出 4× 返回实时。
-冻结取色时左键点击窗外也会取消；操作说明可在设置页查看。
-结果窗口提供 HEX / RGB / CSS RGB / HSL 与复制；托盘“设置”可更改快捷键、
-默认复制格式、自动复制，点击“应用”后保存，重启保留。设置窗口打开时暂停取色入口。
-主键点击后按 A–Z / 0–9 / F1–F11 录入；Esc 或离开该控件取消监听。
-“取色外观”可调节边框粗细（0–6 DIP）与背景透明度（0–80%），默认 2 DIP / 35%。
-点击“应用”后，下次取色生效并在重启后保留；0 DIP 隐藏边框，0% 为不透明背景。
-退出请使用托盘菜单。应用无需管理员权限，没有后台网络功能。
-便携 ZIP 不注册启动项；安装版可选择登录 Windows 时自动启动，详见 docs/windows-installer.md。
+[简体中文](README.zh-CN.md) · [Full user and developer guide](https://github.com/ghostroller/color-picker/blob/main/README.md)
 
-日志：先退出旧实例，在 PowerShell 中运行：
-`.\color-picker.exe --log-file .\color-picker.log`
-默认不写日志；单个日志最多 1 MiB，不记录像素或剪贴板内容。
+A small Windows system tray app for picking screen colors. The app interface is currently in Simplified Chinese.
 
-配置：Windows LocalAppData 下 color-picker/config.json；
-损坏或未知版本不会覆盖，修复/移走后重启。快捷键冲突或保存失败维持原设置。
+1. Extract the ZIP and run `color-picker.exe`. The app stays in the system tray.
+2. Press **Ctrl + Alt + C**, click its tray icon, or choose **开始取色** (Start picking) from the tray menu.
+3. Left-click to pick a color. Copy **HEX**, **RGB**, **CSS RGB**, or **HSL** from the result window.
 
-此包尚未通过全部发布实机矩阵。详见 docs/known-limitations.md、docs/validation.md。
-build-info.json 记录源码、工具链和 EXE 校验值，包外 .sha256 校验 ZIP。
-licenses/ 与 THIRD-PARTY-NOTICES.md 提供依赖许可；项目许可状态见 LICENSE-STATUS.md。
+Right-click or press **Esc** to cancel. Scroll up to freeze and magnify the screen; scroll down to zoom out, returning to live picking below 4×. In frozen mode, clicking outside the picker also cancels.
+
+Choose **设置** (Settings) from the tray menu to change the shortcut, default copy format, automatic copying, border width (0–6 DIP), or background transparency (0–80%). Defaults are 2 DIP and 35%; 0 hides the border or makes the background opaque, respectively. Click **应用** (Apply) to save, then close Settings to resume picking. Saved preferences survive restarts. For the shortcut's main key, click the key button and press A–Z, 0–9, or F1–F11; Esc or leaving the control cancels recording.
+
+Use **退出** (Exit) in the tray menu to quit. Closing a result window leaves the app running. Administrator access is not required, and the app has no background network features.
+
+## Installation and help
+
+The portable ZIP does not register a startup entry. The installer offers optional startup at Windows sign-in; see the [installation guide](docs/windows-installer.md).
+
+Preferences are stored in `%LOCALAPPDATA%\color-picker\config.json`. A damaged file or unknown configuration version is preserved; exit the app, repair or move the file, and restart to restore saving. Shortcut conflicts and failed saves preserve the previous settings. See [troubleshooting](docs/troubleshooting.md) for help.
+
+For diagnostic logging, first exit the running instance, then run this command in PowerShell:
+
+```powershell
+.\color-picker.exe --log-file .\color-picker.log
+```
+
+Logging is off by default, capped at 1 MiB per file, and excludes pixel and clipboard contents.
+
+This build has not passed the full release hardware and environment matrix. See [known limitations](docs/known-limitations.md) and [validation records](docs/validation.md). `build-info.json` records the source, toolchain, and executable checksum; the adjacent `.sha256` file verifies the ZIP.
+
+Dependency notices are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) and `licenses/`. See [LICENSE-STATUS.md](LICENSE-STATUS.md) for the project's license status.
 '@
     $readme = $readme.Replace('__VERSION__', $project.version)
-    $readme = $readme.Replace('__CHANNEL__', $(if ($Release) { '' } else { ' 预览版' }))
+    $readme = $readme.Replace('__CHANNEL__', $(if ($Release) { '' } else { ' preview' }))
     Set-Content -LiteralPath (Join-Path $package 'README.md') -Value $readme -Encoding UTF8
+    $readmeChinese = @'
+# Color Picker __VERSION____CHANNEL__（Windows x64）
+
+[English](README.md) · [完整用户与开发者指南](https://github.com/ghostroller/color-picker/blob/main/README.zh-CN.md)
+
+一款驻留 Windows 系统托盘的轻量屏幕取色工具。当前应用界面为简体中文。
+
+1. 解压 ZIP，运行 `color-picker.exe`；应用会驻留系统托盘。
+2. 按 **Ctrl + Alt + C**、点击托盘图标，或在托盘菜单选择**开始取色**。
+3. 左键确认颜色，然后在结果窗口复制 **HEX**、**RGB**、**CSS RGB** 或 **HSL**。
+
+右键或 **Esc** 取消。滚轮向上冻结并放大画面，向下缩小；缩出 4× 后返回实时取色。冻结模式下，左键点击取色窗口外也会取消。
+
+托盘菜单中的**设置**可更改快捷键、默认复制格式、自动复制、边框粗细（0–6 DIP）和背景透明度（0–80%）。默认边框 2 DIP、透明度 35%；边框设为 0 时隐藏，透明度设为 0 时背景不透明。点击**应用**保存，关闭设置后继续取色，重启后设置仍保留。录入快捷键主键时，点击主键按钮后按 A–Z、0–9 或 F1–F11；Esc 或离开控件取消监听。
+
+退出请使用托盘菜单中的**退出**；关闭结果窗口后应用仍会驻留。应用无需管理员权限，没有后台网络功能。
+
+## 安装与帮助
+
+便携 ZIP 不注册启动项。安装版可选择登录 Windows 时自动启动，详见[安装指南](docs/windows-installer.md)。
+
+配置保存在 `%LOCALAPPDATA%\color-picker\config.json`。损坏或未知版本的文件会保留；退出应用后修复或移走该文件，重新启动即可恢复保存设置。快捷键冲突或保存失败时保留原设置。遇到问题可查看[故障排查](docs/troubleshooting.md)。
+
+需要诊断日志时，先退出旧实例，再在 PowerShell 中运行：
+
+```powershell
+.\color-picker.exe --log-file .\color-picker.log
+```
+
+默认不写日志；单个日志最多 1 MiB，不记录像素或剪贴板内容。
+
+此包尚未通过全部发布实机与环境矩阵，详见[已知限制](docs/known-limitations.md)和[验证记录](docs/validation.md)。`build-info.json` 记录源码、工具链和 EXE 校验值；包外的 `.sha256` 文件用于校验 ZIP。
+
+依赖许可见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) 和 `licenses/`。项目许可状态见 [LICENSE-STATUS.md](LICENSE-STATUS.md)。
+'@
+    $readmeChinese = $readmeChinese.Replace('__VERSION__', $project.version)
+    $readmeChinese = $readmeChinese.Replace('__CHANNEL__', $(if ($Release) { '' } else { ' 预览版' }))
+    Set-Content -LiteralPath (Join-Path $package 'README.zh-CN.md') -Value $readmeChinese -Encoding UTF8
     $licenses = Join-Path $package 'licenses'
     New-Item -ItemType Directory -Path $licenses | Out-Null
     $inventory = [Collections.Generic.List[string]]::new()

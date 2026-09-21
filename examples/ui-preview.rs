@@ -6,6 +6,7 @@
 //! only when explicitly clicked. Settings Apply validates but never saves.
 //! Add --backdrop after the lifetime to preview material over a synthetic pattern.
 //! --border=N / --transparency=N override appearance for this fixture only.
+//! --output=path.bmp exports this fixture's client area, then exits.
 
 #[cfg(not(windows))]
 fn main() {
@@ -37,12 +38,12 @@ mod fixture {
     };
     use windows::{
         Win32::{
-            Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
+            Foundation::{COLORREF, E_FAIL, HWND, LPARAM, LRESULT, RECT, WPARAM},
             Graphics::{Dwm::DwmFlush, Gdi::*},
             System::LibraryLoader::GetModuleHandleW,
             UI::{HiDpi::GetDpiForWindow, WindowsAndMessaging::*},
         },
-        core::{Error, Result, w},
+        core::{BOOL, Error, Result, w},
     };
 
     enum Scene {
@@ -160,13 +161,16 @@ mod fixture {
             }
         }
         let scene = match mode.as_str() {
-            "result" => Scene::Result(ResultWindow::new(
+            "result" => Scene::Result(ResultWindow::new_with_appearance(
                 PickedColor {
                     rgb,
                     source: focus,
                     kind: SampleKind::Live,
                 },
                 owner.0,
+                config.default_format,
+                false,
+                config.appearance,
             )?),
             "settings" => Scene::Settings(SettingsWindow::new(&config, owner.0, None, true)?),
             "live" => {
@@ -228,6 +232,15 @@ mod fixture {
             // retain WDA_EXCLUDEFROMCAPTURE for sampling correctness.
             let _ = SetWindowDisplayAffinity(scene.hwnd(), WDA_NONE);
             let _ = UpdateWindow(scene.hwnd());
+        }
+        if let Some(output) = std::env::args()
+            .find_map(|arg| arg.strip_prefix("--output=").map(std::path::PathBuf::from))
+        {
+            export_bitmap(scene.hwnd(), &output)?;
+            println!("Exported {mode} fixture to {}", output.display());
+            return Ok(());
+        }
+        unsafe {
             if SetTimer(Some(owner.0), 1, seconds * 1000, None) == 0 {
                 return Err(Error::from_thread());
             }
@@ -264,6 +277,126 @@ mod fixture {
             }
         }
         Ok(())
+    }
+
+    // This user32 API is exposed under windows-rs's Storage_Xps feature. Keep
+    // its binding local to the fixture rather than add that production feature.
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn PrintWindow(hwnd: HWND, target: HDC, flags: u32) -> BOOL;
+    }
+
+    struct ExportSurface {
+        dc: HDC,
+        bitmap: HBITMAP,
+        previous: HGDIOBJ,
+    }
+
+    impl Drop for ExportSurface {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.previous.is_invalid() {
+                    SelectObject(self.dc, self.previous);
+                }
+                if !self.bitmap.is_invalid() {
+                    let _ = DeleteObject(self.bitmap.into());
+                }
+                let _ = DeleteDC(self.dc);
+            }
+        }
+    }
+
+    fn export_bitmap(hwnd: HWND, output: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+
+        let mut client = RECT::default();
+        unsafe { GetClientRect(hwnd, &mut client)? };
+        let width = client.right - client.left;
+        let height = client.bottom - client.top;
+        let pixel_bytes = width
+            .checked_mul(height)
+            .and_then(|area| area.checked_mul(4))
+            .filter(|bytes| width > 0 && height > 0 && *bytes <= 64 * 1024 * 1024)
+            .ok_or_else(|| Error::new(E_FAIL, "Invalid fixture export dimensions"))?
+            as u32;
+        let mut surface = ExportSurface {
+            dc: unsafe { CreateCompatibleDC(None) },
+            bitmap: HBITMAP::default(),
+            previous: HGDIOBJ::default(),
+        };
+        if surface.dc.is_invalid() {
+            return Err(Error::from_thread());
+        }
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: 40,
+                biWidth: width,
+                biHeight: -height, // Top-down BGRX matches the exported BMP.
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: pixel_bytes,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut pixels = std::ptr::null_mut();
+        surface.bitmap = unsafe {
+            CreateDIBSection(
+                Some(surface.dc),
+                &info,
+                DIB_RGB_COLORS,
+                &mut pixels,
+                None,
+                0,
+            )?
+        };
+        if pixels.is_null() {
+            return Err(Error::new(E_FAIL, "Fixture bitmap has no pixel storage"));
+        }
+        surface.previous = unsafe { SelectObject(surface.dc, surface.bitmap.into()) };
+        if surface.previous.is_invalid() {
+            return Err(Error::new(E_FAIL, "Could not select fixture bitmap"));
+        }
+        unsafe {
+            let _ = RedrawWindow(
+                Some(hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            );
+            // Print only this process's synthetic fixture into an offscreen
+            // bitmap. No screen DC or pixels from other windows are read here.
+            if !PrintWindow(hwnd, surface.dc, 1 | PW_RENDERFULLCONTENT).as_bool() {
+                return Err(Error::new(E_FAIL, "Could not print fixture window"));
+            }
+            if !GdiFlush().as_bool() {
+                return Err(Error::new(E_FAIL, "Could not flush fixture bitmap"));
+            }
+        }
+        let pixels =
+            unsafe { std::slice::from_raw_parts(pixels.cast::<u8>(), pixel_bytes as usize) };
+        // Write the 14-byte file and 40-byte DIB headers explicitly, avoiding
+        // Rust struct padding and any dependency on an image encoding crate.
+        let mut header = Vec::with_capacity(54);
+        header.extend_from_slice(b"BM");
+        header.extend_from_slice(&(54 + pixel_bytes).to_le_bytes());
+        header.extend_from_slice(&[0; 4]);
+        header.extend_from_slice(&54_u32.to_le_bytes());
+        header.extend_from_slice(&40_u32.to_le_bytes());
+        header.extend_from_slice(&width.to_le_bytes());
+        header.extend_from_slice(&(-height).to_le_bytes());
+        header.extend_from_slice(&1_u16.to_le_bytes());
+        header.extend_from_slice(&32_u16.to_le_bytes());
+        header.extend_from_slice(&0_u32.to_le_bytes());
+        header.extend_from_slice(&pixel_bytes.to_le_bytes());
+        header.extend_from_slice(&[0; 16]);
+        let write = || -> std::io::Result<()> {
+            let mut file = std::fs::File::create(output)?;
+            file.write_all(&header)?;
+            file.write_all(pixels)
+        };
+        write().map_err(|error| Error::new(E_FAIL, format!("Could not save fixture: {error}")))
     }
 
     fn backdrop(focus: ScreenPointPx) -> Result<Owner> {
