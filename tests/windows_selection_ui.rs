@@ -417,6 +417,9 @@ fn cached_selection_and_native_result_controls_smoke() {
         window_text(unsafe { GetDlgItem(Some(settings_content), 24) }.unwrap()),
         "80%"
     );
+    let appearance_preview = unsafe { GetDlgItem(Some(settings_content), 26) }.unwrap();
+    assert!(window_text(appearance_preview).contains("边框 3 DIP，背景透明度 80%"));
+    assert!(unsafe { UpdateWindow(appearance_preview) }.as_bool());
     let mut edited = config.clone();
     edited.appearance.border_width_dip = 3;
     edited.appearance.background_transparency_percent = 80;

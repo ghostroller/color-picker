@@ -19,12 +19,15 @@ use windows::{
             Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute},
             Gdi::*,
         },
-        System::{LibraryLoader::GetModuleHandleW, SystemServices::SS_NOPREFIX},
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            SystemServices::{SS_NOPREFIX, SS_OWNERDRAW},
+        },
         UI::{
             Controls::{
-                EM_GETLINECOUNT, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
-                SetScrollInfo, ShowScrollBar, TBM_SETPAGESIZE, TBM_SETPOS, TBM_SETRANGEMAX,
-                TBM_SETRANGEMIN, TBS_NOTICKS, TRACKBAR_CLASSW,
+                DRAWITEMSTRUCT, EM_GETLINECOUNT, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX,
+                InitCommonControlsEx, SetScrollInfo, ShowScrollBar, TBM_SETPAGESIZE, TBM_SETPOS,
+                TBM_SETRANGEMAX, TBM_SETRANGEMIN, TBS_NOTICKS, TRACKBAR_CLASSW,
             },
             HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
             Input::KeyboardAndMouse::{
@@ -48,6 +51,10 @@ use crate::{
     },
     core::format::ColorFormat,
 };
+
+#[path = "settings_preview.rs"]
+mod settings_preview;
+use settings_preview::AppearancePreview;
 
 pub const WM_SETTINGS_WAKE: u32 = WM_APP + 12;
 const CLASS: PCWSTR = w!("ColorPicker.Settings.v1");
@@ -73,10 +80,13 @@ const BORDER_LABEL: usize = 21;
 const BORDER_VALUE: usize = 22;
 const TRANSPARENCY_LABEL: usize = 23;
 const TRANSPARENCY_VALUE: usize = 24;
+const PREVIEW_HEADING: usize = 25;
+const APPEARANCE_PREVIEW: usize = 26;
+const PREVIEW_HINT: usize = 27;
 const STATUS: usize = 14;
 const CLIENT_WIDTH: i32 = 500;
-const CLIENT_HEIGHT: i32 = 588;
-const CONTENT_HEIGHT: i32 = 524;
+const CLIENT_HEIGHT: i32 = 720;
+const CONTENT_HEIGHT: i32 = 656;
 const FOOTER_HEIGHT: i32 = 64;
 const KEY_SUBCLASS: usize = 1;
 const SCROLL_SUBCLASS: usize = 2;
@@ -102,7 +112,7 @@ const PANELS: [RECT; 3] = [
         left: 24,
         top: 350,
         right: 456,
-        bottom: 466,
+        bottom: 598,
     },
 ];
 
@@ -153,6 +163,7 @@ struct CallbackState {
     scroll_offset: Cell<i32>,
     viewport_height: Cell<i32>,
     wheel_remainder: Cell<i32>,
+    preview: RefCell<Option<AppearancePreview>>,
 }
 
 impl CallbackState {
@@ -228,6 +239,9 @@ struct Controls {
     transparency_label: HWND,
     background_transparency: HWND,
     transparency_value: HWND,
+    preview_heading: HWND,
+    preview: HWND,
+    preview_hint: HWND,
     usage_heading: HWND,
     usage_hint: HWND,
     apply: HWND,
@@ -236,7 +250,7 @@ struct Controls {
 }
 
 impl Controls {
-    fn handles(&self) -> [HWND; 25] {
+    fn handles(&self) -> [HWND; 28] {
         [
             self.title,
             self.subtitle,
@@ -258,6 +272,9 @@ impl Controls {
             self.transparency_label,
             self.background_transparency,
             self.transparency_value,
+            self.preview_heading,
+            self.preview,
+            self.preview_hint,
             self.usage_heading,
             self.usage_hint,
             self.apply,
@@ -336,6 +353,7 @@ impl SettingsWindow {
             scroll_offset: Cell::new(0),
             viewport_height: Cell::new(0),
             wheel_remainder: Cell::new(0),
+            preview: RefCell::new(None),
         });
         let pointer = callback.as_ref() as *const CallbackState;
         let mut cursor = POINT::default();
@@ -611,6 +629,20 @@ impl SettingsWindow {
         )?;
         self.controls.transparency_value =
             self.control(w!("STATIC"), "", TRANSPARENCY_VALUE, label)?;
+        self.controls.preview_heading =
+            self.control(w!("STATIC"), "实时预览 · 示例颜色", PREVIEW_HEADING, label)?;
+        self.controls.preview = self.control(
+            w!("STATIC"),
+            "",
+            APPEARANCE_PREVIEW,
+            WINDOW_STYLE(SS_OWNERDRAW.0),
+        )?;
+        self.controls.preview_hint = self.control(
+            w!("STATIC"),
+            "拖动滑块预览，点击“应用”后生效。",
+            PREVIEW_HINT,
+            label,
+        )?;
         self.controls.usage_heading =
             self.control(w!("STATIC"), "操作提示", USAGE_HEADING, label)?;
         self.controls.usage_hint = self.control(
@@ -737,6 +769,34 @@ impl SettingsWindow {
         ] {
             unsafe { SetWindowTextW(hwnd, PCWSTR(wide(&text).as_ptr()))? };
         }
+        self.update_appearance_preview()
+    }
+
+    fn update_appearance_preview(&self) -> Result<()> {
+        let dpi = self.dpi()?;
+        let appearance = AppearanceConfig {
+            border_width_dip: slider_value(self.controls.border_width)?,
+            background_transparency_percent: slider_value(self.controls.background_transparency)?,
+        };
+        let rebuild = self
+            .callback
+            .preview
+            .borrow()
+            .as_ref()
+            .is_none_or(|preview| !preview.matches(dpi, appearance));
+        if rebuild {
+            self.callback
+                .preview
+                .replace(Some(AppearancePreview::new(dpi, appearance)?));
+            let description = format!(
+                "取色外观示例：#49A7C6，X 1280 Y 720，边框 {} DIP，背景透明度 {}%",
+                appearance.border_width_dip, appearance.background_transparency_percent
+            );
+            unsafe {
+                SetWindowTextW(self.controls.preview, PCWSTR(wide(&description).as_ptr()))?;
+                let _ = InvalidateRect(Some(self.controls.preview), None, false);
+            }
+        }
         Ok(())
     }
 
@@ -858,6 +918,8 @@ impl SettingsWindow {
                 (self.controls.hint, small.0),
                 (self.controls.usage_hint, small.0),
                 (self.controls.status, small.0),
+                (self.controls.preview_heading, small.0),
+                (self.controls.preview_hint, small.0),
             ] {
                 unsafe {
                     SendMessageW(
@@ -930,8 +992,17 @@ impl SettingsWindow {
         place(self.controls.transparency_label, 40, 433, 112, 24)?;
         place(self.controls.background_transparency, 156, 426, 220, 30)?;
         place(self.controls.transparency_value, 388, 433, 56, 24)?;
-        place(self.controls.usage_heading, 24, 478, 64, 20)?;
-        place(self.controls.usage_hint, 96, 478, 360, 40)?;
+        place(self.controls.preview_heading, 40, 464, 396, 20)?;
+        place(
+            self.controls.preview,
+            40,
+            488,
+            settings_preview::WIDTH,
+            settings_preview::HEIGHT,
+        )?;
+        place(self.controls.preview_hint, 40, 564, 396, 20)?;
+        place(self.controls.usage_heading, 24, 610, 64, 20)?;
+        place(self.controls.usage_hint, 96, 610, 360, 40)?;
         let footer_top = viewport_height + dip(8, dpi);
         let button_width = dip(92, dpi);
         let gap = dip(12, dpi);
@@ -979,6 +1050,7 @@ impl SettingsWindow {
             );
         }
         self.update_status_scrollbar()?;
+        self.update_appearance_preview()?;
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
         let _ = unsafe { InvalidateRect(Some(viewport), None, false) };
         Ok(())
@@ -1383,6 +1455,7 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                 ),
                 USAGE_HEADING | USAGE_HINT => (false, Tone::Muted),
                 BORDER_VALUE | TRANSPARENCY_VALUE => (true, Tone::Accent),
+                PREVIEW_HEADING | PREVIEW_HINT => (true, Tone::Muted),
                 APPLY | CLOSE => (false, Tone::Text),
                 _ => (true, Tone::Text),
             };
@@ -1392,6 +1465,17 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         }
         WM_NOTIFY => theme::custom_draw(lparam, APPLY)
             .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }),
+        WM_DRAWITEM if wparam.0 == APPEARANCE_PREVIEW && lparam.0 != 0 => {
+            let draw = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+            if let Some(preview) = state.preview.borrow().as_ref()
+                && let Err(error) = preview.paint(draw.hDC, draw.rcItem)
+            {
+                crate::app::diagnostics::event(format_args!(
+                    "settings.preview_paint_failed {error}"
+                ));
+            }
+            LRESULT(1)
+        }
         WM_CLOSE => {
             state.queue(|pending| pending.close = true);
             LRESULT(0)

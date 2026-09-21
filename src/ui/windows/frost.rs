@@ -180,7 +180,7 @@ impl Drop for FrostedPanel {
     }
 }
 
-fn blur_and_tint(
+pub(super) fn blur_and_tint(
     pixels: &mut [u8],
     scratch: &mut [u8],
     width: usize,
