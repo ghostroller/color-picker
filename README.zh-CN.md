@@ -112,7 +112,7 @@ cargo run --locked
 
 ```powershell
 cargo test --locked --lib -- --ignored --test-threads=1
-cargo test --locked --test windows_capture --test windows_preview --test windows_shell --test windows_selection_ui -- --ignored --test-threads=1 --nocapture
+cargo test --locked --test windows_capture --test windows_preview --test windows_shell --test windows_selection_ui --test windows_language_dropdown -- --ignored --test-threads=1 --nocapture
 ```
 
 这些测试会创建临时窗口和程序实例、检查输入钩子的安装，并短暂占用默认快捷键；不生成真实键鼠输入，也不修改剪贴板，不能替代人工显示和输入验收。非 Windows 平台可用 `cargo test --lib --tests --locked` 运行纯逻辑测试，应用本身仅支持 Windows。

@@ -309,6 +309,10 @@ pub struct SettingsWindow {
     callback: Box<CallbackState>,
     controls: Controls,
     font: RefCell<FontState>,
+    // Keep the bilingual selector's CJK font when localized body fonts change.
+    // Resetting its font can leave the native popup scrolled past the first
+    // choice on the next opening. Rebuild this font only for DPI changes.
+    language_font: RefCell<Option<(u32, Font)>>,
     schema_version: u32,
     save_allowed: bool,
     _thread_affinity: PhantomData<Rc<()>>,
@@ -395,6 +399,7 @@ impl SettingsWindow {
             callback,
             controls: Controls::default(),
             font: RefCell::new(FontState::default()),
+            language_font: RefCell::new(None),
             schema_version: config.schema_version,
             save_allowed,
             _thread_affinity: PhantomData,
@@ -1065,6 +1070,23 @@ impl SettingsWindow {
     fn layout(&self) -> Result<()> {
         self.callback.theme.update_window_icons(self.hwnd);
         let dpi = self.dpi()?;
+        if self
+            .language_font
+            .borrow()
+            .as_ref()
+            .is_none_or(|(font_dpi, _)| *font_dpi != dpi)
+        {
+            let font = Font::for_language(14, dpi, 400, false, Language::SimplifiedChinese)?;
+            unsafe {
+                SendMessageW(
+                    self.controls.language,
+                    WM_SETFONT,
+                    Some(WPARAM(font.0.0 as usize)),
+                    Some(LPARAM(1)),
+                );
+            }
+            self.language_font.replace(Some((dpi, font)));
+        }
         if self.font.borrow().dpi != dpi {
             let body = Font::new(14, dpi, 400, false)?;
             let title = Font::new(20, dpi, 600, false)?;
@@ -1072,6 +1094,9 @@ impl SettingsWindow {
             let small = Font::new(12, dpi, 400, false)?;
             let small_line_height = font_line_height(self.controls.status, small.0, dpi);
             for hwnd in self.controls.handles() {
+                if hwnd == self.controls.language {
+                    continue;
+                }
                 unsafe {
                     SendMessageW(
                         hwnd,

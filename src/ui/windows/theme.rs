@@ -155,6 +155,16 @@ pub(super) struct Font(pub HFONT);
 
 impl Font {
     pub(super) fn new(size_dip: i32, dpi: u32, weight: i32, mono: bool) -> Result<Self> {
+        Self::for_language(size_dip, dpi, weight, mono, language())
+    }
+
+    pub(super) fn for_language(
+        size_dip: i32,
+        dpi: u32,
+        weight: i32,
+        mono: bool,
+        language: Language,
+    ) -> Result<Self> {
         let font = unsafe {
             CreateFontW(
                 -dip(size_dip, dpi),
@@ -173,7 +183,7 @@ impl Font {
                 if mono {
                     w!("Consolas")
                 } else {
-                    match language() {
+                    match language {
                         Language::SimplifiedChinese => w!("Microsoft YaHei UI"),
                         Language::English => w!("Segoe UI"),
                     }

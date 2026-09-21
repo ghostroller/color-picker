@@ -112,7 +112,7 @@ Desktop tests require an interactive Windows session. Exit existing Color Picker
 
 ```powershell
 cargo test --locked --lib -- --ignored --test-threads=1
-cargo test --locked --test windows_capture --test windows_preview --test windows_shell --test windows_selection_ui -- --ignored --test-threads=1 --nocapture
+cargo test --locked --test windows_capture --test windows_preview --test windows_shell --test windows_selection_ui --test windows_language_dropdown -- --ignored --test-threads=1 --nocapture
 ```
 
 These tests create temporary windows and app instances, exercise input-hook setup, and temporarily use the default shortcut. They do not generate real keyboard/mouse input or change the clipboard, and do not replace manual display and input testing. Non-Windows systems can run the platform-independent tests with `cargo test --lib --tests --locked`; the app itself is Windows-only.
