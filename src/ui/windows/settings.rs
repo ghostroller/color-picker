@@ -70,6 +70,7 @@ const FORMAT: usize = 105;
 const AUTO_COPY: usize = 106;
 const BORDER_WIDTH: usize = 107;
 const BACKGROUND_TRANSPARENCY: usize = 108;
+const QUICK_PICK: usize = 109;
 const TITLE: usize = 15;
 const SUBTITLE: usize = 16;
 const COPY_HEADING: usize = 17;
@@ -85,8 +86,8 @@ const APPEARANCE_PREVIEW: usize = 26;
 const PREVIEW_HINT: usize = 27;
 const STATUS: usize = 14;
 const CLIENT_WIDTH: i32 = 500;
-const CLIENT_HEIGHT: i32 = 720;
-const CONTENT_HEIGHT: i32 = 656;
+const CLIENT_HEIGHT: i32 = 750;
+const CONTENT_HEIGHT: i32 = 686;
 const FOOTER_HEIGHT: i32 = 64;
 const KEY_SUBCLASS: usize = 1;
 const SCROLL_SUBCLASS: usize = 2;
@@ -106,13 +107,13 @@ const PANELS: [RECT; 3] = [
         left: 24,
         top: 232,
         right: 456,
-        bottom: 338,
+        bottom: 368,
     },
     RECT {
         left: 24,
-        top: 350,
+        top: 380,
         right: 456,
-        bottom: 598,
+        bottom: 628,
     },
 ];
 
@@ -135,6 +136,7 @@ struct Pending {
     scroll: Option<i32>,
     reveal: Option<HWND>,
     fit_work_area: bool,
+    copy_behavior: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -232,6 +234,7 @@ struct Controls {
     format_label: HWND,
     format: HWND,
     auto_copy: HWND,
+    quick_pick: HWND,
     appearance_heading: HWND,
     border_label: HWND,
     border_width: HWND,
@@ -250,7 +253,7 @@ struct Controls {
 }
 
 impl Controls {
-    fn handles(&self) -> [HWND; 28] {
+    fn handles(&self) -> [HWND; 29] {
         [
             self.title,
             self.subtitle,
@@ -265,6 +268,7 @@ impl Controls {
             self.format_label,
             self.format,
             self.auto_copy,
+            self.quick_pick,
             self.appearance_heading,
             self.border_label,
             self.border_width,
@@ -552,6 +556,9 @@ impl SettingsWindow {
         if pending.appearance {
             self.update_appearance_text()?;
         }
+        if pending.copy_behavior {
+            self.update_copy_behavior();
+        }
         if pending.apply && self.save_allowed {
             match self.read_config() {
                 Ok(config) => match config.validate() {
@@ -612,7 +619,14 @@ impl SettingsWindow {
         self.controls.copy_heading = self.control(w!("STATIC"), "复制行为", COPY_HEADING, label)?;
         self.controls.format_label = self.control(w!("STATIC"), "默认格式", 13, label)?;
         self.controls.format = self.control(w!("COMBOBOX"), "", FORMAT, combo)?;
-        self.controls.auto_copy = self.control(w!("BUTTON"), "取色后自动复制", AUTO_COPY, check)?;
+        self.controls.quick_pick = self.control(
+            w!("BUTTON"),
+            "快速取色（复制后不打开结果窗口）",
+            QUICK_PICK,
+            check,
+        )?;
+        self.controls.auto_copy =
+            self.control(w!("BUTTON"), "普通取色后自动复制", AUTO_COPY, check)?;
         self.controls.appearance_heading =
             self.control(w!("STATIC"), "取色外观", APPEARANCE_HEADING, label)?;
         self.controls.border_label = self.control(w!("STATIC"), "边框粗细", BORDER_LABEL, label)?;
@@ -672,6 +686,8 @@ impl SettingsWindow {
         set_checked(self.controls.alt, config.hotkey.alt);
         set_checked(self.controls.shift, config.hotkey.shift);
         set_checked(self.controls.auto_copy, config.auto_copy_on_pick);
+        set_checked(self.controls.quick_pick, config.quick_pick);
+        self.update_copy_behavior();
         set_slider(
             self.controls.border_width,
             MAX_BORDER_WIDTH_DIP,
@@ -747,6 +763,7 @@ impl SettingsWindow {
             },
             default_format,
             auto_copy_on_pick: checked(self.controls.auto_copy),
+            quick_pick: checked(self.controls.quick_pick),
             appearance: AppearanceConfig {
                 border_width_dip: slider_value(self.controls.border_width)?,
                 background_transparency_percent: slider_value(
@@ -770,6 +787,13 @@ impl SettingsWindow {
             unsafe { SetWindowTextW(hwnd, PCWSTR(wide(&text).as_ptr()))? };
         }
         self.update_appearance_preview()
+    }
+
+    fn update_copy_behavior(&self) {
+        // Keep the ordinary-mode preference intact, even when quick picking
+        // makes copying mandatory. Unchecking quick mode restores this choice.
+        let _ =
+            unsafe { EnableWindow(self.controls.auto_copy, !checked(self.controls.quick_pick)) };
     }
 
     fn update_appearance_preview(&self) -> Result<()> {
@@ -984,25 +1008,26 @@ impl SettingsWindow {
         place(self.controls.copy_heading, 40, 244, 396, 24)?;
         place(self.controls.format_label, 40, 279, 108, 24)?;
         place(self.controls.format, 156, 272, 180, 160)?;
-        place(self.controls.auto_copy, 40, 304, 396, 26)?;
-        place(self.controls.appearance_heading, 40, 362, 396, 24)?;
-        place(self.controls.border_label, 40, 397, 112, 24)?;
-        place(self.controls.border_width, 156, 390, 220, 30)?;
-        place(self.controls.border_value, 388, 397, 56, 24)?;
-        place(self.controls.transparency_label, 40, 433, 112, 24)?;
-        place(self.controls.background_transparency, 156, 426, 220, 30)?;
-        place(self.controls.transparency_value, 388, 433, 56, 24)?;
-        place(self.controls.preview_heading, 40, 464, 396, 20)?;
+        place(self.controls.quick_pick, 40, 304, 396, 26)?;
+        place(self.controls.auto_copy, 40, 334, 396, 26)?;
+        place(self.controls.appearance_heading, 40, 392, 396, 24)?;
+        place(self.controls.border_label, 40, 427, 112, 24)?;
+        place(self.controls.border_width, 156, 420, 220, 30)?;
+        place(self.controls.border_value, 388, 427, 56, 24)?;
+        place(self.controls.transparency_label, 40, 463, 112, 24)?;
+        place(self.controls.background_transparency, 156, 456, 220, 30)?;
+        place(self.controls.transparency_value, 388, 463, 56, 24)?;
+        place(self.controls.preview_heading, 40, 494, 396, 20)?;
         place(
             self.controls.preview,
             40,
-            488,
+            518,
             settings_preview::WIDTH,
             settings_preview::HEIGHT,
         )?;
-        place(self.controls.preview_hint, 40, 564, 396, 20)?;
-        place(self.controls.usage_heading, 24, 610, 64, 20)?;
-        place(self.controls.usage_hint, 96, 610, 360, 40)?;
+        place(self.controls.preview_hint, 40, 594, 396, 20)?;
+        place(self.controls.usage_heading, 24, 640, 64, 20)?;
+        place(self.controls.usage_hint, 96, 640, 360, 40)?;
         let footer_top = viewport_height + dip(8, dpi);
         let button_width = dip(92, dpi);
         let gap = dip(12, dpi);
@@ -1485,6 +1510,7 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                 CLOSE => state.queue(|pending| pending.close = true),
                 APPLY => state.queue(|pending| pending.apply = true),
                 KEY => state.begin_capture(),
+                QUICK_PICK => state.queue(|pending| pending.copy_behavior = true),
                 _ => {}
             }
             LRESULT(0)

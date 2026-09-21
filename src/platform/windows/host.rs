@@ -250,17 +250,23 @@ fn message_loop(
             && !exiting
         {
             result_window.take();
-            match ResultWindow::new_with_appearance(
+            match ResultWindow::new_with_behavior(
                 picked,
                 hwnd,
                 settings.config.default_format,
                 settings.config.auto_copy_on_pick,
                 settings.config.appearance,
+                settings.config.quick_pick,
             ) {
                 Ok(window) => {
                     result_window = Some(window);
                     diagnostics::event(format_args!(
-                        "result.shown resources_released_before_show=true"
+                        "{} resources_released_before_copy=true",
+                        if settings.config.quick_pick {
+                            "result.quick_copy_started"
+                        } else {
+                            "result.shown"
+                        }
                     ));
                 }
                 Err(error) => {

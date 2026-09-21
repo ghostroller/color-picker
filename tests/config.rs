@@ -52,6 +52,7 @@ fn missing_config_defaults_and_valid_changes_round_trip() {
     assert_eq!(loaded.config.hotkey.virtual_key().unwrap(), u32::from(b'C'));
     assert_eq!(loaded.config.default_format, ColorFormat::Hex);
     assert!(!loaded.config.auto_copy_on_pick);
+    assert!(!loaded.config.quick_pick);
     store.save(&loaded.config).unwrap();
     let changed = Config {
         hotkey: HotkeyConfig {
@@ -62,6 +63,7 @@ fn missing_config_defaults_and_valid_changes_round_trip() {
         },
         default_format: ColorFormat::CssRgb,
         auto_copy_on_pick: true,
+        quick_pick: true,
         appearance: AppearanceConfig {
             border_width_dip: 4,
             background_transparency_percent: 65,
@@ -80,15 +82,17 @@ fn missing_config_defaults_and_valid_changes_round_trip() {
 }
 
 #[test]
-fn previous_schema_one_configs_default_missing_appearance_fields() {
+fn previous_schema_one_configs_default_missing_preferences() {
     let directory = TempDirectory::new();
     let store = ConfigStore::new(directory.path());
     let mut previous = serde_json::to_value(Config::default()).unwrap();
     previous.as_object_mut().unwrap().remove("appearance");
+    previous.as_object_mut().unwrap().remove("quick_pick");
     std::fs::write(store.path(), serde_json::to_vec(&previous).unwrap()).unwrap();
     let loaded = store.load();
     assert!(loaded.save_allowed && loaded.warning.is_none());
     assert_eq!(loaded.config.appearance, AppearanceConfig::default());
+    assert!(!loaded.config.quick_pick);
 
     previous["appearance"] = serde_json::json!({"border_width_dip": 5});
     let partial: Config = serde_json::from_value(previous).unwrap();

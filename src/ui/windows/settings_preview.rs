@@ -18,7 +18,8 @@ use crate::app::config::AppearanceConfig;
 pub(super) const WIDTH: i32 = 396;
 pub(super) const HEIGHT: i32 = 72;
 const OVERLAY_WIDTH: i32 = 168;
-const OVERLAY_HEIGHT: i32 = 38;
+// Leave room below the coordinate line even at the maximum 6 DIP border.
+const OVERLAY_HEIGHT: i32 = 44;
 
 pub(super) struct AppearancePreview {
     dpi: u32,

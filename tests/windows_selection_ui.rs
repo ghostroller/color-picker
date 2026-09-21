@@ -264,6 +264,56 @@ fn cached_selection_and_native_result_controls_smoke() {
         settings.process_pending().unwrap(),
         Some(SettingsAction::Apply(config.clone()))
     );
+    let quick = unsafe { GetDlgItem(Some(settings_content), 109) }.unwrap();
+    let automatic = unsafe { GetDlgItem(Some(settings_content), 106) }.unwrap();
+    for ordinary_copy in [false, true] {
+        unsafe {
+            SendMessageW(
+                automatic,
+                BM_SETCHECK,
+                Some(WPARAM(usize::from(ordinary_copy))),
+                None,
+            );
+            SendMessageW(quick, BM_CLICK, None, None);
+        }
+        assert_eq!(
+            settings.process_pending().unwrap(),
+            None,
+            "quick picking remains a draft"
+        );
+        assert!(
+            !unsafe { windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(automatic) }
+                .as_bool()
+        );
+        let mut quick_config = config.clone();
+        quick_config.quick_pick = true;
+        quick_config.auto_copy_on_pick = ordinary_copy;
+        unsafe {
+            SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None);
+        }
+        assert_eq!(
+            settings.process_pending().unwrap(),
+            Some(SettingsAction::Apply(quick_config))
+        );
+        unsafe {
+            SendMessageW(quick, BM_CLICK, None, None);
+        }
+        assert_eq!(settings.process_pending().unwrap(), None);
+        assert!(
+            unsafe { windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(automatic) }
+                .as_bool()
+        );
+        let mut normal_config = config.clone();
+        normal_config.auto_copy_on_pick = ordinary_copy;
+        unsafe {
+            SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None);
+        }
+        assert_eq!(
+            settings.process_pending().unwrap(),
+            Some(SettingsAction::Apply(normal_config)),
+            "turning off quick picking restores the ordinary copy preference"
+        );
+    }
     let border = unsafe { GetDlgItem(Some(settings_content), 107) }.unwrap();
     let transparency = unsafe { GetDlgItem(Some(settings_content), 108) }.unwrap();
     let apply = unsafe { GetDlgItem(Some(settings_hwnd), 1) }.unwrap();

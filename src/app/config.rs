@@ -25,6 +25,8 @@ pub struct Config {
     pub default_format: ColorFormat,
     pub auto_copy_on_pick: bool,
     #[serde(default)]
+    pub quick_pick: bool,
+    #[serde(default)]
     pub appearance: AppearanceConfig,
 }
 
@@ -35,6 +37,7 @@ impl Default for Config {
             hotkey: HotkeyConfig::default(),
             default_format: ColorFormat::Hex,
             auto_copy_on_pick: false,
+            quick_pick: false,
             appearance: AppearanceConfig::default(),
         }
     }

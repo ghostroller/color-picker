@@ -224,6 +224,7 @@ pub struct ResultWindow {
     copy: RefCell<CopyState>,
     copied_target: Cell<Option<CopyTarget>>,
     status_visible: Cell<bool>,
+    quick_pick_pending: Cell<bool>,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
@@ -253,6 +254,26 @@ impl ResultWindow {
         default_format: ColorFormat,
         auto_copy: bool,
         appearance: AppearanceConfig,
+    ) -> Result<Self> {
+        Self::new_with_behavior(
+            picked,
+            notify_hwnd,
+            default_format,
+            auto_copy,
+            appearance,
+            false,
+        )
+    }
+
+    /// Quick picks copy after input cleanup without showing or activating this
+    /// window. A final copy failure reveals it so the color can still be used.
+    pub fn new_with_behavior(
+        picked: PickedColor,
+        notify_hwnd: HWND,
+        default_format: ColorFormat,
+        auto_copy: bool,
+        appearance: AppearanceConfig,
+        quick_pick: bool,
     ) -> Result<Self> {
         let instance = unsafe { GetModuleHandleW(None)? }.into();
         let class = WNDCLASSW {
@@ -314,6 +335,7 @@ impl ResultWindow {
             copy: RefCell::new(CopyState::default()),
             copied_target: Cell::new(None),
             status_visible: Cell::new(false),
+            quick_pick_pending: Cell::new(quick_pick),
             _thread_affinity: PhantomData,
         };
         theme::configure_window(hwnd, &window.callback.theme);
@@ -342,12 +364,10 @@ impl ResultWindow {
         window.create_controls()?;
         window.place_initially()?;
         window.layout()?;
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
-            let _ = SetForegroundWindow(hwnd);
-            let _ = SetFocus(Some(window.controls.default_copy));
+        if !quick_pick {
+            window.show_result();
         }
-        if auto_copy {
+        if auto_copy || quick_pick {
             // The host constructs this window only after capture/input cleanup.
             // Clipboard access stays in process_pending, just like button copies.
             window.callback.queue(|pending| {
@@ -362,6 +382,14 @@ impl ResultWindow {
 
     pub fn hwnd(&self) -> HWND {
         self.hwnd
+    }
+
+    fn show_result(&self) {
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_SHOWNORMAL);
+            let _ = SetForegroundWindow(self.hwnd);
+            let _ = SetFocus(Some(self.controls.default_copy));
+        }
     }
 
     /// Called on the creating UI thread, after the host receives WM_RESULT_WAKE.
@@ -882,13 +910,38 @@ impl ResultWindow {
             return Ok(());
         };
         let text = format_color(self.picked.rgb, request.target.format);
-        match Clipboard::copy_text(self.hwnd, &text) {
+        let outcome = Clipboard::copy_text(self.hwnd, &text);
+        self.finish_copy_attempt(request, outcome)
+    }
+
+    fn copy_failed(&self, text: &str) -> Result<()> {
+        self.status(text, Tone::Error)?;
+        // Once a failed quick pick is visible, retry behaves like any other
+        // result window. Its later successful copies do not dismiss it.
+        if self.quick_pick_pending.replace(false) {
+            self.show_result();
+        }
+        Ok(())
+    }
+
+    fn finish_copy_attempt(
+        &self,
+        request: CopyRequest,
+        outcome: std::result::Result<(), ClipboardError>,
+    ) -> Result<()> {
+        match outcome {
             Ok(()) => {
                 self.copy.borrow_mut().0 = None;
-                self.show_copy_feedback(request.target)
+                if self.quick_pick_pending.replace(false) {
+                    self.callback
+                        .queue(|pending| pending.action = Some(ResultAction::Close));
+                    Ok(())
+                } else {
+                    self.show_copy_feedback(request.target)
+                }
             }
             Err(ClipboardError::Busy) => {
-                let retry = self.copy.borrow_mut().reserve_retry(token);
+                let retry = self.copy.borrow_mut().reserve_retry(request.token);
                 if retry {
                     // Every arming has a fresh ID, including retries within one
                     // copy request. An already queued WM_TIMER cannot shorten
@@ -896,18 +949,17 @@ impl ResultWindow {
                     let timer = next_copy_token()?;
                     if unsafe { SetTimer(Some(self.hwnd), timer, RETRY_MS, None) } == 0 {
                         self.copy.borrow_mut().0 = None;
-                        return self
-                            .status("剪贴板被占用，无法安排重试。请再次点击复制。", Tone::Error);
+                        return self.copy_failed("剪贴板被占用，无法安排重试。请再次点击复制。");
                     }
                     self.callback.active_timer.set(timer);
                     Ok(())
                 } else {
-                    self.status("复制失败：剪贴板仍被占用。请再次点击复制。", Tone::Error)
+                    self.copy_failed("复制失败：剪贴板仍被占用。请再次点击复制。")
                 }
             }
             Err(ClipboardError::Other(error)) => {
                 self.copy.borrow_mut().0 = None;
-                self.status(&format!("复制失败：{error}"), Tone::Error)
+                self.copy_failed(&format!("复制失败：{error}"))
             }
         }
     }
@@ -1376,6 +1428,114 @@ mod tests {
 
     fn target(format: ColorFormat, button_id: usize) -> CopyTarget {
         CopyTarget { format, button_id }
+    }
+
+    fn quick_result() -> ResultWindow {
+        ResultWindow::new_with_behavior(
+            PickedColor {
+                rgb: crate::core::color::Rgb8::new(244, 242, 242),
+                source: crate::core::geometry::ScreenPointPx { x: 0, y: 0 },
+                kind: SampleKind::Frozen,
+            },
+            HWND::default(),
+            ColorFormat::CssRgb,
+            false,
+            AppearanceConfig::default(),
+            true,
+        )
+        .unwrap()
+    }
+
+    fn take_initial_copy(result: &ResultWindow) -> CopyRequest {
+        // Drive only the outcome path: these desktop checks deliberately do
+        // not read or write the user's real clipboard.
+        let target = result.callback.pending.take().copy.unwrap();
+        assert_eq!(target.format, ColorFormat::CssRgb);
+        let token = next_copy_token().unwrap();
+        result.copy.borrow_mut().replace(token, target);
+        result.copy.borrow().matching(token).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; checks a hidden result without copying"]
+    fn quick_copy_success_keeps_focus_and_queues_cleanup_without_showing() {
+        let foreground = unsafe { GetForegroundWindow() };
+        let result = quick_result();
+        assert!(!unsafe { IsWindowVisible(result.hwnd) }.as_bool());
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+        assert!(result.quick_pick_pending.get());
+        let request = take_initial_copy(&result);
+        result.finish_copy_attempt(request, Ok(())).unwrap();
+        assert!(!unsafe { IsWindowVisible(result.hwnd) }.as_bool());
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+        assert_eq!(result.callback.feedback_timer.get(), 0);
+        assert_eq!(result.process_pending().unwrap(), Some(ResultAction::Close));
+        assert!(result.copy.borrow().0.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; displays copy failure without copying"]
+    fn quick_copy_retries_hidden_then_reveals_failure_for_manual_recovery() {
+        let result = quick_result();
+        let request = take_initial_copy(&result);
+        let mut previous_timer = 0;
+        for _ in 0..MAX_RETRIES {
+            result.stop_timer();
+            result
+                .finish_copy_attempt(request, Err(ClipboardError::Busy))
+                .unwrap();
+            let timer = result.callback.active_timer.get();
+            assert_ne!(timer, 0);
+            assert_ne!(timer, previous_timer);
+            previous_timer = timer;
+            assert!(!unsafe { IsWindowVisible(result.hwnd) }.as_bool());
+            assert!(!result.status_visible.get());
+        }
+        result.stop_timer();
+        result
+            .finish_copy_attempt(request, Err(ClipboardError::Busy))
+            .unwrap();
+        assert!(unsafe { IsWindowVisible(result.hwnd) }.as_bool());
+        assert!(unsafe { IsWindowVisible(result.controls.status) }.as_bool());
+        assert!(result.status_visible.get());
+        assert!(!result.quick_pick_pending.get());
+        assert!(result.copy.borrow().0.is_none());
+        assert_eq!(result.callback.active_timer.get(), 0);
+
+        // A manual successful retry keeps the recovered result available.
+        unsafe {
+            SendMessageW(
+                result.hwnd,
+                WM_COMMAND,
+                Some(WPARAM(COPY_DEFAULT | ((BN_CLICKED as usize) << 16))),
+                Some(LPARAM(result.controls.default_copy.0 as isize)),
+            )
+        };
+        let manual_request = take_initial_copy(&result);
+        assert_ne!(manual_request.token, request.token);
+        result.finish_copy_attempt(manual_request, Ok(())).unwrap();
+        assert!(unsafe { IsWindowVisible(result.hwnd) }.as_bool());
+        assert!(!result.status_visible.get());
+        assert_eq!(result.process_pending().unwrap(), None);
+        assert_ne!(result.callback.feedback_timer.get(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; displays copy failure without copying"]
+    fn quick_copy_non_busy_failure_reveals_result_immediately() {
+        let result = quick_result();
+        let request = take_initial_copy(&result);
+        result
+            .finish_copy_attempt(
+                request,
+                Err(ClipboardError::Other(Error::new(E_FAIL, "test failure"))),
+            )
+            .unwrap();
+        assert!(unsafe { IsWindowVisible(result.hwnd) }.as_bool());
+        assert!(result.status_visible.get());
+        assert!(!result.quick_pick_pending.get());
+        assert_eq!(result.callback.active_timer.get(), 0);
+        assert_eq!(result.process_pending().unwrap(), None);
     }
 
     #[test]
