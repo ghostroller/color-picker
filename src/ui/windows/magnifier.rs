@@ -30,7 +30,6 @@ use super::frost::FrostedPanel;
 use crate::{
     app::{config::AppearanceConfig, diagnostics},
     core::{
-        color::Rgb8,
         format::{ColorFormat, format_color},
         geometry::{ScreenPointPx, ScreenRectPx},
         state::{PickedColor, SampleKind},
@@ -54,12 +53,9 @@ struct State {
 
 #[derive(Default)]
 struct Footer {
-    rgb: Option<Rgb8>,
     hex: Vec<u16>,
     scale: Vec<u16>,
     coordinates: Vec<u16>,
-    x: Vec<u16>,
-    y: Vec<u16>,
 }
 
 impl State {
@@ -92,12 +88,9 @@ impl State {
             },
         );
         self.footer = Footer {
-            rgb: self.hover.map(|pixel| pixel.rgb),
             hex: hex.encode_utf16().collect(),
             scale: format!("{factor}×").encode_utf16().collect(),
             coordinates: format!("{x}  {y}").encode_utf16().collect(),
-            x: x.encode_utf16().collect(),
-            y: y.encode_utf16().collect(),
         };
     }
 
@@ -411,10 +404,15 @@ fn window_layout(
             / initial_scale
             * initial_scale
     };
-    let width = axis(image_width, i64::from(work.width()));
-    let footer = i64::from(footer_height(width as i32, dpi));
+    let viewport_width = axis(image_width, i64::from(work.width()));
+    // Text follows display scaling; source pixels keep their exact integer
+    // magnification. Reserve a single row without stretching the pixel grid.
+    let width = viewport_width
+        .max(i64::from(dip(260, dpi)))
+        .min(i64::from(work.width()));
+    let footer = i64::from(footer_height(dpi));
     let viewport_height = axis(image_height, i64::from(work.height()) - footer);
-    if width < 32 || viewport_height < 32 {
+    if viewport_width < 32 || viewport_height < 32 {
         return Err(failure("工作区空间不足，无法显示完整像素格"));
     }
     let height = viewport_height + footer;
@@ -428,36 +426,39 @@ fn window_layout(
         right: (left + width) as i32,
         bottom: (top + height) as i32,
     };
+    // Near a monitor edge, keep the original pointer over the pixel grid,
+    // rather than over the extra space reserved for the information row.
+    let viewport_left =
+        (i64::from(focus.x) - viewport_width / 2).clamp(left, left + width - viewport_width);
     let viewport = ScreenRectPx {
-        left: bounds.left,
+        left: viewport_left as i32,
         top: bounds.top,
-        right: bounds.right,
+        right: (viewport_left + viewport_width) as i32,
         bottom: (top + viewport_height) as i32,
     };
     Ok((bounds, viewport))
 }
 
-fn compact_footer(width: i32, dpi: u32) -> bool {
-    // The heading-font HEX plus swatch, badge and widest border needs more
-    // than 132 DIP. Edge captures must use the smaller, swatch-free layout.
-    width < dip(144, dpi)
+fn footer_height(dpi: u32) -> i32 {
+    dip(28, dpi)
 }
 
-fn narrow_footer(width: i32, dpi: u32) -> bool {
-    width < dip(88, dpi)
-}
-
-fn footer_height(width: i32, dpi: u32) -> i32 {
-    // Edge captures can be only 33 source pixels wide. Stack the coordinates
-    // there, and the zoom badge at high DPI, to retain legible full labels.
-    let height = if narrow_footer(width, dpi) {
-        68
-    } else if compact_footer(width, dpi) {
-        54
-    } else {
-        44
+fn footer_columns(width: i32, dpi: u32, border: i32) -> [RECT; 3] {
+    let right = (width - border - dip(4, dpi)).max(0);
+    let column = |left, top, end| RECT {
+        left: dip(left, dpi).min(right),
+        top: dip(top, dpi),
+        right: dip(end, dpi).min(right),
+        bottom: footer_height(dpi) - border,
     };
-    dip(height, dpi)
+    [
+        column(4, 3, 84),
+        column(88, 6, 112),
+        RECT {
+            right,
+            ..column(120, 6, 120)
+        },
+    ]
 }
 
 fn compact_rows(image: &mut FrozenImage) -> Result<()> {
@@ -588,14 +589,9 @@ impl Surface {
         let heading_font = OwnedFont::new(13, 600, dpi)?;
         let body_font = OwnedFont::new(10, 400, dpi)?;
         let frost = if capture_excluded && appearance.background_transparency_percent != 0 {
-            let panel_left = if compact_footer(width, dpi) {
-                0
-            } else {
-                dip(24, dpi)
-            };
             match FrostedPanel::new(
-                width - panel_left,
-                footer_height(width, dpi),
+                width,
+                footer_height(dpi),
                 dip(6, dpi),
                 appearance.background_transparency_percent,
             ) {
@@ -773,11 +769,9 @@ impl Surface {
             },
             palette::PANEL,
         )?;
-        let compact = compact_footer(self.width, self.dpi);
-        let narrow = narrow_footer(self.width, self.dpi);
         if let Some(frost) = &self.frost {
             let panel = RECT {
-                left: if compact { 0 } else { dip(24, self.dpi) },
+                left: 0,
                 top,
                 right: self.width,
                 bottom: self.height,
@@ -798,83 +792,32 @@ impl Surface {
                 self.fill(panel, palette::PANEL)?;
             }
         }
-        let text_left = if compact {
-            // The image already displays this color. Omit the redundant swatch
-            // when an edge crop needs the available width for labels.
-            dip(2, self.dpi)
-        } else {
-            let swatch = RECT {
-                left: 0,
-                top,
-                right: dip(24, self.dpi),
-                bottom: self.height,
-            };
-            self.fill(
-                swatch,
-                footer.rgb.map_or(palette::EMPTY, |rgb| {
-                    COLORREF(u32::from(rgb.r) | (u32::from(rgb.g) << 8) | (u32::from(rgb.b) << 16))
-                }),
-            )?;
-            swatch.right + dip(2, self.dpi)
-        };
         let border = border_thickness(
             self.width,
             self.height,
             self.dpi,
             self.appearance.border_width_dip,
         );
-        let right = self.width - border - dip(2, self.dpi);
-        let badge_left = (right - dip(24, self.dpi)).max(text_left);
-        draw_text(
-            self.dc.0,
-            if compact {
-                &self.body_font
-            } else {
-                &self.heading_font
-            },
-            RECT {
-                left: text_left,
-                top: top + dip(if compact { 6 } else { 3 }, self.dpi),
-                right: if narrow {
-                    right
-                } else {
-                    badge_left - dip(2, self.dpi)
-                },
-                bottom: top + dip(22, self.dpi),
-            },
-            palette::TEXT,
-            &footer.hex,
-        )?;
-        draw_text(
-            self.dc.0,
-            &self.body_font,
-            RECT {
-                left: if narrow { text_left } else { badge_left },
-                top: top + dip(if narrow { 20 } else { 6 }, self.dpi),
-                right,
-                bottom: top + dip(if narrow { 34 } else { 22 }, self.dpi),
-            },
-            palette::ACCENT,
-            &footer.scale,
-        )?;
-        let coordinate_rows: &[(i32, &[u16])] = if narrow {
-            &[(34, &footer.x), (48, &footer.y)]
-        } else if compact {
-            &[(22, &footer.x), (36, &footer.y)]
-        } else {
-            &[(23, &footer.coordinates)]
-        };
-        for &(offset, text) in coordinate_rows {
+        let columns = footer_columns(self.width, self.dpi, border);
+        for (rect, font, color, text) in [
+            (columns[0], &self.heading_font, palette::TEXT, &footer.hex),
+            (columns[1], &self.body_font, palette::ACCENT, &footer.scale),
+            (
+                columns[2],
+                &self.body_font,
+                palette::SECONDARY,
+                &footer.coordinates,
+            ),
+        ] {
             draw_text(
                 self.dc.0,
-                &self.body_font,
+                font,
                 RECT {
-                    left: text_left,
-                    top: top + dip(offset, self.dpi),
-                    right,
-                    bottom: self.height - border,
+                    top: top + rect.top,
+                    bottom: (top + rect.bottom).min(self.height - border),
+                    ..rect
                 },
-                palette::SECONDARY,
+                color,
                 text,
             )?;
         }
@@ -1042,40 +985,29 @@ mod tests {
     }
 
     #[test]
-    fn edge_footer_has_room_for_full_labels_at_supported_desktop_scaling() {
+    fn single_row_footer_has_room_for_full_labels_at_supported_desktop_scaling() {
         for dpi in [96, 120, 144, 168, 192] {
-            let width = 132;
-            let compact = compact_footer(width, dpi);
-            let narrow = narrow_footer(width, dpi);
-            let surface =
-                Surface::new(640, dip(24, dpi), dpi, false, AppearanceConfig::default()).unwrap();
-            let left = dip(if compact { 2 } else { 26 }, dpi);
+            let width = dip(260, dpi);
+            let surface = Surface::new(
+                640,
+                footer_height(dpi),
+                dpi,
+                false,
+                AppearanceConfig::default(),
+            )
+            .unwrap();
             // Test against the thickest supported border, including a 5-digit
             // negative source coordinate and the widest common HEX glyphs.
-            let right = width - dip(8, dpi);
-            let hex_width = if narrow {
-                right - left
-            } else {
-                right - left - dip(26, dpi)
-            };
+            let columns = footer_columns(width, dpi, dip(6, dpi));
+            assert!(columns[0].right < columns[1].left);
+            assert!(columns[1].right < columns[2].left);
+            assert!(columns[0].top < columns[2].bottom && columns[2].top < columns[0].bottom);
             let rows = [
-                ("#DDDDDD", hex_width, !compact),
-                (
-                    "32×",
-                    if narrow { right - left } else { dip(24, dpi) },
-                    false,
-                ),
-                (
-                    if compact {
-                        "X -65535"
-                    } else {
-                        "X -65535  Y -65535"
-                    },
-                    right - left,
-                    false,
-                ),
+                ("#DDDDDD", columns[0], true),
+                ("32×", columns[1], false),
+                ("X -65535  Y -65535", columns[2], false),
             ];
-            for (label, available, heading) in rows {
+            for (label, column, heading) in rows {
                 let rect = RECT {
                     left: 0,
                     top: 0,
@@ -1103,8 +1035,20 @@ mod tests {
                     })
                     .unwrap();
                 assert!(
-                    last_ink < available,
-                    "{label} clips at {dpi} DPI: {last_ink} >= {available}"
+                    last_ink < column.right - column.left,
+                    "{label} clips at {dpi} DPI: {last_ink} >= {}",
+                    column.right - column.left
+                );
+                let last_row = (0..surface.height)
+                    .rev()
+                    .find(|&y| {
+                        (0..surface.width)
+                            .any(|x| unsafe { GetPixel(surface.dc.0, x, y) } != palette::PANEL)
+                    })
+                    .unwrap();
+                assert!(
+                    last_row < column.bottom - column.top,
+                    "{label} clips vertically at {dpi} DPI"
                 );
             }
         }
@@ -1219,12 +1163,13 @@ mod tests {
             assert_eq!(window.intersection(work), Some(window));
             assert_eq!(viewport.width(), viewport.height());
             assert_eq!(viewport.width(), dip(240, dpi).min(260) as u32 / 4 * 4);
-            assert_eq!(viewport.left, window.left);
+            assert!(viewport.left >= window.left && viewport.right <= window.right);
+            assert!(viewport.contains(ScreenPointPx { x: -1199, y: -699 }));
             assert_eq!(viewport.top, window.top);
-            assert_eq!(window.width(), viewport.width());
+            assert_eq!(window.width(), dip(260, dpi) as u32);
             assert_eq!(
                 window.height(),
-                viewport.height() + footer_height(window.width() as i32, dpi) as u32
+                viewport.height() + footer_height(dpi) as u32
             );
             assert!(viewport.width() >= 32);
             assert!(viewport.bottom < window.bottom);
@@ -1258,8 +1203,9 @@ mod tests {
             window_layout(ScreenPointPx { x: -1, y: -1 }, work, 168, 33, 65).unwrap();
         assert_eq!(viewport.width(), 132);
         assert_eq!(viewport.height(), 260);
-        assert_eq!(window.height(), 379);
-        assert!(compact_footer(window.width() as i32, 168));
+        assert_eq!(window.height(), 309);
+        assert_eq!(window.width(), dip(260, 168) as u32);
+        assert!(viewport.left <= -1 && viewport.right > -1);
         assert_eq!(window.intersection(work), Some(window));
         let mut view = ZoomView::new(
             image(33, 65),
@@ -1304,7 +1250,7 @@ mod tests {
         };
         let (window, viewport) =
             window_layout(ScreenPointPx { x: -1, y: -1 }, small_work, 96, 65, 65).unwrap();
-        assert_eq!((viewport.width(), viewport.height()), (116, 48));
+        assert_eq!((viewport.width(), viewport.height()), (116, 72));
         assert_eq!(window.intersection(small_work), Some(window));
     }
 
