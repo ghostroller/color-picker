@@ -11,7 +11,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_STRING, PostMessageW, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     TrackPopupMenu, WM_NULL,
 };
-use windows::core::{Error, Result, w};
+use windows::core::{Error, PCWSTR, Result};
+
+use crate::app::i18n::tr;
 
 use super::icon::AppIcon;
 
@@ -51,7 +53,13 @@ impl TrayIcon {
             },
             ..Default::default()
         };
-        copy_utf16(&mut data.szTip, "Color Picker — 点击取色 · 右键打开菜单");
+        copy_utf16(
+            &mut data.szTip,
+            tr(
+                "Color Picker — 点击取色 · 右键打开菜单",
+                "Color Picker — Click to pick · Right-click for menu",
+            ),
+        );
         let mut tray = Self {
             data,
             added: false,
@@ -71,8 +79,9 @@ impl TrayIcon {
     }
 
     pub fn update_shortcut(&mut self, shortcut: &str, registered: bool) -> Result<()> {
-        let text = format!(
+        let text = crate::tr_format!(
             "Color Picker · {}\n点击取色 · 右键打开菜单",
+            "Color Picker · {}\nClick to pick · Right-click for menu",
             shortcut_status(shortcut, registered)
         );
         copy_utf16(&mut self.data.szTip, &text);
@@ -83,7 +92,10 @@ impl TrayIcon {
         } else {
             Err(Error::new(
                 E_FAIL,
-                "Could not update the notification tooltip",
+                tr(
+                    "无法更新托盘提示",
+                    "Could not update the notification tooltip",
+                ),
             ))
         }
     }
@@ -91,13 +103,19 @@ impl TrayIcon {
     fn add(&mut self) -> Result<()> {
         // Shell_NotifyIcon does not promise a useful GetLastError value.
         if !unsafe { Shell_NotifyIconW(NIM_ADD, &self.data) }.as_bool() {
-            return Err(Error::new(E_FAIL, "Could not add the notification icon"));
+            return Err(Error::new(
+                E_FAIL,
+                tr("无法添加托盘图标", "Could not add the notification icon"),
+            ));
         }
         if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &self.data) }.as_bool() {
             let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &self.data) };
             return Err(Error::new(
                 E_FAIL,
-                "Could not enable notification icon version 4",
+                tr(
+                    "无法启用托盘图标",
+                    "Could not enable notification icon version 4",
+                ),
             ));
         }
         // Both operations must succeed before we advertise a usable registration.
@@ -118,7 +136,10 @@ impl TrayIcon {
         if !self.added {
             return Err(Error::new(
                 E_FAIL,
-                "The notification icon is not registered",
+                tr(
+                    "托盘图标尚未注册",
+                    "The notification icon is not registered",
+                ),
             ));
         }
         let mut data = self.data;
@@ -129,7 +150,10 @@ impl TrayIcon {
         if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
             Ok(())
         } else {
-            Err(Error::new(E_FAIL, "Could not queue the tray notification"))
+            Err(Error::new(
+                E_FAIL,
+                tr("无法发送托盘通知", "Could not queue the tray notification"),
+            ))
         }
     }
 
@@ -145,14 +169,22 @@ impl TrayIcon {
         // does not access the tray's Rust state while that loop is active.
         let data = self.data;
         let menu = PopupMenu(unsafe { CreatePopupMenu()? });
-        let status: Vec<u16> = format!("快捷键：{}", shortcut_status(shortcut, registered))
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-        let start_label: Vec<u16> = format!("开始取色\t{shortcut}")
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
+        let status: Vec<u16> = crate::tr_format!(
+            "快捷键：{}",
+            "Shortcut: {}",
+            shortcut_status(shortcut, registered)
+        )
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+        let start_label: Vec<u16> =
+            crate::tr_format!("开始取色\t{shortcut}", "Pick a color\t{shortcut}")
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+        let stop_label = wide(tr("停止预览", "Stop preview"));
+        let settings_label = wide(tr("设置", "Settings"));
+        let exit_label = wide(tr("退出", "Exit"));
         unsafe {
             AppendMenuW(
                 menu.0,
@@ -162,13 +194,18 @@ impl TrayIcon {
             )?;
             AppendMenuW(menu.0, MF_SEPARATOR, 0, None)?;
             let start_text = if preview_active {
-                w!("停止预览")
+                PCWSTR(stop_label.as_ptr())
             } else {
                 windows::core::PCWSTR(start_label.as_ptr())
             };
             AppendMenuW(menu.0, MF_STRING, COMMAND_START, start_text)?;
-            AppendMenuW(menu.0, MF_STRING, COMMAND_SETTINGS, w!("设置"))?;
-            AppendMenuW(menu.0, MF_STRING, COMMAND_EXIT, w!("退出"))?;
+            AppendMenuW(
+                menu.0,
+                MF_STRING,
+                COMMAND_SETTINGS,
+                PCWSTR(settings_label.as_ptr()),
+            )?;
+            AppendMenuW(menu.0, MF_STRING, COMMAND_EXIT, PCWSTR(exit_label.as_ptr()))?;
         }
         let mut point = POINT::default();
         unsafe { GetCursorPos(&mut point)? };
@@ -206,20 +243,31 @@ impl TrayIcon {
             })),
             COMMAND_SETTINGS => Ok(Some(TrayCommand::Settings)),
             COMMAND_EXIT => Ok(Some(TrayCommand::Exit)),
-            _ => Err(Error::new(E_FAIL, "Unexpected notification menu command")),
+            _ => Err(Error::new(
+                E_FAIL,
+                tr(
+                    "无法识别托盘菜单操作",
+                    "Unexpected notification menu command",
+                ),
+            )),
         }
     }
 }
 
 fn shortcut_status(shortcut: &str, registered: bool) -> String {
-    format!(
+    crate::tr_format!(
         "{shortcut}（{}）",
+        "{shortcut} ({})",
         if registered {
-            "已注册"
+            tr("已注册", "registered")
         } else {
-            "不可用，请在设置中修改"
+            tr("不可用，请在设置中修改", "unavailable; change in Settings")
         }
     )
+}
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(Some(0)).collect()
 }
 
 impl Drop for TrayIcon {
@@ -259,10 +307,18 @@ mod tests {
 
     #[test]
     fn shortcut_status_reports_the_current_chord_and_registration_failure() {
+        use crate::app::i18n::{Language, set_language};
+        set_language(Language::SimplifiedChinese);
         assert_eq!(shortcut_status("Alt + F7", true), "Alt + F7（已注册）");
         assert_eq!(
             shortcut_status("Ctrl + Shift + C", false),
             "Ctrl + Shift + C（不可用，请在设置中修改）"
+        );
+        set_language(Language::English);
+        assert_eq!(shortcut_status("Alt + F7", true), "Alt + F7 (registered)");
+        assert_eq!(
+            shortcut_status("Ctrl + Shift + C", false),
+            "Ctrl + Shift + C (unavailable; change in Settings)"
         );
     }
 

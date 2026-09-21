@@ -14,10 +14,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{BOOL, Error, Result, w};
+use windows::core::{BOOL, Error, PCWSTR, Result, w};
 
 use super::drawing::{Content, PaintSession, Surface, dip, live_preview_height_dip};
-use crate::app::{config::AppearanceConfig, diagnostics};
+use crate::app::{config::AppearanceConfig, diagnostics, i18n::tr};
 use crate::core::color::Rgb8;
 use crate::core::format::{ColorFormat, format_color};
 use crate::core::geometry::{ScreenPointPx, ScreenRectPx};
@@ -70,6 +70,10 @@ impl PreviewWindow {
         }
         let state = Box::new(RefCell::new(State::default()));
         let pointer = state.as_ref() as *const RefCell<State>;
+        let title: Vec<u16> = tr("实时取色 — Color Picker", "Live picker — Color Picker")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
         let hwnd = unsafe {
             CreateWindowExW(
                 // Establish the intended z-order at creation; some desktops
@@ -80,7 +84,7 @@ impl PreviewWindow {
                     | WS_EX_LAYERED
                     | WS_EX_TRANSPARENT,
                 CLASS_NAME,
-                w!("color-picker preview"),
+                PCWSTR(title.as_ptr()),
                 WS_POPUP,
                 0,
                 0,
@@ -155,7 +159,7 @@ impl PreviewWindow {
         if content_changed {
             let color_text = rgb
                 .map(|color| format_color(color, ColorFormat::Hex))
-                .unwrap_or_else(|| "暂不可采样".to_owned());
+                .unwrap_or_else(|| tr("暂不可采样", "Unavailable").to_owned());
             let content = Content {
                 rgb,
                 color_text: color_text.encode_utf16().collect(),
@@ -190,7 +194,10 @@ impl PreviewWindow {
                 self.hide();
                 return Err(Error::new(
                     E_FAIL,
-                    "工作区空间不足，无法在避开采样点的位置显示预览",
+                    tr(
+                        "工作区空间不足，无法在避开采样点的位置显示预览",
+                        "Not enough screen space to show the preview away from the sampled pixel",
+                    ),
                 ));
             };
             let rebuild = self.state.borrow().surface.as_ref().is_none_or(|surface| {
@@ -238,7 +245,13 @@ impl PreviewWindow {
     fn prepare_target_monitor(&self, point: ScreenPointPx, work_area: ScreenRectPx) -> Result<()> {
         if work_area.is_empty() {
             self.hide();
-            return Err(Error::new(E_FAIL, "预览工作区为空"));
+            return Err(Error::new(
+                E_FAIL,
+                tr(
+                    "预览工作区为空",
+                    "No screen space is available for the preview",
+                ),
+            ));
         }
         let target = unsafe {
             MonitorFromPoint(
@@ -251,7 +264,13 @@ impl PreviewWindow {
         };
         if target.is_invalid() {
             self.hide();
-            return Err(Error::new(E_FAIL, "预览采样点未位于有效显示器"));
+            return Err(Error::new(
+                E_FAIL,
+                tr(
+                    "预览采样点未位于有效显示器",
+                    "The sampled pixel is outside the available displays",
+                ),
+            ));
         }
         if unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONULL) } != target {
             // A 400%-DPI window can be wider than a small 100%-DPI monitor even
@@ -270,7 +289,13 @@ impl PreviewWindow {
                 )?
             };
             if unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONULL) } != target {
-                return Err(Error::new(E_FAIL, "无法将预览定位到采样点所在显示器"));
+                return Err(Error::new(
+                    E_FAIL,
+                    tr(
+                        "无法将预览定位到采样点所在显示器",
+                        "Could not move the preview to the sampled display",
+                    ),
+                ));
             }
         }
         Ok(())

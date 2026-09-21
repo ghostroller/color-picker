@@ -6,6 +6,7 @@
 //! only when explicitly clicked. Settings Apply validates but never saves.
 //! Add --backdrop after the lifetime to preview material over a synthetic pattern.
 //! --border=N / --transparency=N override appearance for this fixture only.
+//! --language=en / --language=zh-CN select the interface language without saving.
 //! --output=path.bmp exports this fixture's client area, then exits.
 
 #[cfg(not(windows))]
@@ -21,7 +22,10 @@ fn main() -> windows::core::Result<()> {
 #[cfg(windows)]
 mod fixture {
     use color_picker::{
-        app::config::Config,
+        app::{
+            config::Config,
+            i18n::{self, Language, tr},
+        },
         core::{
             color::Rgb8,
             geometry::ScreenPointPx,
@@ -68,8 +72,16 @@ mod fixture {
                 Self::Result(window) => Ok(window.process_pending()?.is_some()),
                 Self::Settings(window) => match window.process_pending()? {
                     Some(SettingsAction::Close) => Ok(true),
-                    Some(SettingsAction::Apply(_)) => {
-                        window.show_status("设置有效。当前为界面预览，未写入配置。", true)?;
+                    Some(SettingsAction::Apply(config)) => {
+                        i18n::set_language(config.language);
+                        window.refresh_language()?;
+                        window.show_status(
+                            tr(
+                                "设置有效。当前为界面预览，未写入配置。",
+                                "Settings validated. This preview does not save changes.",
+                            ),
+                            true,
+                        )?;
                         Ok(false)
                     }
                     None => Ok(false),
@@ -92,6 +104,19 @@ mod fixture {
         let mode = std::env::args().nth(1).unwrap_or_else(|| "result".into());
         let mut config = Config::default();
         for arg in std::env::args().skip(2) {
+            if let Some(code) = arg.strip_prefix("--language=") {
+                config.language = match code {
+                    "en" => Language::English,
+                    "zh-CN" => Language::SimplifiedChinese,
+                    _ => {
+                        return Err(Error::new(
+                            windows::Win32::Foundation::E_INVALIDARG,
+                            "--language must be en or zh-CN",
+                        ));
+                    }
+                };
+                continue;
+            }
             let value = if let Some(value) = arg.strip_prefix("--border=") {
                 Some((&mut config.appearance.border_width_dip, value))
             } else {
@@ -111,6 +136,7 @@ mod fixture {
                 })?;
             }
         }
+        i18n::set_language(config.language);
         config.validate().map_err(|error| {
             Error::new(windows::Win32::Foundation::E_INVALIDARG, error.to_string())
         })?;

@@ -11,6 +11,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use super::i18n::{Language, tr};
 use crate::core::format::ColorFormat;
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -27,6 +28,8 @@ pub struct Config {
     #[serde(default)]
     pub quick_pick: bool,
     #[serde(default)]
+    pub language: Language,
+    #[serde(default)]
     pub appearance: AppearanceConfig,
 }
 
@@ -38,6 +41,7 @@ impl Default for Config {
             default_format: ColorFormat::Hex,
             auto_copy_on_pick: false,
             quick_pick: false,
+            language: Language::default(),
             appearance: AppearanceConfig::default(),
         }
     }
@@ -74,14 +78,16 @@ impl Default for AppearanceConfig {
 impl AppearanceConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.border_width_dip > MAX_BORDER_WIDTH_DIP {
-            return Err(ConfigError::InvalidAppearance(
+            return Err(ConfigError::InvalidAppearance(tr(
                 "边框粗细必须在 0–6 DIP 之间",
-            ));
+                "Border width must be between 0 and 6 DIP",
+            )));
         }
         if self.background_transparency_percent > MAX_BACKGROUND_TRANSPARENCY_PERCENT {
-            return Err(ConfigError::InvalidAppearance(
+            return Err(ConfigError::InvalidAppearance(tr(
                 "背景透明度必须在 0–80% 之间",
-            ));
+                "Background transparency must be between 0% and 80%",
+            )));
         }
         Ok(())
     }
@@ -110,7 +116,10 @@ impl Default for HotkeyConfig {
 impl HotkeyConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !self.ctrl && !self.alt {
-            return Err(ConfigError::InvalidHotkey("快捷键至少需要包含 Ctrl 或 Alt"));
+            return Err(ConfigError::InvalidHotkey(tr(
+                "快捷键至少需要包含 Ctrl 或 Alt",
+                "The shortcut must include Ctrl or Alt",
+            )));
         }
         self.key_code().map(|_| ())
     }
@@ -138,9 +147,10 @@ impl HotkeyConfig {
             "F10" => 10,
             "F11" => 11,
             _ => {
-                return Err(ConfigError::InvalidHotkey(
+                return Err(ConfigError::InvalidHotkey(tr(
                     "主键仅支持 A–Z、0–9、F1–F11；F12 为系统保留键",
-                ));
+                    "Use A–Z, 0–9 or F1–F11; F12 is reserved by Windows",
+                )));
             }
         };
         // Win32 virtual-key codes: VK_F1 = 0x70, subsequent F-keys are contiguous.
@@ -184,28 +194,28 @@ pub enum ConfigError {
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedSchema(version) => write!(
-                formatter,
-                "不支持配置版本 {version}，当前仅支持版本 {SCHEMA_VERSION}"
-            ),
+            Self::UnsupportedSchema(version) => formatter.write_str(&crate::tr_format!(
+                "不支持配置版本 {version}，当前仅支持版本 {SCHEMA_VERSION}",
+                "Unsupported settings version {version}; this app supports version {SCHEMA_VERSION}"
+            )),
             Self::InvalidHotkey(reason) => formatter.write_str(reason),
             Self::InvalidAppearance(reason) => formatter.write_str(reason),
-            Self::InvalidJson(error) => write!(formatter, "配置 JSON 无效：{error}"),
+            Self::InvalidJson(error) => formatter.write_str(&crate::tr_format!("配置 JSON 无效：{error}", "Invalid settings JSON: {error}")),
             Self::Io {
                 operation,
                 path,
                 source,
-            } => write!(formatter, "{operation}（{}）：{source}", path.display()),
-            Self::ExistingFileProtected { path, reason } => write!(
-                formatter,
+            } => formatter.write_str(&crate::tr_format!("{operation}（{}）：{source}", "{operation} ({}): {source}", path.display())),
+            Self::ExistingFileProtected { path, reason } => formatter.write_str(&crate::tr_format!(
                 "不会覆盖无法识别的原配置 {}：{reason}；请先修复或移走该文件并重新启动",
+                "The unrecognized settings file {} will not be overwritten: {reason}. Repair or move it, then restart the app",
                 path.display()
-            ),
-            Self::ChangedDuringSave(path) => write!(
-                formatter,
+            )),
+            Self::ChangedDuringSave(path) => formatter.write_str(&crate::tr_format!(
                 "保存期间配置文件 {} 已被修改，本次未覆盖；请重新加载后再试",
+                "The settings file {} changed during saving and was not overwritten. Reload and try again",
                 path.display()
-            ),
+            )),
         }
     }
 }
@@ -255,8 +265,9 @@ impl ConfigStore {
             Err(error) => LoadedConfig {
                 config: Config::default(),
                 save_allowed: false,
-                warning: Some(format!(
-                    "配置无法使用：{error}。已使用默认设置；请修复或移走原文件并重新启动，当前不会覆盖该文件。"
+                warning: Some(crate::tr_format!(
+                    "配置无法使用：{error}。已使用默认设置；请修复或移走原文件并重新启动，当前不会覆盖该文件。",
+                    "Cannot use the settings file: {error}. Defaults are active. Repair or move the original file, then restart. It will not be overwritten."
                 )),
             },
         }
@@ -280,11 +291,16 @@ impl ConfigStore {
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        std::fs::create_dir_all(parent)
-            .map_err(|source| io_error("无法创建配置目录", parent, source))?;
+        std::fs::create_dir_all(parent).map_err(|source| {
+            io_error(
+                tr("无法创建配置目录", "Could not create the settings folder"),
+                parent,
+                source,
+            )
+        })?;
         let name = self.path.file_name().ok_or_else(|| {
             io_error(
-                "配置路径不是文件",
+                tr("配置路径不是文件", "The settings path is not a file"),
                 &self.path,
                 io::Error::new(io::ErrorKind::InvalidInput, "missing filename"),
             )
@@ -304,8 +320,16 @@ impl ConfigStore {
         if current != previous {
             return Err(ConfigError::ChangedDuringSave(self.path.clone()));
         }
-        std::fs::rename(&temporary.path, &self.path)
-            .map_err(|source| io_error("无法原子替换配置文件，原配置已保留", &self.path, source))?;
+        std::fs::rename(&temporary.path, &self.path).map_err(|source| {
+            io_error(
+                tr(
+                    "无法原子替换配置文件，原配置已保留",
+                    "Could not replace the settings file; the original has been preserved",
+                ),
+                &self.path,
+                source,
+            )
+        })?;
         temporary.committed = true;
         Ok(())
     }
@@ -314,7 +338,13 @@ impl ConfigStore {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(io_error("无法读取配置文件", &self.path, source)),
+            Err(source) => {
+                return Err(io_error(
+                    tr("无法读取配置文件", "Could not read the settings file"),
+                    &self.path,
+                    source,
+                ));
+            }
         };
         // Inspect the version first so a newer schema reports a clear version
         // error even when it introduces fields this version cannot deserialize.
@@ -368,11 +398,23 @@ impl TemporaryConfig {
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(source) => return Err(io_error("无法创建配置临时文件", &path, source)),
+                Err(source) => {
+                    return Err(io_error(
+                        tr(
+                            "无法创建配置临时文件",
+                            "Could not create a temporary settings file",
+                        ),
+                        &path,
+                        source,
+                    ));
+                }
             }
         }
         Err(io_error(
-            "无法分配唯一配置临时文件",
+            tr(
+                "无法分配唯一配置临时文件",
+                "Could not allocate a unique temporary settings file",
+            ),
             parent,
             io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -383,10 +425,26 @@ impl TemporaryConfig {
 
     fn write(&mut self, bytes: &[u8]) -> Result<(), ConfigError> {
         if let Some(file) = self.file.as_mut() {
-            file.write_all(bytes)
-                .map_err(|source| io_error("无法写入配置临时文件", &self.path, source))?;
-            file.sync_all()
-                .map_err(|source| io_error("无法同步配置临时文件", &self.path, source))?;
+            file.write_all(bytes).map_err(|source| {
+                io_error(
+                    tr(
+                        "无法写入配置临时文件",
+                        "Could not write the temporary settings file",
+                    ),
+                    &self.path,
+                    source,
+                )
+            })?;
+            file.sync_all().map_err(|source| {
+                io_error(
+                    tr(
+                        "无法同步配置临时文件",
+                        "Could not flush the temporary settings file",
+                    ),
+                    &self.path,
+                    source,
+                )
+            })?;
         }
         // Close before rename, including on Windows where open handles can
         // prevent a replacement. Drop also closes before cleaning a failure.

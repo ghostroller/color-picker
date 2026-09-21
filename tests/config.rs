@@ -1,5 +1,6 @@
 use color_picker::{
     app::config::{AppearanceConfig, Config, ConfigStore, HotkeyConfig},
+    app::i18n::Language,
     core::format::ColorFormat,
 };
 use std::{
@@ -64,6 +65,7 @@ fn missing_config_defaults_and_valid_changes_round_trip() {
         default_format: ColorFormat::CssRgb,
         auto_copy_on_pick: true,
         quick_pick: true,
+        language: Language::English,
         appearance: AppearanceConfig {
             border_width_dip: 4,
             background_transparency_percent: 65,
@@ -88,11 +90,13 @@ fn previous_schema_one_configs_default_missing_preferences() {
     let mut previous = serde_json::to_value(Config::default()).unwrap();
     previous.as_object_mut().unwrap().remove("appearance");
     previous.as_object_mut().unwrap().remove("quick_pick");
+    previous.as_object_mut().unwrap().remove("language");
     std::fs::write(store.path(), serde_json::to_vec(&previous).unwrap()).unwrap();
     let loaded = store.load();
     assert!(loaded.save_allowed && loaded.warning.is_none());
     assert_eq!(loaded.config.appearance, AppearanceConfig::default());
     assert!(!loaded.config.quick_pick);
+    assert_eq!(loaded.config.language, Language::default());
 
     previous["appearance"] = serde_json::json!({"border_width_dip": 5});
     let partial: Config = serde_json::from_value(previous).unwrap();
@@ -200,6 +204,29 @@ fn unsupported_keys_and_strict_json_are_rejected() {
     let mut value = serde_json::to_value(Config::default()).unwrap();
     value["default_format"] = "unknown".into();
     assert!(serde_json::from_value::<Config>(value).is_err());
+    let mut value = serde_json::to_value(Config::default()).unwrap();
+    value["language"] = "fr".into();
+    assert!(serde_json::from_value::<Config>(value).is_err());
+}
+
+#[test]
+fn both_interface_languages_round_trip_without_changing_other_preferences() {
+    let directory = TempDirectory::new();
+    let store = ConfigStore::new(directory.path());
+    for language in [Language::English, Language::SimplifiedChinese] {
+        let config = Config {
+            language,
+            quick_pick: true,
+            ..Config::default()
+        };
+        store.save(&config).unwrap();
+        let restored = store.load();
+        assert!(restored.warning.is_none() && restored.save_allowed);
+        assert_eq!(restored.config, config);
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+        assert_eq!(json["language"], language.code());
+    }
 }
 
 #[test]

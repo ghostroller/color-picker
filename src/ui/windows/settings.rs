@@ -45,9 +45,12 @@ use super::{
     theme::{self, Font, Theme, Tone},
 };
 use crate::{
-    app::config::{
-        AppearanceConfig, Config, HotkeyConfig, MAX_BACKGROUND_TRANSPARENCY_PERCENT,
-        MAX_BORDER_WIDTH_DIP,
+    app::{
+        config::{
+            AppearanceConfig, Config, HotkeyConfig, MAX_BACKGROUND_TRANSPARENCY_PERCENT,
+            MAX_BORDER_WIDTH_DIP,
+        },
+        i18n::{Language, tr},
     },
     core::format::ColorFormat,
 };
@@ -71,6 +74,8 @@ const AUTO_COPY: usize = 106;
 const BORDER_WIDTH: usize = 107;
 const BACKGROUND_TRANSPARENCY: usize = 108;
 const QUICK_PICK: usize = 109;
+const LANGUAGE: usize = 110;
+const LANGUAGE_LABEL: usize = 28;
 const TITLE: usize = 15;
 const SUBTITLE: usize = 16;
 const COPY_HEADING: usize = 17;
@@ -223,6 +228,8 @@ impl CallbackState {
 struct Controls {
     title: HWND,
     subtitle: HWND,
+    language_label: HWND,
+    language: HWND,
     hotkey_label: HWND,
     ctrl: HWND,
     alt: HWND,
@@ -253,10 +260,12 @@ struct Controls {
 }
 
 impl Controls {
-    fn handles(&self) -> [HWND; 29] {
+    fn handles(&self) -> [HWND; 31] {
         [
             self.title,
             self.subtitle,
+            self.language_label,
+            self.language,
             self.hotkey_label,
             self.ctrl,
             self.alt,
@@ -318,7 +327,10 @@ impl SettingsWindow {
             .ok_or_else(|| {
                 Error::new(
                     E_FAIL,
-                    "Configured hotkey is outside the supported key list",
+                    tr(
+                        "配置的快捷键不在支持的按键列表中",
+                        "Configured hotkey is outside the supported key list",
+                    ),
                 )
             })?;
         let instance = unsafe { GetModuleHandleW(None)? }.into();
@@ -366,7 +378,7 @@ impl SettingsWindow {
             CreateWindowExW(
                 EX_STYLE,
                 CLASS,
-                w!("设置 — Color Picker"),
+                PCWSTR(wide(tr("设置 — Color Picker", "Settings — Color Picker")).as_ptr()),
                 STYLE,
                 cursor.x,
                 cursor.y,
@@ -401,7 +413,7 @@ impl SettingsWindow {
             CreateWindowExW(
                 WS_EX_CONTROLPARENT,
                 CONTENT_CLASS,
-                w!("设置内容"),
+                PCWSTR(wide(tr("设置内容", "Settings content")).as_ptr()),
                 WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL,
                 0,
                 0,
@@ -416,12 +428,14 @@ impl SettingsWindow {
         window.callback.viewport.set(viewport);
         window.create_controls(config)?;
         window.place_initially(cursor)?;
-        window.layout()?;
-        window.update_default_style();
+        window.refresh_language()?;
         let default_notice = if save_allowed {
-            "点击“应用”保存更改。"
+            tr("点击“应用”保存更改。", "Click Apply to save changes.")
         } else {
-            "当前配置只读，无法应用更改。"
+            tr(
+                "当前配置只读，无法应用更改。",
+                "Settings are read-only; changes cannot be applied.",
+            )
         };
         let status = match (notice, save_allowed) {
             (Some(notice), false) => format!("{notice}\r\n{default_notice}"),
@@ -447,6 +461,94 @@ impl SettingsWindow {
 
     pub fn hwnd(&self) -> HWND {
         self.hwnd
+    }
+
+    /// Relabel the existing draft only after the host successfully applies it.
+    /// Controls, selections and scroll position stay intact during the switch.
+    pub fn refresh_language(&self) -> Result<()> {
+        for (hwnd, text) in [
+            (
+                self.hwnd,
+                tr("设置 — Color Picker", "Settings — Color Picker"),
+            ),
+            (
+                self.callback.viewport.get(),
+                tr("设置内容", "Settings content"),
+            ),
+            (self.controls.title, tr("偏好设置", "Preferences")),
+            (
+                self.controls.subtitle,
+                tr(
+                    "自定义快捷键、复制方式和取色外观",
+                    "Customize the shortcut, copying and appearance",
+                ),
+            ),
+            (self.controls.language_label, tr("语言", "Language")),
+            (
+                self.controls.hotkey_label,
+                tr("取色快捷键", "Picking shortcut"),
+            ),
+            (self.controls.key_label, tr("主键", "Key")),
+            (self.controls.copy_heading, tr("复制行为", "Copying")),
+            (self.controls.format_label, tr("默认格式", "Default format")),
+            (
+                self.controls.quick_pick,
+                tr(
+                    "快速取色（复制后不打开结果窗口）",
+                    "Quick pick (copy without opening the result)",
+                ),
+            ),
+            (
+                self.controls.auto_copy,
+                tr(
+                    "普通取色后自动复制",
+                    "Automatically copy after a normal pick",
+                ),
+            ),
+            (
+                self.controls.appearance_heading,
+                tr("取色外观", "Picker appearance"),
+            ),
+            (self.controls.border_label, tr("边框粗细", "Border width")),
+            (self.controls.border_width, tr("边框粗细", "Border width")),
+            (
+                self.controls.transparency_label,
+                tr("背景透明度", "Transparency"),
+            ),
+            (
+                self.controls.background_transparency,
+                tr("背景透明度", "Background transparency"),
+            ),
+            (
+                self.controls.preview_heading,
+                tr("实时预览 · 示例颜色", "Live preview · Sample colors"),
+            ),
+            (
+                self.controls.preview_hint,
+                tr(
+                    "拖动滑块预览，点击“应用”后生效。",
+                    "Drag to preview. Click Apply to save.",
+                ),
+            ),
+            (self.controls.usage_heading, tr("操作提示", "Tips")),
+            (
+                self.controls.usage_hint,
+                tr(
+                    "左键确认 · 右键 / Esc 取消 · 窗外左键取消\r\n上滚轮冻结并放大 · 下滚轮缩小",
+                    "Click to pick · Right-click / Esc / outside to cancel\r\nScroll up to freeze / zoom in · Down to zoom out",
+                ),
+            ),
+            (self.controls.close, tr("关闭", "Close")),
+            (self.controls.apply, tr("应用", "Apply")),
+        ] {
+            unsafe { SetWindowTextW(hwnd, PCWSTR(wide(text).as_ptr()))? };
+        }
+        self.update_capture_text()?;
+        self.font.borrow_mut().dpi = 0;
+        self.callback.preview.replace(None);
+        self.layout()?;
+        self.update_default_style();
+        Ok(())
     }
 
     /// Run before IsDialogMessage: a key consumed during recording stays owned
@@ -497,7 +599,13 @@ impl SettingsWindow {
     pub fn process_pending(&self) -> Result<Option<SettingsAction>> {
         self.callback.wake_posted.set(false);
         if self.callback.wake_failed.replace(false) {
-            return Err(Error::new(E_FAIL, "Could not queue settings-window work"));
+            return Err(Error::new(
+                E_FAIL,
+                tr(
+                    "无法处理设置窗口操作",
+                    "Could not queue settings-window work",
+                ),
+            ));
         }
         let pending = self.callback.pending.take();
         if pending.close {
@@ -580,25 +688,38 @@ impl SettingsWindow {
         }
         .as_bool()
         {
-            return Err(Error::new(E_FAIL, "Could not initialize settings sliders"));
+            return Err(Error::new(
+                E_FAIL,
+                tr(
+                    "无法初始化设置滑块",
+                    "Could not initialize settings sliders",
+                ),
+            ));
         }
         let label = WINDOW_STYLE(SS_NOPREFIX.0);
         let check = WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32);
         let combo = WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32);
         let button = WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32);
         let slider = WS_TABSTOP | WINDOW_STYLE(TBS_NOTICKS);
-        self.controls.title = self.control(w!("STATIC"), "偏好设置", TITLE, label)?;
-        self.controls.subtitle = self.control(
-            w!("STATIC"),
-            "自定义快捷键、复制方式和取色外观",
-            SUBTITLE,
-            label,
+        self.controls.title = self.control(w!("STATIC"), "", TITLE, label)?;
+        self.controls.subtitle = self.control(w!("STATIC"), "", SUBTITLE, label)?;
+        self.controls.language_label = self.control(w!("STATIC"), "", LANGUAGE_LABEL, label)?;
+        self.controls.language = self.control(w!("COMBOBOX"), "", LANGUAGE, combo)?;
+        for language in ["简体中文", "English"] {
+            append_choice(self.controls.language, language)?;
+        }
+        set_choice(
+            self.controls.language,
+            match config.language {
+                Language::SimplifiedChinese => 0,
+                Language::English => 1,
+            },
         )?;
-        self.controls.hotkey_label = self.control(w!("STATIC"), "取色快捷键", 10, label)?;
+        self.controls.hotkey_label = self.control(w!("STATIC"), "", 10, label)?;
         self.controls.ctrl = self.control(w!("BUTTON"), "Ctrl", CTRL, check)?;
         self.controls.alt = self.control(w!("BUTTON"), "Alt", ALT, check)?;
         self.controls.shift = self.control(w!("BUTTON"), "Shift", SHIFT, check)?;
-        self.controls.key_label = self.control(w!("STATIC"), "主键", 11, label)?;
+        self.controls.key_label = self.control(w!("STATIC"), "", 11, label)?;
         self.controls.key = self.control(w!("BUTTON"), "", KEY, button)?;
         if !unsafe {
             SetWindowSubclass(
@@ -612,74 +733,62 @@ impl SettingsWindow {
         {
             return Err(Error::new(
                 E_FAIL,
-                "Could not prepare hotkey recording button",
+                tr(
+                    "无法初始化快捷键录制按钮",
+                    "Could not prepare hotkey recording button",
+                ),
             ));
         }
         self.controls.hint = self.control(w!("STATIC"), "", 12, label)?;
-        self.controls.copy_heading = self.control(w!("STATIC"), "复制行为", COPY_HEADING, label)?;
-        self.controls.format_label = self.control(w!("STATIC"), "默认格式", 13, label)?;
+        self.controls.copy_heading = self.control(w!("STATIC"), "", COPY_HEADING, label)?;
+        self.controls.format_label = self.control(w!("STATIC"), "", 13, label)?;
         self.controls.format = self.control(w!("COMBOBOX"), "", FORMAT, combo)?;
-        self.controls.quick_pick = self.control(
-            w!("BUTTON"),
-            "快速取色（复制后不打开结果窗口）",
-            QUICK_PICK,
-            check,
-        )?;
-        self.controls.auto_copy =
-            self.control(w!("BUTTON"), "普通取色后自动复制", AUTO_COPY, check)?;
+        self.controls.quick_pick = self.control(w!("BUTTON"), "", QUICK_PICK, check)?;
+        self.controls.auto_copy = self.control(w!("BUTTON"), "", AUTO_COPY, check)?;
         self.controls.appearance_heading =
-            self.control(w!("STATIC"), "取色外观", APPEARANCE_HEADING, label)?;
-        self.controls.border_label = self.control(w!("STATIC"), "边框粗细", BORDER_LABEL, label)?;
-        self.controls.border_width =
-            self.control(TRACKBAR_CLASSW, "边框粗细", BORDER_WIDTH, slider)?;
+            self.control(w!("STATIC"), "", APPEARANCE_HEADING, label)?;
+        self.controls.border_label = self.control(w!("STATIC"), "", BORDER_LABEL, label)?;
+        self.controls.border_width = self.control(TRACKBAR_CLASSW, "", BORDER_WIDTH, slider)?;
         self.controls.border_value = self.control(w!("STATIC"), "", BORDER_VALUE, label)?;
         self.controls.transparency_label =
-            self.control(w!("STATIC"), "背景透明度", TRANSPARENCY_LABEL, label)?;
-        self.controls.background_transparency = self.control(
-            TRACKBAR_CLASSW,
-            "背景透明度",
-            BACKGROUND_TRANSPARENCY,
-            slider,
-        )?;
+            self.control(w!("STATIC"), "", TRANSPARENCY_LABEL, label)?;
+        self.controls.background_transparency =
+            self.control(TRACKBAR_CLASSW, "", BACKGROUND_TRANSPARENCY, slider)?;
         self.controls.transparency_value =
             self.control(w!("STATIC"), "", TRANSPARENCY_VALUE, label)?;
-        self.controls.preview_heading =
-            self.control(w!("STATIC"), "实时预览 · 示例颜色", PREVIEW_HEADING, label)?;
+        self.controls.preview_heading = self.control(w!("STATIC"), "", PREVIEW_HEADING, label)?;
         self.controls.preview = self.control(
             w!("STATIC"),
             "",
             APPEARANCE_PREVIEW,
             WINDOW_STYLE(SS_OWNERDRAW.0),
         )?;
-        self.controls.preview_hint = self.control(
-            w!("STATIC"),
-            "拖动滑块预览，点击“应用”后生效。",
-            PREVIEW_HINT,
-            label,
-        )?;
-        self.controls.usage_heading =
-            self.control(w!("STATIC"), "操作提示", USAGE_HEADING, label)?;
-        self.controls.usage_hint = self.control(
-            w!("STATIC"),
-            "左键确认 · 右键 / Esc 取消 · 窗外左键取消\r\n上滚轮冻结并放大 · 下滚轮缩小",
-            USAGE_HINT,
-            label,
-        )?;
+        self.controls.preview_hint = self.control(w!("STATIC"), "", PREVIEW_HINT, label)?;
+        self.controls.usage_heading = self.control(w!("STATIC"), "", USAGE_HEADING, label)?;
+        self.controls.usage_hint = self.control(w!("STATIC"), "", USAGE_HINT, label)?;
         self.controls.status = self.control(
             w!("EDIT"),
             "",
             STATUS,
             WS_TABSTOP | WINDOW_STYLE((ES_READONLY | ES_MULTILINE | ES_AUTOVSCROLL) as u32),
         )?;
-        self.controls.close = self.control(w!("BUTTON"), "关闭", CLOSE, button)?;
-        self.controls.apply = self.control(w!("BUTTON"), "应用", APPLY, button)?;
+        self.controls.close = self.control(w!("BUTTON"), "", CLOSE, button)?;
+        self.controls.apply = self.control(w!("BUTTON"), "", APPLY, button)?;
         for format in ColorFormat::ALL {
             append_choice(self.controls.format, format.label())?;
         }
         let format_index = ColorFormat::ALL
             .iter()
             .position(|format| *format == config.default_format)
-            .ok_or_else(|| Error::new(E_FAIL, "Configured color format is not supported"))?;
+            .ok_or_else(|| {
+                Error::new(
+                    E_FAIL,
+                    tr(
+                        "不支持配置的颜色格式",
+                        "Configured color format is not supported",
+                    ),
+                )
+            })?;
         self.update_capture_text()?;
         set_choice(self.controls.format, format_index)?;
         set_checked(self.controls.ctrl, config.hotkey.ctrl);
@@ -740,7 +849,10 @@ impl SettingsWindow {
         {
             return Err(Error::new(
                 E_FAIL,
-                "Could not prepare settings focus scrolling",
+                tr(
+                    "无法初始化设置滚动区域",
+                    "Could not prepare settings focus scrolling",
+                ),
             ));
         }
         Ok(hwnd)
@@ -749,12 +861,26 @@ impl SettingsWindow {
     fn read_config(&self) -> Result<Config> {
         let format_index = selected_choice(self.controls.format)?;
         let key = key_name(self.callback.selected_key.get())
-            .ok_or_else(|| Error::new(E_FAIL, "请选择有效的主键"))?;
-        let default_format = *ColorFormat::ALL
-            .get(format_index)
-            .ok_or_else(|| Error::new(E_FAIL, "请选择有效的颜色格式"))?;
+            .ok_or_else(|| Error::new(E_FAIL, tr("请选择有效的主键", "Choose a valid key")))?;
+        let default_format = *ColorFormat::ALL.get(format_index).ok_or_else(|| {
+            Error::new(
+                E_FAIL,
+                tr("请选择有效的颜色格式", "Choose a valid color format"),
+            )
+        })?;
+        let language = match selected_choice(self.controls.language)? {
+            0 => Language::SimplifiedChinese,
+            1 => Language::English,
+            _ => {
+                return Err(Error::new(
+                    E_FAIL,
+                    tr("请选择有效的语言", "Choose a valid language"),
+                ));
+            }
+        };
         Ok(Config {
             schema_version: self.schema_version,
+            language,
             hotkey: HotkeyConfig {
                 ctrl: checked(self.controls.ctrl),
                 alt: checked(self.controls.alt),
@@ -812,9 +938,11 @@ impl SettingsWindow {
             self.callback
                 .preview
                 .replace(Some(AppearancePreview::new(dpi, appearance)?));
-            let description = format!(
+            let description = crate::tr_format!(
                 "取色外观示例：#49A7C6，X 1280 Y 720，边框 {} DIP，背景透明度 {}%",
-                appearance.border_width_dip, appearance.background_transparency_percent
+                "Appearance sample: #49A7C6, X 1280 Y 720, border {} DIP, transparency {}%",
+                appearance.border_width_dip,
+                appearance.background_transparency_percent
             );
             unsafe {
                 SetWindowTextW(self.controls.preview, PCWSTR(wide(&description).as_ptr()))?;
@@ -826,20 +954,38 @@ impl SettingsWindow {
 
     fn update_capture_text(&self) -> Result<()> {
         let button = if self.callback.recording.get() {
-            "按下主键…".to_owned()
+            tr("按下主键…", "Press a key…").to_owned()
         } else {
-            format!(
+            crate::tr_format!(
                 "{} · 点击修改",
-                key_name(self.callback.selected_key.get())
-                    .ok_or_else(|| Error::new(E_FAIL, "请选择有效的主键"))?
+                "{} · Change",
+                key_name(self.callback.selected_key.get()).ok_or_else(|| Error::new(
+                    E_FAIL,
+                    tr("请选择有效的主键", "Choose a valid key")
+                ))?
             )
         };
         let hint = match self.callback.capture_hint.get() {
-            CaptureHint::Ready => "点击按钮后按下新主键\r\n至少选择 Ctrl 或 Alt",
-            CaptureHint::Listening => "字母、数字或 F1–F11\r\nEsc 取消 · Tab 离开",
-            CaptureHint::Invalid => "仅支持字母、数字和 F1–F11\r\n请重试 · Esc 取消",
-            CaptureHint::Accepted => "主键已更新，应用后生效\r\n点击按钮可再次修改",
-            CaptureHint::Cancelled => "已保留原主键\r\n点击按钮后重新录制",
+            CaptureHint::Ready => tr(
+                "点击按钮后按下新主键\r\n至少选择 Ctrl 或 Alt",
+                "Click, then press a new key\r\nSelect Ctrl or Alt (or both)",
+            ),
+            CaptureHint::Listening => tr(
+                "字母、数字或 F1–F11\r\nEsc 取消 · Tab 离开",
+                "Letters, digits or F1–F11\r\nEsc to cancel · Tab to leave",
+            ),
+            CaptureHint::Invalid => tr(
+                "仅支持字母、数字和 F1–F11\r\n请重试 · Esc 取消",
+                "Use letters, digits or F1–F11\r\nTry again · Esc to cancel",
+            ),
+            CaptureHint::Accepted => tr(
+                "主键已更新，应用后生效\r\n点击按钮可再次修改",
+                "Key updated; Apply to save\r\nClick to change it again",
+            ),
+            CaptureHint::Cancelled => tr(
+                "已保留原主键\r\n点击按钮后重新录制",
+                "Original key kept\r\nClick to record again",
+            ),
         };
         unsafe {
             SetWindowTextW(self.controls.key, PCWSTR(wide(&button).as_ptr()))?;
@@ -853,7 +999,10 @@ impl SettingsWindow {
         if dpi == 0 || dpi > 9600 {
             Err(Error::new(
                 E_FAIL,
-                "Could not determine settings-window DPI",
+                tr(
+                    "无法获取设置窗口的显示缩放比例",
+                    "Could not determine settings-window DPI",
+                ),
             ))
         } else {
             Ok(dpi)
@@ -996,7 +1145,9 @@ impl SettingsWindow {
                 true,
             )
         };
-        place(self.controls.title, 24, 22, 432, 30)?;
+        place(self.controls.title, 24, 22, 220, 30)?;
+        place(self.controls.language_label, 252, 29, 72, 24)?;
+        place(self.controls.language, 326, 22, 130, 160)?;
         place(self.controls.subtitle, 24, 58, 432, 20)?;
         place(self.controls.hotkey_label, 40, 100, 396, 24)?;
         place(self.controls.ctrl, 40, 128, 88, 26)?;
@@ -1060,19 +1211,21 @@ impl SettingsWindow {
                 true,
             )?;
         }
-        unsafe {
-            SendMessageW(
-                self.controls.format,
-                CB_SETITEMHEIGHT,
-                Some(WPARAM(usize::MAX)),
-                Some(LPARAM(dip(24, dpi) as isize)),
-            );
-            SendMessageW(
-                self.controls.format,
-                CB_SETITEMHEIGHT,
-                Some(WPARAM(0)),
-                Some(LPARAM(dip(24, dpi) as isize)),
-            );
+        for combo in [self.controls.language, self.controls.format] {
+            unsafe {
+                SendMessageW(
+                    combo,
+                    CB_SETITEMHEIGHT,
+                    Some(WPARAM(usize::MAX)),
+                    Some(LPARAM(dip(24, dpi) as isize)),
+                );
+                SendMessageW(
+                    combo,
+                    CB_SETITEMHEIGHT,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(dip(24, dpi) as isize)),
+                );
+            }
         }
         self.update_status_scrollbar()?;
         self.update_appearance_preview()?;
@@ -1294,7 +1447,10 @@ fn append_choice(hwnd: HWND, text: &str) -> Result<()> {
         )
     };
     if result.0 < 0 {
-        Err(Error::new(E_FAIL, "Could not populate settings choices"))
+        Err(Error::new(
+            E_FAIL,
+            tr("无法填充设置选项", "Could not populate settings choices"),
+        ))
     } else {
         Ok(())
     }
@@ -1302,7 +1458,10 @@ fn append_choice(hwnd: HWND, text: &str) -> Result<()> {
 
 fn set_choice(hwnd: HWND, index: usize) -> Result<()> {
     if unsafe { SendMessageW(hwnd, CB_SETCURSEL, Some(WPARAM(index)), None) }.0 < 0 {
-        Err(Error::new(E_FAIL, "Could not select settings value"))
+        Err(Error::new(
+            E_FAIL,
+            tr("无法选择设置值", "Could not select settings value"),
+        ))
     } else {
         Ok(())
     }
@@ -1310,7 +1469,8 @@ fn set_choice(hwnd: HWND, index: usize) -> Result<()> {
 
 fn selected_choice(hwnd: HWND) -> Result<usize> {
     let result = unsafe { SendMessageW(hwnd, CB_GETCURSEL, None, None) }.0;
-    usize::try_from(result).map_err(|_| Error::new(E_FAIL, "请选择有效的选项"))
+    usize::try_from(result)
+        .map_err(|_| Error::new(E_FAIL, tr("请选择有效的选项", "Choose a valid option")))
 }
 
 fn set_checked(hwnd: HWND, value: bool) {
@@ -1349,7 +1509,12 @@ fn set_slider(hwnd: HWND, maximum: u8, value: u8, page_size: u8) {
 
 fn slider_value(hwnd: HWND) -> Result<u8> {
     let value = unsafe { SendMessageW(hwnd, TBM_GETPOS, None, None) }.0;
-    u8::try_from(value).map_err(|_| Error::new(E_FAIL, "请选择有效的取色外观值"))
+    u8::try_from(value).map_err(|_| {
+        Error::new(
+            E_FAIL,
+            tr("请选择有效的取色外观值", "Choose a valid appearance value"),
+        )
+    })
 }
 
 unsafe extern "system" fn key_button_proc(
@@ -1467,7 +1632,8 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut _)) } as usize;
             let (panel, tone) = match id {
                 TITLE => (false, Tone::Text),
-                SUBTITLE => (false, Tone::Muted),
+                SUBTITLE | LANGUAGE_LABEL => (false, Tone::Muted),
+                LANGUAGE => (false, Tone::Text),
                 STATUS => (false, state.status_tone.get()),
                 10 => (true, Tone::Accent),
                 12 => (

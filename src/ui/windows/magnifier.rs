@@ -20,7 +20,7 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::{HiDpi::GetDpiForWindow, WindowsAndMessaging::*},
     },
-    core::{BOOL, Error, Result, w},
+    core::{BOOL, Error, PCWSTR, Result, w},
 };
 
 use super::drawing::{
@@ -28,7 +28,7 @@ use super::drawing::{
 };
 use super::frost::FrostedPanel;
 use crate::{
-    app::{config::AppearanceConfig, diagnostics},
+    app::{config::AppearanceConfig, diagnostics, i18n::tr},
     core::{
         format::{ColorFormat, format_color},
         geometry::{ScreenPointPx, ScreenRectPx},
@@ -103,7 +103,10 @@ impl State {
             return Err(error);
         }
         if self.layout_invalidated {
-            return Err(failure("冻结期间显示缩放发生变化，请重新取色"));
+            return Err(failure(tr(
+                "冻结期间显示缩放发生变化，请重新取色",
+                "Display scaling changed while frozen. Please pick again.",
+            )));
         }
         Ok(())
     }
@@ -169,6 +172,10 @@ impl MagnifierWindow {
         }
         let state = Box::new(RefCell::new(State::default()));
         let pointer = state.as_ref() as *const RefCell<State>;
+        let title: Vec<u16> = tr("缩放取色 — Color Picker", "Zoom picker — Color Picker")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
         // Creating the hidden one-pixel window on the target monitor establishes
         // its actual DPI before any DIP-sized layout is tested against work area.
         let hwnd = unsafe {
@@ -179,7 +186,7 @@ impl MagnifierWindow {
                     | WS_EX_LAYERED
                     | WS_EX_TRANSPARENT,
                 CLASS_NAME,
-                w!("color-picker magnifier"),
+                PCWSTR(title.as_ptr()),
                 WS_POPUP,
                 focus.x.clamp(work_area.left, work_area.right - 1),
                 focus.y.clamp(work_area.top, work_area.bottom - 1),
@@ -412,7 +419,10 @@ fn window_layout(
     let footer = i64::from(footer_height(dpi));
     let viewport_height = axis(image_height, i64::from(work.height()) - footer);
     if width < 32 || viewport_height < 32 {
-        return Err(failure("工作区空间不足，无法显示完整像素格"));
+        return Err(failure(tr(
+            "工作区空间不足，无法显示完整像素格",
+            "Not enough screen space to show a complete pixel cell",
+        )));
     }
     let height = viewport_height + footer;
     let left =
@@ -1052,6 +1062,16 @@ mod tests {
 
     #[test]
     fn single_row_footer_fits_the_actual_pixel_width_at_supported_desktop_scaling() {
+        use crate::app::i18n::{Language, language, set_language};
+        let previous_language = language();
+        for language in [Language::SimplifiedChinese, Language::English] {
+            set_language(language);
+            assert_single_row_footer_fits();
+        }
+        set_language(previous_language);
+    }
+
+    fn assert_single_row_footer_fits() {
         let footer = Footer {
             hex: "#DDDDDD".encode_utf16().collect(),
             scale: "32×".encode_utf16().collect(),

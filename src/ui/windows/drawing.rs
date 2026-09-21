@@ -6,6 +6,7 @@ use windows::core::{Error, PCWSTR, Result, w};
 
 use super::frost::FrostedPanel;
 use crate::app::config::AppearanceConfig;
+use crate::app::i18n::{Language, language};
 use crate::core::color::Rgb8;
 use crate::core::geometry::ScreenPointPx;
 
@@ -96,7 +97,10 @@ impl OwnedFont {
                 CLIP_DEFAULT_PRECIS,
                 CLEARTYPE_QUALITY,
                 0,
-                w!("Microsoft YaHei UI"),
+                match language() {
+                    Language::SimplifiedChinese => w!("Microsoft YaHei UI"),
+                    Language::English => w!("Segoe UI"),
+                },
             )
         });
         if font.0.is_invalid() {

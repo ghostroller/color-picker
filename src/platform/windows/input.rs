@@ -70,17 +70,47 @@ pub struct InputFailure {
 impl std::fmt::Display for InputFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let reason = match self.kind {
-            InputFailureKind::GestureAlreadyHeld => "请先松开鼠标按钮和 Esc，再开始取色",
-            InputFailureKind::HookInstall => "无法安装本次会话的输入钩子",
-            InputFailureKind::EventQueueFull => "输入事件队列已满，本次取色已取消",
-            InputFailureKind::ReceiverDisconnected => "输入事件接收端已关闭",
-            InputFailureKind::WakeFailed => "无法唤醒取色窗口",
-            InputFailureKind::ControlWakeFailed => "无法唤醒输入线程进行清理",
-            InputFailureKind::MessageLoop => "输入线程消息等待失败",
-            InputFailureKind::DrainTimeout => "等待已按下的按键释放超时，本次取色已取消",
-            InputFailureKind::HookUninstall => "输入钩子卸载失败",
-            InputFailureKind::ThreadPanicked => "输入线程异常退出",
-            InputFailureKind::DpiContext => "输入线程未使用 PerMonitorV2 DPI 上下文",
+            InputFailureKind::GestureAlreadyHeld => crate::app::i18n::tr(
+                "请先松开鼠标按钮和 Esc，再开始取色",
+                "Release the mouse buttons and Esc before picking",
+            ),
+            InputFailureKind::HookInstall => crate::app::i18n::tr(
+                "无法安装本次会话的输入钩子",
+                "Could not start input handling for this pick",
+            ),
+            InputFailureKind::EventQueueFull => crate::app::i18n::tr(
+                "输入事件队列已满，本次取色已取消",
+                "The input queue is full; picking was canceled",
+            ),
+            InputFailureKind::ReceiverDisconnected => crate::app::i18n::tr(
+                "输入事件接收端已关闭",
+                "The input event receiver has closed",
+            ),
+            InputFailureKind::WakeFailed => {
+                crate::app::i18n::tr("无法唤醒取色窗口", "Could not wake the picker window")
+            }
+            InputFailureKind::ControlWakeFailed => crate::app::i18n::tr(
+                "无法唤醒输入线程进行清理",
+                "Could not wake the input thread for cleanup",
+            ),
+            InputFailureKind::MessageLoop => crate::app::i18n::tr(
+                "输入线程消息等待失败",
+                "The input thread could not wait for messages",
+            ),
+            InputFailureKind::DrainTimeout => crate::app::i18n::tr(
+                "等待已按下的按键释放超时，本次取色已取消",
+                "Timed out waiting for held keys to be released; picking was canceled",
+            ),
+            InputFailureKind::HookUninstall => {
+                crate::app::i18n::tr("输入钩子卸载失败", "Could not remove the input hooks")
+            }
+            InputFailureKind::ThreadPanicked => {
+                crate::app::i18n::tr("输入线程异常退出", "The input thread exited unexpectedly")
+            }
+            InputFailureKind::DpiContext => crate::app::i18n::tr(
+                "输入线程未使用 PerMonitorV2 DPI 上下文",
+                "The input thread is not using PerMonitorV2 DPI awareness",
+            ),
         };
         write!(formatter, "{reason} (0x{:08X})", self.code as u32)
     }
@@ -123,7 +153,13 @@ pub struct InputSession {
 impl InputSession {
     pub fn start(session: SessionId, notify: HWND) -> Result<Self> {
         if held_gesture() {
-            return Err(Error::new(E_FAIL, "请先松开鼠标按钮和 Esc，再开始取色"));
+            return Err(Error::new(
+                E_FAIL,
+                crate::app::i18n::tr(
+                    "请先松开鼠标按钮和 Esc，再开始取色",
+                    "Release the mouse buttons and Esc before picking",
+                ),
+            ));
         }
         let signal = ControlSignal::new()?;
         let shared = Arc::new(Shared {
@@ -151,7 +187,15 @@ impl InputSession {
                 thread_shared.emit(&sender, InputEvent::Stopped { session });
                 thread_shared.failure().map_or(Ok(()), Err)
             })
-            .map_err(|error| Error::new(E_FAIL, format!("无法创建输入线程：{error}")))?;
+            .map_err(|error| {
+                Error::new(
+                    E_FAIL,
+                    crate::tr_format!(
+                        "无法创建输入线程：{error}",
+                        "Could not create the input thread: {error}"
+                    ),
+                )
+            })?;
         Ok(Self {
             shared,
             receiver,

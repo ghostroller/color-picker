@@ -8,18 +8,18 @@ use windows::{
         Foundation::{HWND, LPARAM, S_OK, WPARAM},
         UI::{
             Controls::{
-                TASKDIALOG_NOTIFICATIONS, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0,
-                TD_INFORMATION_ICON, TDCBF_OK_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
-                TDM_CLICK_BUTTON, TDN_CREATED, TDN_DESTROYED, TaskDialogIndirect,
+                TASKDIALOG_BUTTON, TASKDIALOG_NOTIFICATIONS, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0,
+                TD_INFORMATION_ICON, TDF_ALLOW_DIALOG_CANCELLATION, TDM_CLICK_BUTTON, TDN_CREATED,
+                TDN_DESTROYED, TaskDialogIndirect,
             },
             WindowsAndMessaging::{IDCANCEL, IDOK, PostMessageW, SendMessageW},
         },
     },
-    core::{HRESULT, PCWSTR, w},
+    core::{HRESULT, PCWSTR},
 };
 
 use super::config_path::default_config_path;
-use crate::app::diagnostics;
+use crate::app::{diagnostics, i18n::tr};
 
 thread_local! {
     // Only this guide's exact HWND is retained; never search for or close an
@@ -80,13 +80,21 @@ unsafe extern "system" fn guide_callback(
 
 fn show_guide(owner: HWND, text: &str) -> windows::core::Result<bool> {
     let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    let title = wide(tr("欢迎使用 Color Picker", "Welcome to Color Picker"));
+    let button_text = wide(tr("知道了", "Got it"));
+    let buttons = [TASKDIALOG_BUTTON {
+        nButtonID: IDOK.0,
+        pszButtonText: PCWSTR(button_text.as_ptr()),
+    }];
     GUIDE_CANCELLED.set(false);
     let config = TASKDIALOGCONFIG {
         cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
         hwndParent: owner,
         dwFlags: TDF_ALLOW_DIALOG_CANCELLATION,
-        dwCommonButtons: TDCBF_OK_BUTTON,
-        pszWindowTitle: w!("欢迎使用 Color Picker"),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: IDOK.0,
+        pszWindowTitle: PCWSTR(title.as_ptr()),
         Anonymous1: TASKDIALOGCONFIG_0 {
             pszMainIcon: TD_INFORMATION_ICON,
         },
@@ -111,14 +119,7 @@ pub(super) fn show_once(owner: HWND, shortcut: &str, registered: bool) {
         }
     };
     let result = offer_once(&marker, || {
-        let shortcut = if registered {
-            format!("按 {shortcut} 开始取色，或点击系统托盘中的滴管图标。")
-        } else {
-            format!("{shortcut} 当前注册失败。请点击托盘图标取色，或右键打开设置更换快捷键。")
-        };
-        let text = format!(
-            "Color Picker 已在系统托盘运行。\n\n{shortcut}\n\n左键确认颜色；右键或 Esc 取消。\n向上滚动可冻结并放大，选取精确像素。\n取色后可复制 HEX、RGB、CSS RGB 或 HSL。\n\n右键托盘图标可打开设置或退出；图标也可能在托盘的隐藏区域中。\n此指引仅显示一次，登录 Windows 时启动不会弹出。"
-        );
+        let text = guide_text(shortcut, registered);
         let shown = match show_guide(owner, &text) {
             Ok(shown) => shown,
             Err(error) => {
@@ -134,6 +135,28 @@ pub(super) fn show_once(owner: HWND, shortcut: &str, registered: bool) {
     if let Err(error) = result {
         diagnostics::event(format_args!("welcome.marker_failed error={error}"));
     }
+}
+
+fn guide_text(shortcut: &str, registered: bool) -> String {
+    let shortcut = if registered {
+        crate::tr_format!(
+            "按 {shortcut} 开始取色，或点击系统托盘中的滴管图标。",
+            "Press {shortcut} to pick a color, or click the eyedropper icon in the system tray."
+        )
+    } else {
+        crate::tr_format!(
+            "{shortcut} 当前注册失败。请点击托盘图标取色，或右键打开设置更换快捷键。",
+            "{shortcut} is unavailable. Click the tray icon to pick, or right-click it and open Settings to change the shortcut."
+        )
+    };
+    crate::tr_format!(
+        "Color Picker 已在系统托盘运行。\n\n{shortcut}\n\n左键确认颜色；右键或 Esc 取消。\n向上滚动可冻结并放大，选取精确像素。\n取色后可复制 HEX、RGB、CSS RGB 或 HSL。\n\n右键托盘图标可打开设置或退出；图标也可能在托盘的隐藏区域中。\n此指引仅显示一次，登录 Windows 时启动不会弹出。",
+        "Color Picker is running in the system tray.\n\n{shortcut}\n\nLeft-click to confirm; right-click or press Esc to cancel.\nScroll up to freeze and zoom for precise pixel selection.\nCopy the picked color as HEX, RGB, CSS RGB or HSL.\n\nRight-click the tray icon for Settings or Exit. The icon may be in the tray overflow area.\nThis guide appears once, and never when starting with Windows."
+    )
+}
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(Some(0)).collect()
 }
 
 fn offer_once(marker: &Path, show: impl FnOnce() -> bool) -> io::Result<()> {
@@ -154,6 +177,7 @@ fn offer_once(marker: &Path, show: impl FnOnce() -> bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::i18n::{Language, set_language};
     use windows::{
         Win32::{
             Foundation::{HINSTANCE, LRESULT},
@@ -164,11 +188,25 @@ mod tests {
                 WNDCLASSW,
             },
         },
-        core::Result,
+        core::{Result, w},
     };
 
     thread_local! {
         static EXIT_RECEIVED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[test]
+    fn guide_uses_selected_language_and_actual_shortcut_state() {
+        set_language(Language::English);
+        let text = guide_text("Alt + F7", true);
+        assert!(text.contains("Press Alt + F7"));
+        assert!(text.contains("Left-click to confirm"));
+        assert!(!text.contains("unavailable"));
+        let text = guide_text("Alt + F7", false);
+        assert!(text.contains("Alt + F7 is unavailable"));
+        assert!(!text.contains("Press Alt + F7"));
+        set_language(Language::SimplifiedChinese);
+        assert!(guide_text("Ctrl + Shift + C", true).contains("按 Ctrl + Shift + C 开始取色"));
     }
 
     unsafe extern "system" fn test_owner_proc(

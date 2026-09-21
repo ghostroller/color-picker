@@ -6,7 +6,10 @@
 mod pixel_fixture;
 
 use color_picker::{
-    app::config::{Config, HotkeyConfig},
+    app::{
+        config::{Config, HotkeyConfig},
+        i18n::{self, Language},
+    },
     core::{
         color::Rgb8,
         format::{ColorFormat, format_color},
@@ -29,12 +32,12 @@ use windows::{
         Graphics::Gdi::{ClientToScreen, UpdateWindow},
         UI::Controls::{TBM_GETRANGEMAX, TBM_GETRANGEMIN, TBM_SETPOS},
         UI::WindowsAndMessaging::{
-            BM_CLICK, BM_SETCHECK, CB_GETCOUNT, CreateWindowExW, DestroyWindow, ES_READONLY,
-            GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetDlgItem, GetNextDlgTabItem, GetWindowLongW,
-            GetWindowRect, GetWindowTextW, HTCAPTION, HTCLIENT, IsDialogMessageW, IsIconic,
-            IsWindow, IsWindowVisible, MSG, SB_BOTTOM, SB_TOP, SW_RESTORE, SWP_NOACTIVATE,
-            SWP_NOZORDER, SendMessageW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_CLOSE,
-            WM_COMMAND, WM_GETDLGCODE, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_NCHITTEST,
+            BM_CLICK, BM_SETCHECK, CB_GETCOUNT, CB_SETCURSEL, CreateWindowExW, DestroyWindow,
+            ES_READONLY, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetDlgItem, GetNextDlgTabItem,
+            GetWindowLongW, GetWindowRect, GetWindowTextW, HTCAPTION, HTCLIENT, IsDialogMessageW,
+            IsIconic, IsWindow, IsWindowVisible, MSG, SB_BOTTOM, SB_TOP, SW_RESTORE,
+            SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
+            WM_CLOSE, WM_COMMAND, WM_GETDLGCODE, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_NCHITTEST,
             WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_VSCROLL, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
             WS_OVERLAPPED, WS_TABSTOP,
         },
@@ -45,6 +48,7 @@ use windows::{
 #[test]
 #[ignore = "requires an interactive Windows desktop; briefly displays its own magnifier and result windows"]
 fn cached_selection_and_native_result_controls_smoke() {
+    i18n::set_language(Language::SimplifiedChinese);
     let _dpi = ScopedPmv2::enter().unwrap();
     let cursor = cursor_position().unwrap();
     let monitors = Monitors::enumerate().unwrap();
@@ -235,6 +239,7 @@ fn cached_selection_and_native_result_controls_smoke() {
     assert!(!unsafe { IsWindow(Some(result_hwnd)) }.as_bool());
 
     let config = Config {
+        language: Language::SimplifiedChinese,
         hotkey: HotkeyConfig {
             ctrl: false,
             alt: true,
@@ -474,6 +479,75 @@ fn cached_selection_and_native_result_controls_smoke() {
         settings.process_pending().unwrap(),
         Some(SettingsAction::Apply(edited.clone()))
     );
+    // Changing the language remains a draft until Apply. Relabeling the same
+    // window must preserve both edited controls and the user's scroll position.
+    let language = unsafe { GetDlgItem(Some(settings_content), 110) }.unwrap();
+    assert_eq!(
+        unsafe { SendMessageW(language, CB_GETCOUNT, None, None) }.0,
+        2
+    );
+    unsafe { SendMessageW(language, CB_SETCURSEL, Some(WPARAM(1)), None) };
+    assert_eq!(settings.process_pending().unwrap(), None);
+    assert_eq!(i18n::language(), Language::SimplifiedChinese);
+    assert_eq!(window_text(apply), "应用");
+    let mut english_draft = edited.clone();
+    english_draft.language = Language::English;
+    unsafe {
+        SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None);
+    }
+    assert_eq!(
+        settings.process_pending().unwrap(),
+        Some(SettingsAction::Apply(english_draft.clone()))
+    );
+    unsafe {
+        SendMessageW(
+            settings_content,
+            WM_VSCROLL,
+            Some(WPARAM(SB_BOTTOM.0 as usize)),
+            None,
+        );
+    }
+    settings.process_pending().unwrap();
+    let mut before_language_switch = RECT::default();
+    unsafe { GetWindowRect(border, &mut before_language_switch).unwrap() };
+    i18n::set_language(Language::English);
+    settings.refresh_language().unwrap();
+    assert_eq!(window_text(settings_hwnd), "Settings — Color Picker");
+    assert_eq!(window_text(apply), "Apply");
+    assert_eq!(window_text(close), "Close");
+    assert_eq!(
+        window_text(unsafe { GetDlgItem(Some(settings_content), 15) }.unwrap()),
+        "Preferences"
+    );
+    assert!(window_text(appearance_preview).contains("border 3 DIP, transparency 80%"));
+    let mut after_language_switch = RECT::default();
+    unsafe { GetWindowRect(border, &mut after_language_switch).unwrap() };
+    assert_eq!(before_language_switch, after_language_switch);
+    unsafe { SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None) };
+    assert_eq!(
+        settings.process_pending().unwrap(),
+        Some(SettingsAction::Apply(english_draft))
+    );
+    unsafe {
+        SendMessageW(language, CB_SETCURSEL, Some(WPARAM(0)), None);
+        SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None);
+    }
+    assert_eq!(
+        settings.process_pending().unwrap(),
+        Some(SettingsAction::Apply(edited.clone()))
+    );
+    i18n::set_language(Language::SimplifiedChinese);
+    settings.refresh_language().unwrap();
+    assert_eq!(window_text(apply), "应用");
+    unsafe {
+        SendMessageW(
+            settings_content,
+            WM_VSCROLL,
+            Some(WPARAM(SB_TOP.0 as usize)),
+            None,
+        );
+    }
+    settings.process_pending().unwrap();
     // Exercise the native key control, including the dialog message path.
     // These messages target only this fixture; no global input is generated.
     let key = unsafe { GetDlgItem(Some(settings_content), 104) }.unwrap();

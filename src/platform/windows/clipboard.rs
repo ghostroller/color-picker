@@ -27,7 +27,10 @@ pub enum ClipboardError {
 impl std::fmt::Display for ClipboardError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Busy => formatter.write_str("剪贴板正被其他程序占用"),
+            Self::Busy => formatter.write_str(crate::app::i18n::tr(
+                "剪贴板正被其他程序占用",
+                "The clipboard is in use by another application",
+            )),
             Self::Other(error) => error.fmt(formatter),
         }
     }

@@ -9,6 +9,7 @@ use super::{
 use crate::app::{
     config::{Config, ConfigStore},
     diagnostics,
+    i18n::{set_language, tr},
 };
 
 pub struct SettingsRuntime {
@@ -37,12 +38,14 @@ impl SettingsRuntime {
             Err(error) => (
                 None,
                 Config::default(),
-                Some(format!(
-                    "无法找到配置目录，当前使用默认设置且禁止保存。重启后重试：{error}"
+                Some(crate::tr_format!(
+                    "无法找到配置目录，当前使用默认设置且禁止保存。重启后重试：{error}",
+                    "The settings folder could not be found. Defaults are in use and saving is disabled. Restart to retry: {error}"
                 )),
                 false,
             ),
         };
+        set_language(config.language);
         let mut runtime = Self {
             config,
             notice,
@@ -65,8 +68,9 @@ impl SettingsRuntime {
                     "hotkey.registration_failed chord={} error={error}",
                     runtime.config.hotkey.label()
                 ));
-                let warning = format!(
+                let warning = crate::tr_format!(
                     "{} 注册失败，仍可从托盘取色；可在设置中换键或点击应用重试。{error}",
+                    "{} could not be registered. You can still pick from the tray; change the shortcut in Settings or click Apply to retry. {error}",
                     runtime.config.hotkey.label()
                 );
                 runtime.notice = Some(match runtime.notice.take() {
@@ -86,24 +90,27 @@ impl SettingsRuntime {
     pub fn apply(&mut self, hwnd: HWND, config: Config) -> Result<Option<HotkeyGuard>, String> {
         config.validate().map_err(|error| error.to_string())?;
         if !self.save_allowed {
-            return Err(self
-                .notice
-                .clone()
-                .unwrap_or_else(|| "配置文件不可写。".into()));
+            return Err(self.notice.clone().unwrap_or_else(|| {
+                tr("配置文件不可写。", "The settings file is not writable.").into()
+            }));
         }
-        let store = self.store.as_ref().ok_or("配置目录不可用。")?;
+        let store = self.store.as_ref().ok_or(tr(
+            "配置目录不可用。",
+            "The settings folder is unavailable.",
+        ))?;
         // The old key stays registered on both registration and save failures.
         // Each attempted ID is fresh; delayed WM_HOTKEY for a retired ID is ignored.
         let replacement = if config.hotkey != self.config.hotkey || self.hotkey.is_none() {
             let id = self.next_id;
             if id > 0xbfff {
-                return Err("本次运行已用尽快捷键标识，请重启程序后重试。".into());
+                return Err(tr("本次运行已用尽快捷键标识，请重启程序后重试。", "Shortcut registrations are exhausted for this session. Restart the app and try again.").into());
             }
             self.next_id += 1;
             Some(
                 HotkeyGuard::register_config(hwnd, id, &config.hotkey).map_err(|error| {
-                    format!(
+                    crate::tr_format!(
                         "快捷键 {} 不可用，原设置未更改：{error}",
+                        "Shortcut {} is unavailable. Your previous settings are unchanged: {error}",
                         config.hotkey.label()
                     )
                 })?,
@@ -112,10 +119,14 @@ impl SettingsRuntime {
             None
         };
         // On failure replacement drops here, unregistering only the temporary key.
-        store
-            .save(&config)
-            .map_err(|error| format!("保存失败，原设置未更改：{error}"))?;
+        store.save(&config).map_err(|error| {
+            crate::tr_format!(
+                "保存失败，原设置未更改：{error}",
+                "Could not save. Your previous settings are unchanged: {error}"
+            )
+        })?;
         self.config = config;
+        set_language(self.config.language);
         let old_hotkey = replacement.and_then(|guard| self.hotkey.replace(guard));
         self.notice = None;
         diagnostics::event(format_args!(
@@ -208,12 +219,15 @@ mod tests {
     #[test]
     #[ignore = "temporarily registers Ctrl+Alt+Shift+F9/F10/F11; requires those chords to be unused"]
     fn hotkey_conflict_and_save_failure_preserve_the_old_transaction() {
+        use crate::app::i18n::{Language, language};
+        set_language(Language::SimplifiedChinese);
         let directory = TestDirectory::new();
         let owner = TestWindow::new();
         let probe = TestWindow::new();
         let path = directory.0.join("config.json");
         let store = ConfigStore::new(path.clone());
         let original = Config {
+            language: Language::SimplifiedChinese,
             hotkey: chord("F9"),
             ..Config::default()
         };
@@ -239,6 +253,7 @@ mod tests {
             next_id: 1000,
         };
         let conflicting = Config {
+            language: Language::English,
             hotkey: chord("F10"),
             ..original.clone()
         };
@@ -246,6 +261,7 @@ mod tests {
         // A real RegisterHotKey conflict changes neither disk nor accepted ID.
         let error = runtime.apply(owner.0, conflicting.clone()).unwrap_err();
         assert!(error.contains("快捷键"), "{error}");
+        assert_eq!(language(), Language::SimplifiedChinese);
         assert_eq!(runtime.config, original);
         assert_eq!(runtime.hotkey_id(), Some(101));
         assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
@@ -261,6 +277,7 @@ mod tests {
             .unwrap();
         let error = runtime.apply(owner.0, conflicting).unwrap_err();
         assert!(error.contains("保存失败"), "{error}");
+        assert_eq!(language(), Language::SimplifiedChinese);
         assert_eq!(runtime.config, original);
         assert_eq!(runtime.hotkey_id(), Some(101));
         assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
@@ -272,6 +289,7 @@ mod tests {
         drop(lock);
 
         let updated = Config {
+            language: Language::English,
             hotkey: chord("F11"),
             default_format: ColorFormat::Hsl,
             auto_copy_on_pick: true,
@@ -282,6 +300,7 @@ mod tests {
             .unwrap()
             .expect("successful replacement returns the old registration");
         assert_eq!(runtime.config, updated);
+        assert_eq!(language(), Language::English);
         assert_ne!(runtime.hotkey_id(), Some(101));
         assert_eq!(runtime.store.as_ref().unwrap().load().config, updated);
         // The host can publish hotkey_id() before dropping this retired guard.

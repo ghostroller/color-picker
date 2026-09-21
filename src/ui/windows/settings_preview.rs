@@ -15,7 +15,7 @@ use super::super::{
     },
     frost::blur_and_tint,
 };
-use crate::app::config::AppearanceConfig;
+use crate::app::{config::AppearanceConfig, i18n::tr};
 
 pub(super) const WIDTH: i32 = 396;
 pub(super) const HEIGHT: i32 = 72;
@@ -81,7 +81,10 @@ impl AppearancePreview {
                 )
             } == 0
             {
-                return Err(Error::new(E_FAIL, "Could not draw appearance example"));
+                return Err(Error::new(
+                    E_FAIL,
+                    tr("无法绘制外观示例", "Could not draw appearance example"),
+                ));
             }
             let x = bounds.left + (width - dip(OVERLAY_WIDTH, self.dpi)) / 2;
             let overlay_height = dip(

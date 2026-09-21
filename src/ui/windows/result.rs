@@ -43,6 +43,7 @@ use super::{
 };
 use crate::{
     app::config::AppearanceConfig,
+    app::i18n::tr,
     core::{
         format::{ColorFormat, format_color},
         state::{PickedColor, SampleKind},
@@ -308,11 +309,12 @@ impl ResultWindow {
             default_id: Cell::new(COPY_DEFAULT),
         });
         let pointer = callback.as_ref() as *const CallbackState;
+        let title = wide(tr("取色结果 — Color Picker", "Picked color — Color Picker"));
         let hwnd = unsafe {
             CreateWindowExW(
                 EX_STYLE,
                 CLASS,
-                w!("取色结果 — Color Picker"),
+                PCWSTR(title.as_ptr()),
                 STYLE,
                 picked.source.x,
                 picked.source.y,
@@ -454,14 +456,14 @@ impl ResultWindow {
     fn create_controls(&mut self) -> Result<()> {
         self.controls.swatch = self.control(
             w!("STATIC"),
-            "已选颜色色块",
+            tr("已选颜色色块", "Selected color swatch"),
             10,
             WINDOW_STYLE(SS_OWNERDRAW.0) | WS_CLIPSIBLINGS,
             WINDOW_EX_STYLE::default(),
         )?;
         let source = match self.picked.kind {
-            SampleKind::Live => "实时屏幕",
-            SampleKind::Frozen => "冻结画面",
+            SampleKind::Live => tr("实时屏幕", "Live screen"),
+            SampleKind::Frozen => tr("冻结画面", "Frozen screen"),
         };
         self.controls.source = self.control(
             w!("STATIC"),
@@ -491,7 +493,7 @@ impl ResultWindow {
                 )?,
                 copy: self.control(
                     w!("BUTTON"),
-                    &format!("复制 {}", format.label()),
+                    &crate::tr_format!("复制 {}", "Copy {}", format.label()),
                     COPY_ROW + index,
                     WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
                     WINDOW_EX_STYLE::default(),
@@ -500,21 +502,21 @@ impl ResultWindow {
         }
         self.controls.default_copy = self.control(
             w!("BUTTON"),
-            &format!("复制 {}", self.callback.default_format.label()),
+            &crate::tr_format!("复制 {}", "Copy {}", self.callback.default_format.label()),
             COPY_DEFAULT,
             WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
             WINDOW_EX_STYLE::default(),
         )?;
         self.controls.pick_again = self.control(
             w!("BUTTON"),
-            "重新取色",
+            tr("重新取色", "Pick again"),
             PICK_AGAIN,
             WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
             WINDOW_EX_STYLE::default(),
         )?;
         self.controls.close = self.control(
             w!("BUTTON"),
-            "关闭",
+            tr("关闭", "Close"),
             CLOSE,
             WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
             WINDOW_EX_STYLE::default(),
@@ -530,14 +532,14 @@ impl ResultWindow {
         let _ = unsafe { ShowWindow(self.controls.status, SW_HIDE) };
         self.controls.minimize = self.control(
             w!("BUTTON"),
-            "最小化",
+            tr("最小化", "Minimize"),
             CAPTION_MINIMIZE,
             WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
             WINDOW_EX_STYLE::default(),
         )?;
         self.controls.caption_close = self.control(
             w!("BUTTON"),
-            "关闭窗口",
+            tr("关闭窗口", "Close window"),
             CAPTION_CLOSE,
             WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
             WINDOW_EX_STYLE::default(),
@@ -851,7 +853,11 @@ impl ResultWindow {
             let _ = unsafe { KillTimer(Some(self.hwnd), timer) };
         }
         if let Some(target) = self.copied_target.take() {
-            let label = wide(&format!("复制 {}", target.format.label()));
+            let label = wide(&crate::tr_format!(
+                "复制 {}",
+                "Copy {}",
+                target.format.label()
+            ));
             unsafe { SetWindowTextW(self.copy_button(target), PCWSTR(label.as_ptr()))? };
         }
         Ok(())
@@ -888,7 +894,11 @@ impl ResultWindow {
         }
         self.callback.feedback_timer.set(timer);
         self.copied_target.set(Some(target));
-        let label = wide(&format!("已复制 {}", target.format.label()));
+        let label = wide(&crate::tr_format!(
+            "已复制 {}",
+            "Copied {}",
+            target.format.label()
+        ));
         unsafe { SetWindowTextW(self.copy_button(target), PCWSTR(label.as_ptr()))? };
         Ok(())
     }
@@ -949,17 +959,26 @@ impl ResultWindow {
                     let timer = next_copy_token()?;
                     if unsafe { SetTimer(Some(self.hwnd), timer, RETRY_MS, None) } == 0 {
                         self.copy.borrow_mut().0 = None;
-                        return self.copy_failed("剪贴板被占用，无法安排重试。请再次点击复制。");
+                        return self.copy_failed(tr(
+                            "剪贴板被占用，无法安排重试。请再次点击复制。",
+                            "Clipboard busy; retry unavailable. Click Copy to try again.",
+                        ));
                     }
                     self.callback.active_timer.set(timer);
                     Ok(())
                 } else {
-                    self.copy_failed("复制失败：剪贴板仍被占用。请再次点击复制。")
+                    self.copy_failed(tr(
+                        "复制失败：剪贴板仍被占用。请再次点击复制。",
+                        "Clipboard still busy. Click Copy to try again.",
+                    ))
                 }
             }
             Err(ClipboardError::Other(error)) => {
                 self.copy.borrow_mut().0 = None;
-                self.copy_failed(&format!("复制失败：{error}"))
+                self.copy_failed(&crate::tr_format!(
+                    "复制失败：{error}",
+                    "Copy failed: {error}"
+                ))
             }
         }
     }
@@ -1541,6 +1560,9 @@ mod tests {
     #[test]
     #[ignore = "requires an interactive Windows desktop; displays a result window without copying"]
     fn copy_feedback_preserves_layout_and_rejects_old_reset_timers() {
+        use crate::app::i18n::{Language, language, set_language};
+        let previous_language = language();
+        set_language(Language::SimplifiedChinese);
         let result = ResultWindow::new(
             PickedColor {
                 rgb: crate::core::color::Rgb8::new(244, 242, 242),
@@ -1588,5 +1610,64 @@ mod tests {
         assert_eq!(text(result.controls.default_copy), "复制 HEX");
         assert_eq!(result.callback.feedback_timer.get(), 0);
         assert_eq!(rect(), before);
+        drop(result);
+        set_language(previous_language);
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; checks English controls without copying"]
+    fn english_result_labels_and_copy_feedback_fit_without_resizing() {
+        use crate::app::i18n::{Language, language, set_language};
+        let previous_language = language();
+        set_language(Language::English);
+        let result = quick_result();
+        let text = |hwnd| {
+            let mut text = [0_u16; 128];
+            let length = unsafe { GetWindowTextW(hwnd, &mut text) } as usize;
+            String::from_utf16_lossy(&text[..length])
+        };
+        assert_eq!(text(result.hwnd), "Picked color — Color Picker");
+        assert_eq!(text(result.controls.swatch), "Selected color swatch");
+        assert_eq!(text(result.controls.source), "Frozen screen  ·  X 0  Y 0");
+        assert_eq!(text(result.controls.pick_again), "Pick again");
+        assert_eq!(text(result.controls.close), "Close");
+        assert_eq!(text(result.controls.minimize), "Minimize");
+        assert_eq!(text(result.controls.caption_close), "Close window");
+        assert_eq!(text(result.controls.default_copy), "Copy CSS RGB");
+        let mut before = RECT::default();
+        unsafe { GetWindowRect(result.hwnd, &mut before) }.unwrap();
+        let css = target(ColorFormat::CssRgb, COPY_ROW + 2);
+        assert_eq!(text(result.copy_button(css)), "Copy CSS RGB");
+        result.show_copy_feedback(css).unwrap();
+        assert_eq!(text(result.copy_button(css)), "Copied CSS RGB");
+        // The owner-drawn row shows "Copied"; its native accessible name keeps
+        // the format. Measure the real selected font in the existing footprint.
+        let button = result.copy_button(css);
+        let dc = unsafe { GetDC(Some(button)) };
+        assert!(!dc.is_invalid());
+        let font = unsafe { SendMessageW(button, WM_GETFONT, None, None) };
+        let old = unsafe { SelectObject(dc, HGDIOBJ(font.0 as *mut _)) };
+        let mut size = windows::Win32::Foundation::SIZE::default();
+        let mut bounds = RECT::default();
+        unsafe {
+            GetClientRect(button, &mut bounds).unwrap();
+            assert!(
+                GetTextExtentPoint32W(dc, &"Copied".encode_utf16().collect::<Vec<_>>(), &mut size,)
+                    .as_bool()
+            );
+            SelectObject(dc, old);
+            ReleaseDC(Some(button), dc);
+        }
+        assert!(size.cx <= bounds.right - dip(8, result.dpi().unwrap()));
+        assert!(size.cy <= bounds.bottom - dip(8, result.dpi().unwrap()));
+        let mut after = RECT::default();
+        unsafe { GetWindowRect(result.hwnd, &mut after) }.unwrap();
+        assert_eq!(before, after);
+        assert!(!result.status_visible.get());
+        assert!(!unsafe { IsWindowVisible(result.hwnd) }.as_bool());
+        result.clear_copy_feedback().unwrap();
+        assert_eq!(text(button), "Copy CSS RGB");
+        drop(result);
+        set_language(previous_language);
     }
 }

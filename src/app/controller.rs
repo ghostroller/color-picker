@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    app::{config::AppearanceConfig, diagnostics},
+    app::{config::AppearanceConfig, diagnostics, i18n::tr},
     core::{
         geometry::{ScreenPointPx, ScreenRectPx, freeze_rect},
         state::{AppState, Event, PickedColor, SampleKind, StateMachine},
@@ -285,7 +285,15 @@ impl PreviewController {
                 self.stop("input_thread_failure");
             }
             if !matches!(self.state(), AppState::Finishing { .. }) {
-                error.get_or_insert_with(|| Error::new(E_FAIL, "输入线程意外结束，取色已取消"));
+                error.get_or_insert_with(|| {
+                    Error::new(
+                        E_FAIL,
+                        tr(
+                            "输入线程意外结束，取色已取消",
+                            "The input thread ended unexpectedly. Picking was cancelled.",
+                        ),
+                    )
+                });
                 self.stop("input_thread_stopped");
             }
             let session = self
@@ -374,24 +382,40 @@ impl PreviewController {
         let Some(resources) = self.session.as_mut() else {
             return Ok(None);
         };
-        let preview = resources
-            .preview
-            .as_ref()
-            .ok_or_else(|| Error::new(E_FAIL, "实时预览窗口不可用"))?;
+        let preview = resources.preview.as_ref().ok_or_else(|| {
+            Error::new(
+                E_FAIL,
+                tr(
+                    "实时预览窗口不可用",
+                    "The live preview window is unavailable.",
+                ),
+            )
+        })?;
         let Some(monitor) = resources.monitors.at(point).copied() else {
             resources.last_sample = None;
             preview.hide();
-            return unavailable(resources, Error::new(E_FAIL, "该位置没有有效显示器"));
+            return unavailable(
+                resources,
+                Error::new(
+                    E_FAIL,
+                    tr(
+                        "该位置没有有效显示器",
+                        "There is no available display at this position.",
+                    ),
+                ),
+            );
         };
         if preview.rect().is_some_and(|rect| rect.contains(point)) {
             preview.hide();
             flush_composition()?;
         }
         self.sample_attempts = self.sample_attempts.saturating_add(1);
-        let sampler = resources
-            .sampler
-            .as_mut()
-            .ok_or_else(|| Error::new(E_FAIL, "实时采样资源不可用"))?;
+        let sampler = resources.sampler.as_mut().ok_or_else(|| {
+            Error::new(
+                E_FAIL,
+                tr("实时采样资源不可用", "Live sampling is unavailable."),
+            )
+        })?;
         match sampler.sample_pixel(point) {
             Ok(rgb) => {
                 resources.failures = 0;
@@ -428,7 +452,15 @@ impl PreviewController {
                         .session
                         .as_ref()
                         .and_then(|resources| resources.magnifier.as_ref())
-                        .ok_or_else(|| Error::new(E_FAIL, "冻结窗口不可用"))?
+                        .ok_or_else(|| {
+                            Error::new(
+                                E_FAIL,
+                                tr(
+                                    "冻结窗口不可用",
+                                    "The frozen preview window is unavailable.",
+                                ),
+                            )
+                        })?
                         .change_scale(steps > 0, point)?;
                     if !keep_frozen {
                         self.resume_live()?;
@@ -444,13 +476,24 @@ impl PreviewController {
         let Some(resources) = self.session.as_mut() else {
             return Ok(());
         };
-        let monitor = resources
-            .monitors
-            .at(point)
-            .copied()
-            .ok_or_else(|| Error::new(E_FAIL, "该位置没有有效显示器"))?;
-        let rect = freeze_rect(point, monitor.bounds)
-            .ok_or_else(|| Error::new(E_FAIL, "无法确定冻结区域"))?;
+        let monitor = resources.monitors.at(point).copied().ok_or_else(|| {
+            Error::new(
+                E_FAIL,
+                tr(
+                    "该位置没有有效显示器",
+                    "There is no available display at this position.",
+                ),
+            )
+        })?;
+        let rect = freeze_rect(point, monitor.bounds).ok_or_else(|| {
+            Error::new(
+                E_FAIL,
+                tr(
+                    "无法确定冻结区域",
+                    "Could not determine the area to freeze.",
+                ),
+            )
+        })?;
         self.timer.take();
         // Frozen does not retain a hidden Live window or its font/backbuffer.
         if let Some(preview) = resources.preview.take() {
@@ -460,7 +503,12 @@ impl PreviewController {
         let image = resources
             .sampler
             .as_mut()
-            .ok_or_else(|| Error::new(E_FAIL, "实时采样资源不可用"))?
+            .ok_or_else(|| {
+                Error::new(
+                    E_FAIL,
+                    tr("实时采样资源不可用", "Live sampling is unavailable."),
+                )
+            })?
             .capture_rect(rect)
             .map_err(platform_error)?;
         resources.sampler.take();
@@ -533,10 +581,15 @@ impl PreviewController {
     }
 
     fn replace_timer(&mut self) -> Result<()> {
-        self.next_timer = self
-            .next_timer
-            .checked_add(1)
-            .ok_or_else(|| Error::new(E_FAIL, "Timer generation exhausted"))?;
+        self.next_timer = self.next_timer.checked_add(1).ok_or_else(|| {
+            Error::new(
+                E_FAIL,
+                tr(
+                    "取色计时器已用尽，请重启程序。",
+                    "Picker timers are exhausted. Restart the app.",
+                ),
+            )
+        })?;
         // Preserve the old timer if creating its replacement fails.
         let replacement = SessionTimer::start(self.host, self.next_timer)?;
         self.timer = Some(replacement);

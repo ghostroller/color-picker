@@ -4,20 +4,24 @@ fn main() -> std::process::ExitCode {
     #[cfg(windows)]
     {
         use color_picker::app::{
-            cli::{Options, USAGE},
+            cli::{Options, usage},
             diagnostics,
         };
         let options = match Options::parse(std::env::args_os().skip(1)) {
             Ok(options) => options,
             Err(error) => {
-                eprintln!("{error}\n{USAGE}");
+                eprintln!("{error}\n{}", usage());
                 return std::process::ExitCode::from(2);
             }
         };
         if let Some(path) = &options.log_file
             && let Err(error) = diagnostics::init(path)
         {
-            let message = format!("无法打开诊断日志 {}：{error}", path.display());
+            let message = color_picker::tr_format!(
+                "无法打开诊断日志 {}：{error}",
+                "Could not open diagnostic log {}: {error}",
+                path.display()
+            );
             eprintln!("{message}");
             if !options.check_environment && !options.quit {
                 color_picker::platform::windows::host::show_error(&message);
@@ -65,7 +69,13 @@ fn main() -> std::process::ExitCode {
 
     #[cfg(not(windows))]
     {
-        eprintln!("当前仅支持 Windows");
+        eprintln!(
+            "{}",
+            color_picker::app::i18n::tr(
+                "当前仅支持 Windows",
+                "Only Windows is currently supported."
+            )
+        );
         std::process::ExitCode::FAILURE
     }
 }

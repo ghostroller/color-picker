@@ -1,6 +1,14 @@
+use super::i18n::tr;
 use std::{ffi::OsString, path::PathBuf};
 
 pub const USAGE: &str = "Usage: color-picker [--startup | --quit | --check-environment] [--diagnostics] [--log-file <path>] [--no-onboarding]";
+
+pub fn usage() -> &'static str {
+    tr(
+        "用法：color-picker [--startup | --quit | --check-environment] [--diagnostics] [--log-file <路径>] [--no-onboarding]",
+        USAGE,
+    )
+}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -29,22 +37,39 @@ impl Options {
                 options.no_onboarding = true;
             } else if argument == "--log-file" {
                 if options.log_file.is_some() {
-                    return Err("--log-file must only be specified once".into());
+                    return Err(tr(
+                        "--log-file 只能指定一次",
+                        "--log-file must only be specified once",
+                    )
+                    .into());
                 }
-                let path = arguments.next().ok_or("--log-file requires a file path")?;
+                let path = arguments.next().ok_or(tr(
+                    "--log-file 需要文件路径",
+                    "--log-file requires a file path",
+                ))?;
                 if path.is_empty() || path.to_string_lossy().starts_with("--") {
-                    return Err("--log-file requires a file path".into());
+                    return Err(
+                        tr("--log-file 需要文件路径", "--log-file requires a file path").into(),
+                    );
                 }
                 options.log_file = Some(path.into());
                 options.diagnostics = true;
             } else {
-                return Err(format!("Unknown argument: {}", argument.to_string_lossy()));
+                return Err(crate::tr_format!(
+                    "未知参数：{}",
+                    "Unknown argument: {}",
+                    argument.to_string_lossy()
+                ));
             }
         }
         if u8::from(options.startup) + u8::from(options.quit) + u8::from(options.check_environment)
             > 1
         {
-            return Err("--startup, --quit and --check-environment cannot be combined".into());
+            return Err(tr(
+                "--startup、--quit 和 --check-environment 不能组合使用",
+                "--startup, --quit and --check-environment cannot be combined",
+            )
+            .into());
         }
         Ok(options)
     }

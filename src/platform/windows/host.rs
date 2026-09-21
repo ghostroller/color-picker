@@ -37,7 +37,7 @@ use windows::{
 };
 
 use crate::{
-    app::{controller::PreviewController, diagnostics},
+    app::{controller::PreviewController, diagnostics, i18n::tr},
     core::format::{ColorFormat, format_color},
     ui::windows::{
         result::{ResultAction, ResultWindow, WM_RESULT_WAKE},
@@ -161,14 +161,14 @@ pub fn run_with_launch_options(
     });
     // Deliberately never ShowWindow; parent=None makes this a broadcast-capable
     // top-level window, not HWND_MESSAGE. Guards below drop before the window.
+    let mut settings = SettingsRuntime::load(window.0);
     let mut tray = TrayIcon::new(window.0, WM_TRAY)?;
     TRAY_ADDED.set(true);
     diagnostics::event(format_args!("tray.registered version=4"));
-    let mut settings = SettingsRuntime::load(window.0);
     publish_hotkey_status(&settings);
     update_tray_shortcut(&mut tray, &settings);
     if let Some(notice) = settings.notice.as_deref() {
-        notify(&tray, "设置提示", notice);
+        notify(&tray, tr("设置提示", "Settings notice"), notice);
     }
     let session_notifications = match SessionNotifications::new(window.0) {
         Ok(guard) => {
@@ -181,8 +181,11 @@ pub fn run_with_launch_options(
             ));
             notify(
                 &tray,
-                "会话通知不可用",
-                &format!("无法订阅锁屏和会话通知：{error}。当前仍可使用托盘。"),
+                tr("会话通知不可用", "Session notifications unavailable"),
+                &crate::tr_format!(
+                    "无法订阅锁屏和会话通知：{error}。当前仍可使用托盘。",
+                    "Could not subscribe to lock-screen and session notifications: {error}. You can still use the tray."
+                ),
             );
             None
         }
@@ -226,7 +229,13 @@ fn message_loop(
     let mut deferred_menu = false;
     loop {
         if CALLBACK_FAILED.get() {
-            return Err(Error::new(E_FAIL, "Failed to wake the host message loop"));
+            return Err(Error::new(
+                E_FAIL,
+                tr(
+                    "无法唤醒应用消息循环",
+                    "Failed to wake the host message loop",
+                ),
+            ));
         }
         // Broadcasts/exit already received must invalidate a pending candidate
         // before worker completion can promote it to Result and auto-copy it.
@@ -242,7 +251,11 @@ fn message_loop(
         if let Err(error) = controller.process_input() {
             diagnostics::event(format_args!("input.failed error={error}"));
             if !exiting {
-                notify(tray, "取色已停止", &error.to_string());
+                notify(
+                    tray,
+                    tr("取色已停止", "Picking stopped"),
+                    &error.to_string(),
+                );
             }
         }
         publish_preview_status(&controller);
@@ -273,9 +286,10 @@ fn message_loop(
                     controller.close_result()?;
                     notify(
                         tray,
-                        "结果窗口无法显示",
-                        &format!(
+                        tr("结果窗口无法显示", "Could not show the picked color"),
+                        &crate::tr_format!(
                             "已取色 {}。{error}",
+                            "Picked {}. {error}",
                             format_color(picked.rgb, ColorFormat::Hex)
                         ),
                     );
@@ -294,7 +308,11 @@ fn message_loop(
                 Ok(None) => {}
                 Err(error) => {
                     diagnostics::event(format_args!("result.failed error={error}"));
-                    notify(tray, "结果窗口操作失败", &error.to_string());
+                    notify(
+                        tray,
+                        tr("结果窗口操作失败", "Result window action failed"),
+                        &error.to_string(),
+                    );
                 }
             }
         }
@@ -306,7 +324,14 @@ fn message_loop(
                         publish_hotkey_status(settings);
                         update_tray_shortcut(tray, settings);
                         drop(old_hotkey);
-                        window.show_status("设置已保存，关闭此窗口后生效。", true)?;
+                        window.refresh_language()?;
+                        window.show_status(
+                            tr(
+                                "设置已保存，关闭此窗口后即可取色。",
+                                "Settings saved. Close this window to start picking.",
+                            ),
+                            true,
+                        )?;
                     }
                     Err(error) => {
                         diagnostics::event(format_args!("config.apply_failed error={error}"));
@@ -415,7 +440,10 @@ fn message_loop(
                     Err(error) => {
                         return Err(Error::new(
                             error.code(),
-                            format!("恢复托盘图标失败：{error}"),
+                            crate::tr_format!(
+                                "恢复托盘图标失败：{error}",
+                                "Could not restore the tray icon: {error}"
+                            ),
                         ));
                     }
                 }
@@ -487,7 +515,11 @@ fn message_loop(
                                 Ok(window) => settings_window = Some(window),
                                 Err(error) => {
                                     controller.close_settings()?;
-                                    notify(tray, "无法打开设置", &error.to_string());
+                                    notify(
+                                        tray,
+                                        tr("无法打开设置", "Could not open Settings"),
+                                        &error.to_string(),
+                                    );
                                 }
                             }
                         }
@@ -505,7 +537,11 @@ fn message_loop(
                 let timer = PENDING_TIMER.replace(0);
                 if let Err(error) = controller.on_timer(timer) {
                     diagnostics::event(format_args!("preview.failed error={error}"));
-                    notify(tray, "预览已停止", &error.to_string());
+                    notify(
+                        tray,
+                        tr("预览已停止", "Preview stopped"),
+                        &error.to_string(),
+                    );
                 }
                 publish_preview_status(&controller);
             }
@@ -574,7 +610,7 @@ fn explain_settings_block(window: Option<&SettingsWindow>) -> bool {
     // Preserve the draft and keep capture stopped. This also restores a
     // minimized/covered settings window when a hotkey or second launch arrives.
     if let Err(error) = window.show_status(
-        "设置窗口打开时暂停取色。请先应用需要保存的更改，再关闭此窗口。",
+        tr("设置窗口打开时暂停取色。请先应用需要保存的更改，再关闭此窗口。", "Picking is paused while Settings is open. Apply any changes you want to save, then close this window."),
         false,
     ) {
         diagnostics::event(format_args!(
@@ -607,7 +643,11 @@ fn activate(
         // of the next pick, including a hotkey pressed over that same window.
         result_window.take();
         if let Err(error) = super::session::flush_composition() {
-            notify(tray, "无法开始取色", &error.to_string());
+            notify(
+                tray,
+                tr("无法开始取色", "Could not start picking"),
+                &error.to_string(),
+            );
             let _ = controller.close_result();
             return;
         }
@@ -625,7 +665,11 @@ fn activate(
         )),
         Err(error) => {
             diagnostics::event(format_args!("preview.start_failed error={error}"));
-            notify(tray, "无法开始预览", &error.to_string());
+            notify(
+                tray,
+                tr("无法开始预览", "Could not start preview"),
+                &error.to_string(),
+            );
         }
     }
     publish_preview_status(controller);
@@ -663,7 +707,10 @@ fn notify(tray: &TrayIcon, title: &str, message: &str) {
             diagnostics::event(format_args!(
                 "tray.notification_failed title={title} error={error}"
             ));
-            show_error(&format!("{title}\n{message}\n\n托盘通知失败：{error}"));
+            show_error(&crate::tr_format!(
+                "{title}\n{message}\n\n托盘通知失败：{error}",
+                "{title}\n{message}\n\nTray notification failed: {error}"
+            ));
         }
     }
 }
@@ -716,11 +763,24 @@ pub fn quit_current_installation() -> Result<()> {
         };
     }
     let resident_path = PathBuf::from(OsString::from_wide(&path[..length as usize]));
-    let own_path = std::env::current_exe()
-        .map_err(|error| Error::new(E_FAIL, format!("无法确定安装程序路径：{error}")))?;
-    if !same_installation(&own_path, &resident_path)
-        .map_err(|error| Error::new(E_FAIL, format!("无法核对运行中的程序路径：{error}")))?
-    {
+    let own_path = std::env::current_exe().map_err(|error| {
+        Error::new(
+            E_FAIL,
+            crate::tr_format!(
+                "无法确定安装程序路径：{error}",
+                "Could not determine this installation's path: {error}"
+            ),
+        )
+    })?;
+    if !same_installation(&own_path, &resident_path).map_err(|error| {
+        Error::new(
+            E_FAIL,
+            crate::tr_format!(
+                "无法核对运行中的程序路径：{error}",
+                "Could not verify the running app's path: {error}"
+            ),
+        )
+    })? {
         diagnostics::event(format_args!("instance.quit_skipped reason=different_path"));
         return Ok(());
     }
@@ -729,7 +789,13 @@ pub fn quit_current_installation() -> Result<()> {
     let mut current_pid = 0;
     if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut current_pid)) } != 0 {
         if current_pid != pid {
-            return Err(Error::new(E_FAIL, "程序窗口已改变，请重试退出操作"));
+            return Err(Error::new(
+                E_FAIL,
+                tr(
+                    "程序窗口已改变，请重试退出操作",
+                    "The app window has changed. Try exiting again.",
+                ),
+            ));
         }
         if let Err(error) = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }
             && unsafe { WaitForSingleObject(process.0, 0) } != WAIT_OBJECT_0
@@ -744,7 +810,10 @@ pub fn quit_current_installation() -> Result<()> {
         WAIT_OBJECT_0 => Ok(()),
         WAIT_TIMEOUT => Err(Error::new(
             E_FAIL,
-            "color-picker 未在 10 秒内退出，请通过托盘退出后重试",
+            tr(
+                "color-picker 未在 10 秒内退出，请通过托盘退出后重试",
+                "Color Picker did not exit within 10 seconds. Exit from the tray and try again.",
+            ),
         )),
         _ => Err(Error::from_thread()),
     }
@@ -768,7 +837,10 @@ fn wait_for_existing_host(
         if remaining.is_zero() {
             return Err(Error::new(
                 E_FAIL,
-                "color-picker 已在运行，但控制窗口未在 10 秒内就绪，请退出后重试",
+                tr(
+                    "color-picker 已在运行，但控制窗口未在 10 秒内就绪，请退出后重试",
+                    "Color Picker is running, but its control window was not ready within 10 seconds. Exit the app and try again.",
+                ),
             ));
         }
         std::thread::sleep(remaining.min(Duration::from_millis(50)));
@@ -817,7 +889,10 @@ fn activate_existing(allow_onboarding: bool) -> Result<()> {
     }
     Err(Error::new(
         E_FAIL,
-        "color-picker 已在运行，但现有实例尚未就绪；请稍后重试。",
+        tr(
+            "color-picker 已在运行，但现有实例尚未就绪；请稍后重试。",
+            "Color Picker is already running but is not ready yet. Try again shortly.",
+        ),
     ))
 }
 
@@ -1050,6 +1125,7 @@ mod tests {
     #[test]
     #[ignore = "requires an interactive Windows desktop; restores its own settings window"]
     fn blocked_pick_restores_settings_and_explains_without_applying() {
+        crate::app::i18n::set_language(crate::app::i18n::Language::SimplifiedChinese);
         let config = crate::app::config::Config::default();
         let window = SettingsWindow::new(&config, HWND::default(), None, true).unwrap();
         let _ = unsafe { ShowWindow(window.hwnd(), SW_MINIMIZE) };

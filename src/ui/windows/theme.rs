@@ -18,6 +18,7 @@ use windows::{
 };
 
 use super::drawing::dip;
+use crate::app::i18n::{Language, language, tr};
 use crate::platform::windows::icon::WindowIcons;
 
 const CANVAS: COLORREF = rgb(0xf5f7fa);
@@ -172,7 +173,10 @@ impl Font {
                 if mono {
                     w!("Consolas")
                 } else {
-                    w!("Microsoft YaHei UI")
+                    match language() {
+                        Language::SimplifiedChinese => w!("Microsoft YaHei UI"),
+                        Language::English => w!("Segoe UI"),
+                    }
                 },
             )
         };
@@ -313,18 +317,26 @@ fn draw_button(lparam: LPARAM, primary_id: usize, minimal: bool) -> Option<LRESU
         SetTextColor(hdc, text);
         let mut label = [0_u16; 128];
         let mut length = GetWindowTextW(header.hwndFrom, &mut label) as usize;
-        let copied_label = [0x5df2, 0x590d, 0x5236]; // 已复制
+        let copied_label = tr("已复制", "Copied");
+        let copied_length = copied_label.encode_utf16().count();
         if minimal
             && (primary || (100..104).contains(&header.idFrom))
-            && label[..length].starts_with(&copied_label)
+            && label[..length]
+                .iter()
+                .copied()
+                .take(copied_length)
+                .eq(copied_label.encode_utf16())
         {
             // The accessible native name still includes the copied format.
-            length = copied_label.len();
+            length = copied_length;
         } else if (100..104).contains(&header.idFrom) {
             // Keep the full native name (e.g. "复制 CSS RGB") for screen readers,
             // while the visible row already identifies the target format.
-            label[..2].copy_from_slice(&[0x590d, 0x5236]);
-            length = 2;
+            let copy_label = tr("复制", "Copy");
+            for (slot, character) in label.iter_mut().zip(copy_label.encode_utf16()) {
+                *slot = character;
+            }
+            length = copy_label.encode_utf16().count();
         }
         let mut rect = draw.rc;
         let flags = DT_CENTER

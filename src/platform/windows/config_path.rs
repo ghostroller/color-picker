@@ -1,5 +1,6 @@
 //! Resolve the configuration directory through the current user's known folder.
 
+use crate::app::i18n::tr;
 use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
 
 use windows::{
@@ -20,14 +21,20 @@ pub fn default_config_path() -> Result<PathBuf> {
     if allocation.0.is_null() {
         return Err(Error::new(
             E_FAIL,
-            "LocalAppData known folder returned a null path",
+            tr(
+                "无法获取 LocalAppData 配置目录",
+                "LocalAppData known folder returned a null path",
+            ),
         ));
     }
     let path = OsString::from_wide(unsafe { allocation.0.as_wide() });
     if path.is_empty() {
         return Err(Error::new(
             E_FAIL,
-            "LocalAppData known folder returned an empty path",
+            tr(
+                "LocalAppData 配置目录为空",
+                "LocalAppData known folder returned an empty path",
+            ),
         ));
     }
     Ok(PathBuf::from(path).join("color-picker").join("config.json"))
