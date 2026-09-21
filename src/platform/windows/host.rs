@@ -381,7 +381,8 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime)
                 || {
                     diagnostics::event(format_args!(
                         "activation.ignored reason=picker_or_settings_active"
-                    ))
+                    ));
+                    explain_settings_block(settings_window.as_ref());
                 },
             );
             if pending & MENU != 0 {
@@ -397,7 +398,9 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime)
                 match tray.show_menu(false)? {
                     Some(TrayCommand::Start) => {
                         diagnostics::event(format_args!("tray.menu_selected command=start"));
-                        activate(tray, &mut controller, &mut result_window);
+                        if !explain_settings_block(settings_window.as_ref()) {
+                            activate(tray, &mut controller, &mut result_window);
+                        }
                     }
                     Some(TrayCommand::Stop) => {
                         controller.stop("tray_menu");
@@ -501,6 +504,30 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime)
             DispatchMessageW(&message);
         }
     }
+}
+
+fn explain_settings_block(window: Option<&SettingsWindow>) -> bool {
+    let Some(window) = window else {
+        return false;
+    };
+    // Preserve the draft and keep capture stopped. This also restores a
+    // minimized/covered settings window when a hotkey or second launch arrives.
+    if let Err(error) = window.show_status(
+        "设置窗口打开时暂停取色。请先应用需要保存的更改，再关闭此窗口。",
+        false,
+    ) {
+        diagnostics::event(format_args!(
+            "settings.activation_notice_failed error={error}"
+        ));
+    }
+    unsafe {
+        let _ = ShowWindow(window.hwnd(), SW_RESTORE);
+        let _ = SetForegroundWindow(window.hwnd());
+    }
+    diagnostics::event(format_args!(
+        "settings.activation_blocked window_restored=true"
+    ));
+    true
 }
 
 fn activate(
@@ -908,6 +935,23 @@ impl Drop for SessionNotifications {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; restores its own settings window"]
+    fn blocked_pick_restores_settings_and_explains_without_applying() {
+        let config = crate::app::config::Config::default();
+        let window = SettingsWindow::new(&config, HWND::default(), None, true).unwrap();
+        let _ = unsafe { ShowWindow(window.hwnd(), SW_MINIMIZE) };
+        assert!(unsafe { IsIconic(window.hwnd()) }.as_bool());
+        assert!(explain_settings_block(Some(&window)));
+        assert!(!unsafe { IsIconic(window.hwnd()) }.as_bool());
+        assert_eq!(window.process_pending().unwrap(), None);
+        let status = unsafe { GetDlgItem(Some(window.hwnd()), 14) }.unwrap();
+        let mut text = [0_u16; 256];
+        let length = unsafe { GetWindowTextW(status, &mut text) };
+        assert!(String::from_utf16_lossy(&text[..length as usize]).contains("暂停取色"));
+        assert!(!explain_settings_block(None));
+    }
 
     #[test]
     fn quit_waits_for_a_starting_instance_without_creating_or_retaining_its_marker() {
