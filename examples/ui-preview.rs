@@ -208,12 +208,7 @@ mod fixture {
                     work,
                     config.appearance,
                 )?;
-                let bounds = window.rect().expect("shown magnifier");
-                let footer_height = (24 * unsafe { GetDpiForWindow(window.hwnd()) } + 48) / 96;
-                window.update_hover(ScreenPointPx {
-                    x: bounds.left + (bounds.width() / 2) as i32,
-                    y: bounds.top + ((bounds.height() - footer_height) / 2) as i32,
-                })?;
+                window.update_hover(focus)?;
                 Scene::Frozen(window)
             }
             _ => {
@@ -232,6 +227,9 @@ mod fixture {
             // retain WDA_EXCLUDEFROMCAPTURE for sampling correctness.
             let _ = SetWindowDisplayAffinity(scene.hwnd(), WDA_NONE);
             let _ = UpdateWindow(scene.hwnd());
+            // Let the compositor finish the capture-affinity change before
+            // exporting a layered preview's own backing surface.
+            DwmFlush()?;
         }
         if let Some(output) = std::env::args()
             .find_map(|arg| arg.strip_prefix("--output=").map(std::path::PathBuf::from))

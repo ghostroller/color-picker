@@ -82,13 +82,9 @@ fn cached_selection_and_native_result_controls_smoke() {
         (WS_EX_TOPMOST | WS_EX_NOACTIVATE).0
     );
     let bounds = magnifier.rect().unwrap();
-    // Edge-clipped snapshots can have rectangular viewports. Exclude only the
-    // compact 24 DIP footer when locating the image center.
-    let footer_height = (24 * unsafe { GetDpiForWindow(magnifier_hwnd) } + 48) / 96;
-    let hover = ScreenPointPx {
-        x: (i64::from(bounds.left) + i64::from(bounds.width()) / 2) as i32,
-        y: (i64::from(bounds.top) + i64::from(bounds.height() - footer_height) / 2) as i32,
-    };
+    // The original focus stays over its source pixel even when the footer
+    // adapts to the available width and current display scaling.
+    let hover = focus;
     let picked = magnifier
         .hit_test(hover)
         .expect("the image center must be selectable");

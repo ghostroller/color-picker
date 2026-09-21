@@ -56,21 +56,25 @@ try {
 
 A small Windows system tray app for picking screen colors. The app interface is currently in Simplified Chinese.
 
-1. Extract the ZIP and run `color-picker.exe`. The app stays in the system tray.
+1. Extract the ZIP and run `color-picker.exe`. Your first manual launch shows a short guide, then the app stays in the system tray.
 2. Press **Ctrl + Alt + C**, click its tray icon, or choose **开始取色** (Start picking) from the tray menu.
 3. Left-click to pick a color. Copy **HEX**, **RGB**, **CSS RGB**, or **HSL** from the result window.
 
-Right-click or press **Esc** to cancel. Scroll up to freeze and magnify the screen; scroll down to zoom out, returning to live picking below 4×. In frozen mode, clicking outside the picker also cancels.
+Right-click or press **Esc** to cancel. Scroll up to freeze and magnify the screen; scroll down to zoom out, returning to live picking below 4×. Hovering over frozen pixels updates their HEX and original screen X/Y coordinates alongside the zoom level. In frozen mode, clicking outside the picker also cancels. The tray menu shows the current shortcut and its registration status.
 
-Choose **设置** (Settings) from the tray menu to change the shortcut, default copy format, automatic copying, border width (0–6 DIP), or background transparency (0–80%). Defaults are 2 DIP and 35%; 0 hides the border or makes the background opaque, respectively. Click **应用** (Apply) to save, then close Settings to resume picking. Saved preferences survive restarts. For the shortcut's main key, click the key button and press A–Z, 0–9, or F1–F11; Esc or leaving the control cancels recording.
+Choose **设置** (Settings) from the tray menu to change the shortcut, default copy format, automatic copying, Quick pick, border width (0–6 DIP), or background transparency (0–80%). Defaults are 2 DIP and 35%; 0 hides the border or makes the background opaque, respectively. Settings fits the screen's available height, with scrollable content and **应用** (Apply) fixed at the bottom. Its synthetic-color preview updates as you drag the sliders; click Apply to save. Close Settings to resume picking; trying to pick while it is open restores it with an explanation and preserves your edits. Saved preferences survive restarts. For the shortcut's main key, click the key button and press A–Z, 0–9, or F1–F11; Esc or leaving the control cancels recording.
+
+Automatic copying and **快速取色** (Quick pick) are off by default. Quick pick always copies the default format; on success it leaves your current app focused without a result popup, while failure opens the result for retry. Your ordinary automatic-copy preference is retained while Quick pick is enabled. In a normal result window, a successful copy briefly shows **已复制** (Copied) on its button without expanding the layout; only errors need extra space.
 
 Use **退出** (Exit) in the tray menu to quit. Closing a result window leaves the app running. Administrator access is not required, and the app has no background network features.
 
 ## Installation and help
 
-The portable ZIP does not register a startup entry. The installer offers optional startup at Windows sign-in; see the [installation guide](docs/windows-installer.md).
+The portable ZIP does not register a startup entry. The installer offers optional startup at Windows sign-in, which stays quiet without showing the welcome guide; see the [installation guide](docs/windows-installer.md).
 
 Preferences are stored in `%LOCALAPPDATA%\color-picker\config.json`. A damaged file or unknown configuration version is preserved; exit the app, repair or move the file, and restart to restore saving. Shortcut conflicts and failed saves preserve the previous settings. See [troubleshooting](docs/troubleshooting.md) for help.
+
+The welcome guide is remembered separately in `%LOCALAPPDATA%\color-picker\welcome-v1.seen`. Automation can use `--no-onboarding` to suppress the guide without marking it as seen.
 
 For diagnostic logging, first exit the running instance, then run this command in PowerShell:
 
@@ -94,21 +98,25 @@ Dependency notices are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) and `
 
 一款驻留 Windows 系统托盘的轻量屏幕取色工具。当前应用界面为简体中文。
 
-1. 解压 ZIP，运行 `color-picker.exe`；应用会驻留系统托盘。
+1. 解压 ZIP，运行 `color-picker.exe`；首次手动启动会显示简短指引，之后应用驻留系统托盘。
 2. 按 **Ctrl + Alt + C**、点击托盘图标，或在托盘菜单选择**开始取色**。
 3. 左键确认颜色，然后在结果窗口复制 **HEX**、**RGB**、**CSS RGB** 或 **HSL**。
 
-右键或 **Esc** 取消。滚轮向上冻结并放大画面，向下缩小；缩出 4× 后返回实时取色。冻结模式下，左键点击取色窗口外也会取消。
+右键或 **Esc** 取消。滚轮向上冻结并放大画面，向下缩小；缩出 4× 后返回实时取色。在冻结像素格内移动鼠标，信息栏会更新 HEX、原始屏幕 X/Y 坐标和倍率。冻结模式下，左键点击取色窗口外也会取消。托盘菜单显示当前快捷键及注册状态。
 
-托盘菜单中的**设置**可更改快捷键、默认复制格式、自动复制、边框粗细（0–6 DIP）和背景透明度（0–80%）。默认边框 2 DIP、透明度 35%；边框设为 0 时隐藏，透明度设为 0 时背景不透明。点击**应用**保存，关闭设置后继续取色，重启后设置仍保留。录入快捷键主键时，点击主键按钮后按 A–Z、0–9 或 F1–F11；Esc 或离开控件取消监听。
+托盘菜单中的**设置**可更改快捷键、默认复制格式、自动复制、快速取色、边框粗细（0–6 DIP）和背景透明度（0–80%）。默认边框 2 DIP、透明度 35%；边框设为 0 时隐藏，透明度设为 0 时背景不透明。设置按屏幕可用高度调整，内容可滚动，底部**应用**按钮固定可见。拖动滑块会立即更新合成颜色预览，点击应用才保存。关闭设置后继续取色；设置打开时触发取色，会恢复设置窗口、说明原因并保留编辑。重启后设置仍保留。录入快捷键主键时，点击主键按钮后按 A–Z、0–9 或 F1–F11；Esc 或离开控件取消监听。
+
+自动复制和**快速取色**默认均关闭。快速取色始终复制默认格式，成功时不弹出结果、不改变当前应用焦点，失败才显示结果供重试；普通自动复制偏好会保留。普通结果窗口复制成功后，对应按钮短暂显示**已复制**，正常布局不变；只有错误信息才会展开额外空间。
 
 退出请使用托盘菜单中的**退出**；关闭结果窗口后应用仍会驻留。应用无需管理员权限，没有后台网络功能。
 
 ## 安装与帮助
 
-便携 ZIP 不注册启动项。安装版可选择登录 Windows 时自动启动，详见[安装指南](docs/windows-installer.md)。
+便携 ZIP 不注册启动项。安装版可选择登录 Windows 时自动启动，此时保持安静、不弹出首次指引，详见[安装指南](docs/windows-installer.md)。
 
 配置保存在 `%LOCALAPPDATA%\color-picker\config.json`。损坏或未知版本的文件会保留；退出应用后修复或移走该文件，重新启动即可恢复保存设置。快捷键冲突或保存失败时保留原设置。遇到问题可查看[故障排查](docs/troubleshooting.md)。
+
+首次指引使用独立的 `%LOCALAPPDATA%\color-picker\welcome-v1.seen` 文件记录。自动化启动可使用 `--no-onboarding` 跳过指引，不会将其标记为已显示。
 
 需要诊断日志时，先退出旧实例，再在 PowerShell 中运行：
 

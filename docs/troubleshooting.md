@@ -5,11 +5,17 @@
 ## The shortcut does nothing
 
 1. Check the system tray, including hidden icons, to confirm the app is running.
-2. Close Settings if it is open; picking is paused while that window is open.
-3. Activate the tray icon or choose **开始取色** (Start picking) from its menu. This works even when the global shortcut could not be registered.
+2. Check the current shortcut and registration status in the tray menu. If Settings is open, a pick request restores that window and explains that picking is paused; apply any edits you want to keep, then close it.
+3. Activate the tray icon or choose **开始取色** (Start picking) from its menu. This works even when the global shortcut could not be registered, once Settings is closed.
 4. Open **设置** (Settings), choose an unused shortcut, and click **应用** (Apply). A shortcut needs Ctrl and/or Alt, optionally Shift, and one of A–Z, 0–9, or F1–F11. You can also click Apply to retry registering the existing shortcut.
 
 Windows notification settings can suppress error notifications. If the issue persists, enable the optional file log below.
+
+## Finding settings on a small or scaled display
+
+The settings window fits the monitor's work area. Scroll its content to reach lower options; the **应用** (Apply) button remains fixed at the bottom. Tab navigation also brings the focused setting into view.
+
+The sample-color preview responds immediately to the border and transparency sliders. It uses synthetic colors, so it does not sample your desktop. The active picker appearance changes only after Apply; closing without applying discards the draft.
 
 ## Settings cannot be saved
 
@@ -21,7 +27,19 @@ If another program changes the file while settings are being saved, the app canc
 
 ## Copying fails
 
-The result window reports clipboard errors. If another application is using the clipboard, wait for it to finish and click **复制** (Copy) again. The result's text remains selectable. A failed automatic copy does not require you to pick the color again.
+The result window expands to report clipboard errors. If another application is using the clipboard, wait for it to finish and click **复制** (Copy) again. The result's text remains selectable. A failed automatic or quick copy does not require you to pick the color again. Successful copies briefly show **已复制** (Copied) on the corresponding button without expanding the normal layout.
+
+## A successful pick does not open a result window
+
+Check **快速取色** (Quick pick) in Settings. It is off by default. When enabled, every pick copies the default format and leaves your current app focused, without a result popup on success. A failed copy reveals the result and its error so you can retry.
+
+Quick pick temporarily disables the ordinary automatic-copy checkbox while preserving its value. Turn Quick pick off to resume ordinary results and your previous automatic-copy preference.
+
+## The welcome guide appears or is missing
+
+The short guide appears on the first manual launch. Windows sign-in startup (`--startup`) stays quiet and does not consume it. After you acknowledge the guide, the app creates `%LOCALAPPDATA%\color-picker\welcome-v1.seen`, independently of `config.json`. If the marker cannot be written, the guide may appear again on a later launch.
+
+For automation, use `--no-onboarding` to suppress the guide without creating its marker. To see it again yourself, exit the app, remove only `welcome-v1.seen`, then launch normally. This does not reset your preferences.
 
 ## The sampled color differs from the source
 
@@ -54,11 +72,13 @@ For an installed or portable executable, you can supply a log path directly. For
 | `hotkey.received` | The host received `WM_HOTKEY` |
 | `activation.handled` | Activation was handled and live picking started |
 | `activation.ignored` | An existing preview caused a repeated activation to be ignored |
+| `settings.activation_blocked` | Picking stayed paused; the existing settings window was restored with an explanation |
 | `preview.started` | The sampling session and timer were created |
 | `preview.stopped` | The timer and preview resources were released |
 | `session.starting` / `session.finishing` | Waiting for input readiness / releasing a consumed gesture |
 | `session.frozen` / `session.resumed_live` | Entered frozen zoom / resumed live picking |
 | `result.shown` | The result window appeared after input and sampling cleanup |
+| `result.quick_copy_started` | A quick pick started copying the default format while its result remained hidden; this event alone does not confirm success |
 | `config.applied` / `config.apply_failed` | Settings were saved / a failed change left previous settings active |
 | `preview.sample_unavailable` / `preview.failed` | Sampling was temporarily unavailable / the preview stopped after an error |
 | `tray.notification_accepted` | Windows accepted the notification request; this does not prove it was visible |
@@ -70,6 +90,8 @@ Logs contain discrete application events and errors, not general keystrokes, scr
 ## Developer checks
 
 `color-picker.exe --check-environment` checks the effective DPI awareness and exits without installing input hooks. The main [developer guide](https://github.com/ghostroller/color-picker/blob/main/README.md#develop) covers build and test commands.
+
+Run native window unit checks serially in an interactive Windows session with `cargo test --locked --lib -- --ignored --test-threads=1`. They cover scrolling, stable copy feedback, and quick-copy success/failure without changing the real clipboard. Automation that launches the app should pass `--no-onboarding` to avoid a modal welcome guide.
 
 For a known pixel pattern, run `cargo run --locked --example pixel-fixture`. Its 384×256-pixel client area uses RGB `(x % 256, y % 256, (x ^ y) % 256)` at local `(x, y)`, except for the bottom 16 rows, which contain repeating single-pixel red, green, and blue columns. The title shows the client area's physical origin. Close the window when finished.
 
