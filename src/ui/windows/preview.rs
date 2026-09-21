@@ -16,7 +16,7 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, Error, Result, w};
 
-use super::drawing::{Content, PaintSession, Surface, dip};
+use super::drawing::{Content, PaintSession, Surface, dip, live_preview_height_dip};
 use crate::app::{config::AppearanceConfig, diagnostics};
 use crate::core::color::Rgb8;
 use crate::core::format::{ColorFormat, format_color};
@@ -176,7 +176,10 @@ impl PreviewWindow {
                 return Err(Error::new(E_FAIL, "Could not determine preview DPI"));
             }
             let width = dip(168, dpi);
-            let height = dip(38, dpi);
+            let height = dip(
+                live_preview_height_dip(self.appearance.border_width_dip),
+                dpi,
+            );
             let Some(rect) = place_preview(
                 point,
                 work_area,

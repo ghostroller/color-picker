@@ -10,7 +10,9 @@ use windows::{
 };
 
 use super::super::{
-    drawing::{OwnedFont, dip, draw_bottom_right_border, draw_text, palette},
+    drawing::{
+        OwnedFont, dip, draw_bottom_right_border, draw_text, live_preview_height_dip, palette,
+    },
     frost::blur_and_tint,
 };
 use crate::app::config::AppearanceConfig;
@@ -18,8 +20,6 @@ use crate::app::config::AppearanceConfig;
 pub(super) const WIDTH: i32 = 396;
 pub(super) const HEIGHT: i32 = 72;
 const OVERLAY_WIDTH: i32 = 168;
-// Leave room below the coordinate line even at the maximum 6 DIP border.
-const OVERLAY_HEIGHT: i32 = 44;
 
 pub(super) struct AppearancePreview {
     dpi: u32,
@@ -34,7 +34,7 @@ impl AppearancePreview {
         Ok(Self {
             dpi,
             appearance,
-            pixels: example_pixels(dpi, appearance.background_transparency_percent),
+            pixels: example_pixels(dpi, appearance),
             heading: OwnedFont::new(13, 600, dpi)?,
             body: OwnedFont::new(10, 400, dpi)?,
         })
@@ -84,7 +84,11 @@ impl AppearancePreview {
                 return Err(Error::new(E_FAIL, "Could not draw appearance example"));
             }
             let x = bounds.left + (width - dip(OVERLAY_WIDTH, self.dpi)) / 2;
-            let y = bounds.top + (height - dip(OVERLAY_HEIGHT, self.dpi)) / 2;
+            let overlay_height = dip(
+                live_preview_height_dip(self.appearance.border_width_dip),
+                self.dpi,
+            );
+            let y = bounds.top + (height - overlay_height) / 2;
             unsafe {
                 SetViewportOrgEx(dc, x, y, None).ok()?;
             }
@@ -111,7 +115,7 @@ impl AppearancePreview {
             draw_bottom_right_border(
                 dc,
                 dip(OVERLAY_WIDTH, self.dpi),
-                dip(OVERLAY_HEIGHT, self.dpi),
+                overlay_height,
                 self.dpi,
                 self.appearance.border_width_dip,
             )
@@ -121,7 +125,7 @@ impl AppearancePreview {
     }
 }
 
-fn example_pixels(dpi: u32, transparency: u8) -> Vec<u8> {
+fn example_pixels(dpi: u32, appearance: AppearanceConfig) -> Vec<u8> {
     let width = dip(WIDTH, dpi) as usize;
     let height = dip(HEIGHT, dpi) as usize;
     let mut pixels = vec![0xff; width * height * 4];
@@ -138,7 +142,7 @@ fn example_pixels(dpi: u32, transparency: u8) -> Vec<u8> {
         }
     }
     let overlay_width = dip(OVERLAY_WIDTH, dpi) as usize;
-    let overlay_height = dip(OVERLAY_HEIGHT, dpi) as usize;
+    let overlay_height = dip(live_preview_height_dip(appearance.border_width_dip), dpi) as usize;
     let left = (width - overlay_width) / 2;
     let top = (height - overlay_height) / 2;
     let swatch_width = dip(38, dpi) as usize;
@@ -156,7 +160,7 @@ fn example_pixels(dpi: u32, transparency: u8) -> Vec<u8> {
         panel_width,
         overlay_height,
         dip(8, dpi).max(1) as usize,
-        transparency,
+        appearance.background_transparency_percent,
     );
     for y in 0..overlay_height {
         for x in 0..swatch_width {
@@ -177,12 +181,29 @@ mod tests {
     #[test]
     fn example_transparency_only_changes_the_information_panel() {
         for dpi in [96, 144, 192] {
-            let opaque = example_pixels(dpi, 0);
-            let transparent = example_pixels(dpi, 80);
+            let opaque = example_pixels(
+                dpi,
+                AppearanceConfig {
+                    background_transparency_percent: 0,
+                    ..AppearanceConfig::default()
+                },
+            );
+            let transparent = example_pixels(
+                dpi,
+                AppearanceConfig {
+                    background_transparency_percent: 80,
+                    ..AppearanceConfig::default()
+                },
+            );
             let width = dip(WIDTH, dpi) as usize;
             let height = dip(HEIGHT, dpi) as usize;
             let left = (width - dip(OVERLAY_WIDTH, dpi) as usize) / 2;
-            let top = (height - dip(OVERLAY_HEIGHT, dpi) as usize) / 2;
+            let top = (height
+                - dip(
+                    live_preview_height_dip(AppearanceConfig::default().border_width_dip),
+                    dpi,
+                ) as usize)
+                / 2;
             let at = |x, y| (y * width + x) * 4;
             let swatch = at(left + dip(10, dpi) as usize, top + dip(10, dpi) as usize);
             assert_eq!(&opaque[swatch..swatch + 4], &[0xc6, 0xa7, 0x49, 255]);

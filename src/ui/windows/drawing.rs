@@ -13,6 +13,12 @@ pub(super) fn dip(value: i32, dpi: u32) -> i32 {
     ((i64::from(value) * i64::from(dpi) + 48) / 96) as i32
 }
 
+/// Preserve the default 38 DIP footprint while reserving space for wider
+/// bottom borders. The text keeps its original baseline and readable area.
+pub(super) fn live_preview_height_dip(border_width_dip: u8) -> i32 {
+    38 + i32::from(border_width_dip.saturating_sub(2))
+}
+
 /// The sampling overlays deliberately stay dark, so they remain distinct from
 /// both the sampled pixels and the normal result/settings windows.
 pub(super) mod palette {
@@ -400,5 +406,85 @@ impl PaintSession {
 impl Drop for PaintSession {
     fn drop(&mut self) {
         let _ = unsafe { EndPaint(self.hwnd, &self.paint) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_live_borders_leave_both_text_lines_intact_at_common_dpis() {
+        let content = Content {
+            rgb: Some(Rgb8::new(0x49, 0xa7, 0xc6)),
+            color_text: "#49A7C6".encode_utf16().collect(),
+            coordinates: "X -12345  Y -67890".encode_utf16().collect(),
+        };
+        assert_eq!(live_preview_height_dip(2), 38);
+        for dpi in [96, 120, 144, 168, 192] {
+            let width = dip(168, dpi);
+            let reference = Surface::new(
+                width,
+                dip(44, dpi),
+                dpi,
+                false,
+                AppearanceConfig {
+                    border_width_dip: 0,
+                    background_transparency_percent: 0,
+                },
+            )
+            .unwrap();
+            // Draw directly into its own offscreen bitmap: no window, screen
+            // capture, focus change or clipboard access is involved.
+            reference
+                .draw(reference.dc.0, &content, ScreenPointPx { x: 0, y: 0 })
+                .unwrap();
+            for border in 0..=6 {
+                let height = dip(live_preview_height_dip(border), dpi);
+                let actual = Surface::new(
+                    width,
+                    height,
+                    dpi,
+                    false,
+                    AppearanceConfig {
+                        border_width_dip: border,
+                        background_transparency_percent: 0,
+                    },
+                )
+                .unwrap();
+                actual
+                    .draw(actual.dc.0, &content, ScreenPointPx { x: 0, y: 0 })
+                    .unwrap();
+                let mut text_pixels = [0, 0];
+                for y in dip(2, dpi)..dip(37, dpi) {
+                    for x in dip(44, dpi)..dip(164, dpi) {
+                        let expected = unsafe { GetPixel(reference.dc.0, x, y) };
+                        if expected != palette::PANEL {
+                            let line = usize::from(y >= dip(21, dpi));
+                            text_pixels[line] += 1;
+                            assert_eq!(
+                                unsafe { GetPixel(actual.dc.0, x, y) },
+                                expected,
+                                "border {border} at {dpi} DPI covered text at ({x}, {y})"
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    text_pixels.into_iter().all(|count| count > 20),
+                    "both lines must render"
+                );
+                if border > 0 {
+                    assert_eq!(
+                        unsafe { GetPixel(actual.dc.0, width - 1, height / 2) },
+                        palette::BORDER
+                    );
+                    assert_eq!(
+                        unsafe { GetPixel(actual.dc.0, width / 2, height - 1) },
+                        palette::BORDER
+                    );
+                }
+            }
+        }
     }
 }
