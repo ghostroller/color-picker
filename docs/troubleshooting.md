@@ -2,6 +2,12 @@
 
 [English README](../README.md) · [中文说明](../README.zh-CN.md)
 
+## Changing the interface language
+
+Open **Settings** (设置) from the tray menu, choose **Language** (语言), then click **Apply** (应用). English and Simplified Chinese are supported, and switching takes effect immediately without restarting. Changing the dropdown alone does not apply or save the choice. If saving or shortcut registration fails, the previous language remains active.
+
+On first use, Chinese Windows display languages select Simplified Chinese; other languages select English. Older configuration files without a `language` field use the same default. A saved choice survives restarts. The installer has its own language selection.
+
 ## The shortcut does nothing
 
 1. Check the system tray, including hidden icons, to confirm the app is running.

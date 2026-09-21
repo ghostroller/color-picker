@@ -11,7 +11,11 @@
 设置继续使用浅灰背景、白色卡片与蓝色主操作。
 应用、托盘、结果 / 设置窗口、安装器共用透明底的青蓝滴管图标，提供 16–256 像素的九档尺寸。
 图标源文件为 `resources/app.svg`，可运行 `scripts/generate-icon.ps1` 重建 ICO；正常构建无需图标生成工具。
-颜色值使用等宽字体，中文使用 Microsoft YaHei UI。实时和冻结取色浮窗使用
+应用支持简体中文和英文，首次使用跟随 Windows 显示语言，非中文使用英文。
+设置页顶部的语言下拉框只修改草稿；点击“应用”保存成功后立即刷新设置、托盘与后续取色窗口，
+无需重启，并保留当前滚动位置。保存失败或快捷键冲突时仍使用原语言。
+旧配置缺少 `language` 时使用系统默认语言；保存的 `zh-CN` / `en` 选择在重启后保留。
+颜色值使用等宽字体，中文使用 Microsoft YaHei UI，英文使用 Segoe UI。实时和冻结取色浮窗使用
 统一的深色配色与分级文字，保留原有像素绘制和命中映射。
 
 所有交互仍为原生 Win32 控件。只读色值可选择，Tab / Enter / Esc、复制重试、
@@ -57,8 +61,8 @@
 ## 本机检查
 
 - Windows 11；图片由预览程序直接导出自身原生窗口，使用合成取色数据。
-- `scripts/verify-windows.ps1` 通过：格式、Clippy、94 项默认测试、x64 Release、
-  嵌入 manifest 和 PerMonitorV2 检查；另串行运行 13 项桌面测试通过。
+- `scripts/verify-windows.ps1` 通过：格式、Clippy、98 项默认测试、x64 Release、
+  嵌入 manifest 和 PerMonitorV2 检查；另串行运行 15 项桌面测试通过。
 - 主程序、示例和测试统一嵌入 Common Controls v6 清单。首次指引打开时的宿主退出已实测，
   会立即关闭指引并保留未读状态；收到退出或环境变化后不会执行旧取色请求。
 - 已有 `windows_selection_ui` 桌面冒烟通过，覆盖冻结倍率映射、只读色值、
@@ -69,6 +73,8 @@
   这些复制路径检查使用模拟结果，不改写真实剪贴板。
 - 外观滑块的范围、初值、方向键 / End、Tab 顺序、数值刷新、仅应用返回草稿均通过；
   旧配置补默认值、新参数保存重载、非法范围保护已用隔离配置文件验证。
+- 中英文配置往返、语言保存失败回滚、设置草稿与滚动位置保留、英文复制反馈的原生字体宽度、
+  两种语言下的多 DPI 放大镜布局均有回归覆盖；两种语言的设置与结果窗口已导出检查。
 - 上、下方鼠标锚点的 4×→8×→16×→32× 及反向缩小已通过真实 GDI 离屏绘图回归，
   比较屏幕绘制色值与源缓存命中，防止纵向裁剪反向。
 - 预览的置顶 / 不抢焦点 / 100 次资源释放检查通过：本轮 GDI 为 2，USER 为 2，
@@ -82,6 +88,8 @@
 ```powershell
 cargo run --release --example ui-preview -- result
 cargo run --release --example ui-preview -- settings
+cargo run --release --example ui-preview -- settings --language=en
+cargo run --release --example ui-preview -- result --language=zh-CN
 cargo run --release --example ui-preview -- live
 cargo run --release --example ui-preview -- frozen
 cargo run --release --example ui-preview -- frozen-edge
@@ -90,7 +98,8 @@ cargo run --release --example ui-preview -- live 60 --backdrop --border=4 --tran
 cargo run --example ui-preview -- result --color=F4F2F2 --output=target/result-preview.bmp
 ```
 
-可在模式后指定存活秒数（1–600）。预览中的“应用”只校验，不保存；
+可在模式后指定存活秒数（1–600）；`--language=en` / `--language=zh-CN` 指定预览语言，
+省略时跟随 Windows 显示语言。预览中的“应用”校验并切换预览语言，不保存；
 结果窗口的复制按钮在用户主动点击时仍会写入剪贴板。浮窗仅在这个合成预览中
 允许截图，正常程序继续排除取色浮窗，避免采到自身画面。
 `--backdrop` 会显示一个合成棋盘背景，方便检查磨砂；下方取色浮窗截图使用此背景。
@@ -99,9 +108,13 @@ cargo run --example ui-preview -- result --color=F4F2F2 --output=target/result-p
 
 ### 取色结果
 
+![English result](images/ui-result-en.png)
+
 ![取色结果](images/ui-result.png)
 
 ### 设置
+
+![English settings](images/ui-settings-en.png)
 
 ![设置](images/ui-settings.png)
 

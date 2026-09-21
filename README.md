@@ -12,9 +12,11 @@ A native Windows color picker that stays in your system tray. Pick a pixel anywh
 2. Run the installer, or extract the entire ZIP and open `color-picker.exe`. No administrator privileges are required.
 3. On your first manual launch, read the short guide, then find Color Picker in the system tray, including the hidden-icons area. Startup at Windows sign-in stays quiet.
 4. Press **Ctrl + Alt + C**, move over the color you want, and **left-click** to select it.
-5. In the result window, copy HEX, RGB, CSS RGB, or HSL. Choose **重新取色** (Pick again) to select another color.
+5. In the result window, copy HEX, RGB, CSS RGB, or HSL. Choose **Pick again** to select another color.
 
-The target platform is **Windows 11 x64**. Windows 10 22H2 x64 compatibility has not yet been fully verified. The app's interface is currently **Simplified Chinese**; the installer offers English and Simplified Chinese. Builds are currently unsigned. See [known limitations](docs/known-limitations.md) for the validation status.
+The app and installer support **English and Simplified Chinese**. The app initially follows your Windows display language: Chinese uses Simplified Chinese; other languages use English. Change **Language** in Settings and click **Apply** to switch immediately, without restarting.
+
+The target platform is **Windows 11 x64**. Windows 10 22H2 x64 compatibility has not yet been fully verified. Builds are currently unsigned. See [known limitations](docs/known-limitations.md) for the validation status.
 
 ## Pick precisely
 
@@ -33,11 +35,11 @@ The frozen preview uses a snapshot, so you can inspect a tiny target without cha
 
 ![Frozen pixel grid with a color value, source coordinates, and zoom level](docs/images/ui-frozen.png)
 
-Starting again during an active pick does not create another session. The tray menu shows your current shortcut and whether Windows registered it successfully. Closing a result window leaves the app in the tray. To quit completely, right-click the tray icon and choose **退出** (Exit).
+Starting again during an active pick does not create another session. The tray menu shows your current shortcut and whether Windows registered it successfully. Closing a result window leaves the app in the tray. To quit completely, right-click the tray icon and choose **Exit**.
 
 ## Copy the format you need
 
-Every result includes the color swatch, original coordinates, and whether it came from live or frozen picking. Values are selectable, and each row has its own **复制** (Copy) button.
+Every result includes the color swatch, original coordinates, and whether it came from live or frozen picking. Values are selectable, and each row has its own **Copy** button.
 
 | Format | Example |
 | --- | --- |
@@ -46,18 +48,19 @@ Every result includes the color swatch, original coordinates, and whether it cam
 | CSS RGB | `rgb(255 0 0)` |
 | HSL | `hsl(0 100% 50%)` |
 
-The main Copy button uses your default format, initially HEX. A successful copy briefly changes that button to **已复制** (Copied), keeping the normal window layout stable. Only failures expand an error message. The result window supports **Tab**, **Enter**, and **Esc** for keyboard navigation and closing.
+The main Copy button uses your default format, initially HEX. A successful copy briefly changes that button to **Copied**, keeping the normal window layout stable. Only failures expand an error message. The result window supports **Tab**, **Enter**, and **Esc** for keyboard navigation and closing.
 
-**Automatic copying and Quick pick are off by default.** Ordinary automatic copying still opens the result window. Enable **快速取色** (Quick pick) to always copy the default format and continue in your current app, without a result popup or focus change on success. If copying fails, the result window appears so you can retry. Your ordinary automatic-copy preference is retained while Quick pick is on and resumes when you turn it off.
+**Automatic copying and Quick pick are off by default.** Ordinary automatic copying still opens the result window. Enable **Quick pick** to always copy the default format and continue in your current app, without a result popup or focus change on success. If copying fails, the result window appears so you can retry. Your ordinary automatic-copy preference is retained while Quick pick is on and resumes when you turn it off.
 
-![Color result with selectable values and copy controls](docs/images/ui-result.png)
+![Color result with selectable values and copy controls](docs/images/ui-result-en.png)
 
 ## Make it yours
 
-Right-click the tray icon and open **设置** (Settings).
+Right-click the tray icon and open **Settings** (设置 in Chinese).
 
 | Setting | Options | Default |
 | --- | --- | --- |
+| Language | English / 简体中文 | Matches Windows; English fallback |
 | Global shortcut | Ctrl and/or Alt, optional Shift, plus A–Z, 0–9, or F1–F11 | Ctrl + Alt + C |
 | Default copy format | HEX, RGB, CSS RGB, HSL | HEX |
 | Copy automatically after picking | On / off | Off |
@@ -67,9 +70,9 @@ Right-click the tray icon and open **设置** (Settings).
 
 To change the shortcut, select its modifiers, click the main-key button, and press the new letter, digit, or function key. **Esc** or moving focus away cancels key recording. F12 is reserved and cannot be used.
 
-Settings fits the monitor's available height. On a small display or at high scaling, scroll the content; **应用** (Apply) stays visible at the bottom. The sample-color preview updates immediately as you drag the border and transparency sliders. It uses synthetic colors and saves nothing until you click Apply.
+Settings fits the monitor's available height. On a small display or at high scaling, scroll the content; **Apply** stays visible at the bottom. The sample-color preview updates immediately as you drag the border and transparency sliders. It uses synthetic colors and saves nothing until you click Apply.
 
-Click **应用** (Apply) to save, then close Settings before picking again. A pick request while Settings is open restores that window and explains why picking is paused, preserving your edits. Closing without applying discards your edits. If a new shortcut is unavailable or saving fails, the previous settings remain active. Picking previews and the result window share a right and bottom border. Transparency affects the picking previews' information backgrounds; color swatches and magnified pixels stay opaque.
+Click **Apply** (应用 in Chinese) to save, then close Settings before picking again. A saved language change updates Settings, the tray menu, and subsequent picking windows immediately, while preserving your scroll position. A pick request while Settings is open restores that window and explains why picking is paused, preserving your edits. Closing without applying discards your edits. If a new shortcut is unavailable or saving fails, the previous settings and language remain active. Picking previews and the result window share a right and bottom border. Transparency affects the picking previews' information backgrounds; color swatches and magnified pixels stay opaque.
 
 Settings are stored in `%LOCALAPPDATA%\color-picker\config.json`, including for portable use. A missing file uses defaults. If a file is invalid, unreadable, or from an unsupported version, the app preserves it, uses defaults, and disables saving. Exit the app, repair or move that file, then restart; you do not need to create a replacement manually.
 
@@ -115,6 +118,8 @@ cargo test --locked --test windows_capture --test windows_preview --test windows
 These tests create temporary windows and app instances, exercise input-hook setup, and temporarily use the default shortcut. They do not generate real keyboard/mouse input or change the clipboard, and do not replace manual display and input testing. Non-Windows systems can run the platform-independent tests with `cargo test --lib --tests --locked`; the app itself is Windows-only.
 
 For automation, pass `--no-onboarding` to suppress the welcome guide without marking it as seen; the next ordinary manual launch can still show it. `--startup` also suppresses the guide and quietly exits when another instance is already running. The optional `quick_pick` setting defaults to `false`, including when loading older configuration files that omit it.
+
+The optional `language` setting accepts `"en"` and `"zh-CN"`. Older configuration files without it use the Windows language default until a choice is saved. Translation pairs and formatted messages use `tr` / `tr_format!` from `src/app/i18n.rs`; the active choice belongs to the UI thread, and both format strings are checked by the compiler. Native Windows error details may follow the operating system's language.
 
 | Location | Purpose |
 | --- | --- |

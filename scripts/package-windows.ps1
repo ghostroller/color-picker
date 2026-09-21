@@ -54,7 +54,7 @@ try {
 
 [简体中文](README.zh-CN.md) · [Full user and developer guide](https://github.com/ghostroller/color-picker/blob/main/README.md)
 
-A small Windows system tray app for picking screen colors. The app interface is currently in Simplified Chinese.
+A small Windows system tray app for picking screen colors, with English and Simplified Chinese interfaces. Initially, Chinese Windows display languages use Simplified Chinese; other languages use English. In Settings (设置), choose Language (语言) and click Apply (应用) to switch immediately and remember your choice.
 
 1. Extract the ZIP and run `color-picker.exe`. Your first manual launch shows a short guide, then the app stays in the system tray.
 2. Press **Ctrl + Alt + C**, click its tray icon, or choose **开始取色** (Start picking) from the tray menu.
@@ -96,7 +96,7 @@ Dependency notices are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) and `
 
 [English](README.md) · [完整用户与开发者指南](https://github.com/ghostroller/color-picker/blob/main/README.zh-CN.md)
 
-一款驻留 Windows 系统托盘的轻量屏幕取色工具。当前应用界面为简体中文。
+一款驻留 Windows 系统托盘的轻量屏幕取色工具，支持简体中文和英文。初始跟随 Windows 显示语言，中文使用简体中文，其他语言使用英文。在设置（Settings）中选择语言（Language）并点击应用（Apply），即可立即切换并记住所选语言。
 
 1. 解压 ZIP，运行 `color-picker.exe`；首次手动启动会显示简短指引，之后应用驻留系统托盘。
 2. 按 **Ctrl + Alt + C**、点击托盘图标，或在托盘菜单选择**开始取色**。
