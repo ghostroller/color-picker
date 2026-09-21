@@ -7,8 +7,9 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW_0, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_STRING, PostMessageW,
-    SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_GRAYED, MF_SEPARATOR,
+    MF_STRING, PostMessageW, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, WM_NULL,
 };
 use windows::core::{Error, Result, w};
 
@@ -69,6 +70,24 @@ impl TrayIcon {
         self.add()
     }
 
+    pub fn update_shortcut(&mut self, shortcut: &str, registered: bool) -> Result<()> {
+        let text = format!(
+            "Color Picker · {}\n点击取色 · 右键打开菜单",
+            shortcut_status(shortcut, registered)
+        );
+        copy_utf16(&mut self.data.szTip, &text);
+        let mut data = self.data;
+        data.uFlags = NIF_TIP | NIF_SHOWTIP;
+        if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+            Ok(())
+        } else {
+            Err(Error::new(
+                E_FAIL,
+                "Could not update the notification tooltip",
+            ))
+        }
+    }
+
     fn add(&mut self) -> Result<()> {
         // Shell_NotifyIcon does not promise a useful GetLastError value.
         if !unsafe { Shell_NotifyIconW(NIM_ADD, &self.data) }.as_bool() {
@@ -116,16 +135,36 @@ impl TrayIcon {
 
     /// The host decodes the low 16 bits of a version-4 callback's lParam.
     /// Call for WM_CONTEXTMENU; NIN_SELECT/NIN_KEYSELECT may activate directly.
-    pub fn show_menu(&self, preview_active: bool) -> Result<Option<TrayCommand>> {
+    pub fn show_menu(
+        &self,
+        preview_active: bool,
+        shortcut: &str,
+        registered: bool,
+    ) -> Result<Option<TrayCommand>> {
         // Copy before TrackPopupMenu starts its nested message loop. This method
         // does not access the tray's Rust state while that loop is active.
         let data = self.data;
         let menu = PopupMenu(unsafe { CreatePopupMenu()? });
+        let status: Vec<u16> = format!("快捷键：{}", shortcut_status(shortcut, registered))
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let start_label: Vec<u16> = format!("开始取色\t{shortcut}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
         unsafe {
+            AppendMenuW(
+                menu.0,
+                MF_STRING | MF_GRAYED,
+                0,
+                windows::core::PCWSTR(status.as_ptr()),
+            )?;
+            AppendMenuW(menu.0, MF_SEPARATOR, 0, None)?;
             let start_text = if preview_active {
                 w!("停止预览")
             } else {
-                w!("开始取色")
+                windows::core::PCWSTR(start_label.as_ptr())
             };
             AppendMenuW(menu.0, MF_STRING, COMMAND_START, start_text)?;
             AppendMenuW(menu.0, MF_STRING, COMMAND_SETTINGS, w!("设置"))?;
@@ -172,6 +211,17 @@ impl TrayIcon {
     }
 }
 
+fn shortcut_status(shortcut: &str, registered: bool) -> String {
+    format!(
+        "{shortcut}（{}）",
+        if registered {
+            "已注册"
+        } else {
+            "不可用，请在设置中修改"
+        }
+    )
+}
+
 impl Drop for TrayIcon {
     fn drop(&mut self) {
         self.remove();
@@ -205,7 +255,16 @@ fn copy_utf16<const N: usize>(buffer: &mut [u16; N], text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::copy_utf16;
+    use super::{copy_utf16, shortcut_status};
+
+    #[test]
+    fn shortcut_status_reports_the_current_chord_and_registration_failure() {
+        assert_eq!(shortcut_status("Alt + F7", true), "Alt + F7（已注册）");
+        assert_eq!(
+            shortcut_status("Ctrl + Shift + C", false),
+            "Ctrl + Shift + C（不可用，请在设置中修改）"
+        );
+    }
 
     #[test]
     fn tray_text_truncates_without_splitting_surrogates() {

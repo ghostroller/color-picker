@@ -439,6 +439,7 @@ impl AppChild {
         let log = TempLog::new();
         let child = Command::new(env!("CARGO_BIN_EXE_color-picker"))
             .arg("--diagnostics")
+            .arg("--no-onboarding")
             .arg("--log-file")
             .arg(&log.path)
             .creation_flags(CREATE_NO_WINDOW.0)

@@ -79,6 +79,7 @@ const ACTIVATION_IGNORED: u32 = 8192;
 const INPUT_WAKE: u32 = 16384;
 const RESULT_WAKE: u32 = 32768;
 const SETTINGS_WAKE: u32 = 65536;
+const ONBOARDING_REQUEST: u32 = 131072;
 // shellapi.h defines this expression; windows 0.62.2 does not emit that macro.
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 
@@ -109,6 +110,14 @@ pub fn run(diagnostics: bool) -> Result<()> {
 
 /// Automatic launches should never start picking in an already running process.
 pub fn run_with_startup(diagnostics: bool, startup: bool) -> Result<()> {
+    run_with_launch_options(diagnostics, startup, true)
+}
+
+pub fn run_with_launch_options(
+    diagnostics: bool,
+    startup: bool,
+    allow_onboarding: bool,
+) -> Result<()> {
     let _instance = match SingleInstance::acquire()? {
         InstanceStatus::Primary(instance) => {
             diagnostics::event(format_args!("instance.primary"));
@@ -122,7 +131,7 @@ pub fn run_with_startup(diagnostics: bool, startup: bool) -> Result<()> {
             diagnostics::event(format_args!(
                 "instance.existing logging_applies_to_this_process_only; exit the old instance from its tray and restart with --log-file to trace hotkeys"
             ));
-            return activate_existing();
+            return activate_existing(allow_onboarding);
         }
     };
     DIAGNOSTICS.set(diagnostics);
@@ -157,6 +166,7 @@ pub fn run_with_startup(diagnostics: bool, startup: bool) -> Result<()> {
     diagnostics::event(format_args!("tray.registered version=4"));
     let mut settings = SettingsRuntime::load(window.0);
     publish_hotkey_status(&settings);
+    update_tray_shortcut(&mut tray, &settings);
     if let Some(notice) = settings.notice.as_deref() {
         notify(&tray, "设置提示", notice);
     }
@@ -183,7 +193,12 @@ pub fn run_with_startup(diagnostics: bool, startup: bool) -> Result<()> {
         settings.hotkey_id().is_some()
     ));
 
-    let result = message_loop(window.0, &mut tray, &mut settings);
+    let result = message_loop(
+        window.0,
+        &mut tray,
+        &mut settings,
+        allow_onboarding && !startup,
+    );
     READY.set(false);
     HOTKEY_REGISTERED.set(false);
     ACCEPTED_HOTKEY.set(0);
@@ -197,7 +212,12 @@ pub fn run_with_startup(diagnostics: bool, startup: bool) -> Result<()> {
     result
 }
 
-fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime) -> Result<()> {
+fn message_loop(
+    hwnd: HWND,
+    tray: &mut TrayIcon,
+    settings: &mut SettingsRuntime,
+    mut pending_intro: bool,
+) -> Result<()> {
     let mut controller = PreviewController::new(hwnd);
     controller.set_appearance(settings.config.appearance);
     let mut result_window: Option<ResultWindow> = None;
@@ -278,6 +298,7 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime)
                     Ok(old_hotkey) => {
                         controller.set_appearance(settings.config.appearance);
                         publish_hotkey_status(settings);
+                        update_tray_shortcut(tray, settings);
                         drop(old_hotkey);
                         window.show_status("设置已保存，关闭此窗口后生效。", true)?;
                     }
@@ -298,6 +319,17 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime)
             }
         }
         publish_preview_status(&controller);
+
+        // A manual launch after an automatic launch can also request the first
+        // guide. Defer it while capture owns input or settings holds a draft.
+        if pending_intro && !controller.active() && settings_window.is_none() && !exiting {
+            pending_intro = false;
+            super::onboarding::show_once(
+                hwnd,
+                &settings.config.hotkey.label(),
+                settings.hotkey_id().is_some(),
+            );
+        }
         if exiting && !controller.active() {
             return Ok(());
         }
@@ -324,6 +356,17 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime)
             }
             if exiting {
                 continue;
+            }
+            if pending & ONBOARDING_REQUEST != 0 {
+                pending_intro = true;
+                if !controller.active() && settings_window.is_none() {
+                    pending_intro = false;
+                    super::onboarding::show_once(
+                        hwnd,
+                        &settings.config.hotkey.label(),
+                        settings.hotkey_id().is_some(),
+                    );
+                }
             }
             // A topology, desktop/session or power transition invalidates the
             // current DC and coordinates. Never automatically resume capture.
@@ -395,7 +438,11 @@ fn message_loop(hwnd: HWND, tray: &mut TrayIcon, settings: &mut SettingsRuntime)
                     publish_preview_status(&controller);
                     continue;
                 }
-                match tray.show_menu(false)? {
+                match tray.show_menu(
+                    false,
+                    &settings.config.hotkey.label(),
+                    settings.hotkey_id().is_some(),
+                )? {
                     Some(TrayCommand::Start) => {
                         diagnostics::event(format_args!("tray.menu_selected command=start"));
                         if !explain_settings_block(settings_window.as_ref()) {
@@ -584,6 +631,15 @@ fn publish_hotkey_status(settings: &SettingsRuntime) {
     HOTKEY_REGISTERED.set(settings.hotkey_id().is_some());
 }
 
+fn update_tray_shortcut(tray: &mut TrayIcon, settings: &SettingsRuntime) {
+    if let Err(error) = tray.update_shortcut(
+        &settings.config.hotkey.label(),
+        settings.hotkey_id().is_some(),
+    ) {
+        diagnostics::event(format_args!("tray.shortcut_update_failed error={error}"));
+    }
+}
+
 fn notify(tray: &TrayIcon, title: &str, message: &str) {
     match tray.notify(title, message) {
         Ok(()) => diagnostics::event(format_args!(
@@ -724,13 +780,21 @@ fn same_installation(own_path: &Path, resident_path: &Path) -> std::io::Result<b
     Ok(own_path.canonicalize()? == resident_path.canonicalize()?)
 }
 
-fn activate_existing() -> Result<()> {
+fn activate_existing(allow_onboarding: bool) -> Result<()> {
     let title = wide(&instance_key()?);
     // A second launch can race the first process's window creation. This is a
     // bounded startup retry, never a resident timer or a background worker.
     for _ in 0..20 {
         if let Ok(hwnd) = unsafe { FindWindowW(HOST_CLASS, PCWSTR(title.as_ptr())) }
-            && unsafe { PostMessageW(Some(hwnd), WM_ACTIVATE_PICKER, WPARAM(0), LPARAM(0)) }.is_ok()
+            && unsafe {
+                PostMessageW(
+                    Some(hwnd),
+                    WM_ACTIVATE_PICKER,
+                    WPARAM(usize::from(allow_onboarding)),
+                    LPARAM(0),
+                )
+            }
+            .is_ok()
         {
             diagnostics::event(format_args!("instance.activation_forwarded"));
             return Ok(());
@@ -802,7 +866,11 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             enqueue(hwnd, SAMPLE_TICK);
         }
         WM_STOP_PREVIEW if DIAGNOSTICS.get() => enqueue(hwnd, STOP_PREVIEW),
-        WM_ACTIVATE_PICKER => enqueue(hwnd, activation_intent(ACTIVATE, ACTIVATION_BLOCKED.get())),
+        WM_ACTIVATE_PICKER => enqueue(
+            hwnd,
+            activation_intent(ACTIVATE, ACTIVATION_BLOCKED.get())
+                | if wparam.0 == 1 { ONBOARDING_REQUEST } else { 0 },
+        ),
         WM_HOTKEY if ACCEPTED_HOTKEY.get() != 0 && wparam.0 == ACCEPTED_HOTKEY.get() as usize => {
             enqueue(
                 hwnd,

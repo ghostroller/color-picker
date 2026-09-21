@@ -43,9 +43,10 @@ fn main() -> std::process::ExitCode {
                     println!("color-picker: PerMonitorV2 active");
                     Ok(())
                 } else {
-                    color_picker::platform::windows::host::run_with_startup(
+                    color_picker::platform::windows::host::run_with_launch_options(
                         options.diagnostics,
                         options.startup,
+                        !options.no_onboarding,
                     )
                 }
             })

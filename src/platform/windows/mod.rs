@@ -12,6 +12,7 @@ pub(crate) mod icon;
 pub mod input;
 pub mod instance;
 pub mod monitors;
+mod onboarding;
 pub mod session;
 pub mod settings;
 pub mod tray;

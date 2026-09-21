@@ -1,6 +1,6 @@
 use std::{ffi::OsString, path::PathBuf};
 
-pub const USAGE: &str = "Usage: color-picker [--startup | --quit | --check-environment] [--diagnostics] [--log-file <path>]";
+pub const USAGE: &str = "Usage: color-picker [--startup | --quit | --check-environment] [--diagnostics] [--log-file <path>] [--no-onboarding]";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -8,6 +8,7 @@ pub struct Options {
     pub startup: bool,
     pub quit: bool,
     pub diagnostics: bool,
+    pub no_onboarding: bool,
     pub log_file: Option<PathBuf>,
 }
 
@@ -24,6 +25,8 @@ impl Options {
                 options.quit = true;
             } else if argument == "--diagnostics" {
                 options.diagnostics = true;
+            } else if argument == "--no-onboarding" {
+                options.no_onboarding = true;
             } else if argument == "--log-file" {
                 if options.log_file.is_some() {
                     return Err("--log-file must only be specified once".into());
@@ -93,5 +96,8 @@ mod tests {
         assert!(!quit.check_environment);
         assert!(!quit.diagnostics);
         assert!(quit.log_file.is_none());
+        let automation = parse(&["--no-onboarding", "--diagnostics"]).unwrap();
+        assert!(automation.no_onboarding && automation.diagnostics);
+        assert!(!automation.startup);
     }
 }
