@@ -32,10 +32,11 @@ use windows::{
             BM_CLICK, BM_SETCHECK, CB_GETCOUNT, CreateWindowExW, DestroyWindow, ES_READONLY,
             GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetDlgItem, GetNextDlgTabItem, GetWindowLongW,
             GetWindowRect, GetWindowTextW, HTCAPTION, HTCLIENT, IsDialogMessageW, IsIconic,
-            IsWindow, IsWindowVisible, MSG, SW_RESTORE, SendMessageW, ShowWindow, WINDOW_EX_STYLE,
-            WM_CLOSE, WM_COMMAND, WM_GETDLGCODE, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_NCHITTEST,
-            WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_OVERLAPPED,
-            WS_TABSTOP,
+            IsWindow, IsWindowVisible, MSG, SB_BOTTOM, SB_TOP, SW_RESTORE, SWP_NOACTIVATE,
+            SWP_NOZORDER, SendMessageW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_CLOSE,
+            WM_COMMAND, WM_GETDLGCODE, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_NCHITTEST,
+            WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_VSCROLL, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+            WS_OVERLAPPED, WS_TABSTOP,
         },
     },
     core::w,
@@ -251,8 +252,9 @@ fn cached_selection_and_native_result_controls_smoke() {
     let settings =
         SettingsWindow::new(&config, owner.0, Some("控件测试；不会保存配置"), true).unwrap();
     let settings_hwnd = settings.hwnd();
+    let settings_content = unsafe { GetDlgItem(Some(settings_hwnd), 200) }.unwrap();
     assert_eq!(settings.process_pending().unwrap(), None);
-    let format_combo = unsafe { GetDlgItem(Some(settings_hwnd), 105) }.unwrap();
+    let format_combo = unsafe { GetDlgItem(Some(settings_content), 105) }.unwrap();
     assert_eq!(
         unsafe { SendMessageW(format_combo, CB_GETCOUNT, None, None) }.0,
         4
@@ -262,8 +264,114 @@ fn cached_selection_and_native_result_controls_smoke() {
         settings.process_pending().unwrap(),
         Some(SettingsAction::Apply(config.clone()))
     );
-    let border = unsafe { GetDlgItem(Some(settings_hwnd), 107) }.unwrap();
-    let transparency = unsafe { GetDlgItem(Some(settings_hwnd), 108) }.unwrap();
+    let border = unsafe { GetDlgItem(Some(settings_content), 107) }.unwrap();
+    let transparency = unsafe { GetDlgItem(Some(settings_content), 108) }.unwrap();
+    let apply = unsafe { GetDlgItem(Some(settings_hwnd), 1) }.unwrap();
+    let close = unsafe { GetDlgItem(Some(settings_hwnd), 2) }.unwrap();
+    let mut original = RECT::default();
+    unsafe { GetWindowRect(settings_hwnd, &mut original) }.unwrap();
+    assert!(original.top >= work.top && original.bottom <= work.bottom);
+    // A short work area is simulated by resizing only this fixture. The footer
+    // stays fixed while native controls scroll, and keyboard focus reveals them.
+    let settings_dpi = unsafe { GetDpiForWindow(settings_hwnd) };
+    unsafe {
+        SetWindowPos(
+            settings_hwnd,
+            None,
+            original.left,
+            original.top,
+            original.right - original.left,
+            (360 * settings_dpi / 96) as i32,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+        .unwrap();
+    }
+    settings.process_pending().unwrap();
+    let mut viewport_bounds = RECT::default();
+    let mut footer_before = RECT::default();
+    unsafe {
+        GetWindowRect(settings_content, &mut viewport_bounds).unwrap();
+        GetWindowRect(apply, &mut footer_before).unwrap();
+    }
+    for button in [apply, close] {
+        let mut bounds = RECT::default();
+        unsafe {
+            GetWindowRect(button, &mut bounds).unwrap();
+        }
+        assert!(bounds.top >= viewport_bounds.bottom);
+        assert!(bounds.bottom <= original.top + (360 * settings_dpi / 96) as i32);
+    }
+    unsafe {
+        SendMessageW(
+            settings_content,
+            WM_VSCROLL,
+            Some(WPARAM(SB_BOTTOM.0 as usize)),
+            None,
+        );
+    }
+    settings.process_pending().unwrap();
+    let mut footer_after = RECT::default();
+    unsafe {
+        GetWindowRect(apply, &mut footer_after).unwrap();
+    }
+    assert_eq!(
+        footer_before, footer_after,
+        "scrolling must keep Apply stationary"
+    );
+    let ctrl = unsafe { GetDlgItem(Some(settings_content), 101) }.unwrap();
+    unsafe {
+        windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(apply)).unwrap();
+        windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(ctrl)).unwrap();
+    }
+    settings.process_pending().unwrap();
+    let mut control_bounds = RECT::default();
+    unsafe {
+        GetWindowRect(ctrl, &mut control_bounds).unwrap();
+    }
+    assert!(
+        control_bounds.top >= viewport_bounds.top
+            && control_bounds.bottom <= viewport_bounds.bottom
+    );
+    unsafe {
+        windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(border)).unwrap();
+    }
+    settings.process_pending().unwrap();
+    let next = MSG {
+        hwnd: border,
+        message: WM_KEYDOWN,
+        wParam: WPARAM(0x09),
+        lParam: LPARAM(1),
+        ..Default::default()
+    };
+    assert!(unsafe { IsDialogMessageW(settings_hwnd, &next) }.as_bool());
+    settings.process_pending().unwrap();
+    unsafe {
+        GetWindowRect(transparency, &mut control_bounds).unwrap();
+    }
+    assert!(
+        control_bounds.top >= viewport_bounds.top
+            && control_bounds.bottom <= viewport_bounds.bottom,
+        "Tab must reveal the focused native control"
+    );
+    unsafe {
+        SendMessageW(
+            settings_content,
+            WM_VSCROLL,
+            Some(WPARAM(SB_TOP.0 as usize)),
+            None,
+        );
+        SetWindowPos(
+            settings_hwnd,
+            None,
+            original.left,
+            original.top,
+            original.right - original.left,
+            original.bottom - original.top,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+        .unwrap();
+    }
+    settings.process_pending().unwrap();
     for (slider, maximum, expected) in [
         (border, 6, config.appearance.border_width_dip),
         (
@@ -302,11 +410,11 @@ fn cached_selection_and_native_result_controls_smoke() {
         "slider changes remain a draft"
     );
     assert_eq!(
-        window_text(unsafe { GetDlgItem(Some(settings_hwnd), 22) }.unwrap()),
+        window_text(unsafe { GetDlgItem(Some(settings_content), 22) }.unwrap()),
         "3 DIP"
     );
     assert_eq!(
-        window_text(unsafe { GetDlgItem(Some(settings_hwnd), 24) }.unwrap()),
+        window_text(unsafe { GetDlgItem(Some(settings_content), 24) }.unwrap()),
         "80%"
     );
     let mut edited = config.clone();
@@ -319,7 +427,7 @@ fn cached_selection_and_native_result_controls_smoke() {
     );
     // Exercise the native key control, including the dialog message path.
     // These messages target only this fixture; no global input is generated.
-    let key = unsafe { GetDlgItem(Some(settings_hwnd), 104) }.unwrap();
+    let key = unsafe { GetDlgItem(Some(settings_content), 104) }.unwrap();
     assert!(window_text(key).contains("F11"));
     unsafe { SendMessageW(key, BM_CLICK, None, None) };
     settings.process_pending().unwrap();
@@ -437,7 +545,7 @@ fn cached_selection_and_native_result_controls_smoke() {
     };
     assert!(!settings.filter_key_message(&fresh));
     // Removing both Ctrl and Alt is invalid; no draft may reach persistence.
-    let alt = unsafe { GetDlgItem(Some(settings_hwnd), 102) }.unwrap();
+    let alt = unsafe { GetDlgItem(Some(settings_content), 102) }.unwrap();
     unsafe {
         SendMessageW(alt, BM_SETCHECK, Some(WPARAM(0)), None);
         SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None);

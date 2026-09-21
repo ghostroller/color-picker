@@ -12,8 +12,8 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{
-            E_FAIL, ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT,
-            POINT, RECT, SetLastError, WPARAM,
+            COLORREF, E_FAIL, ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND,
+            LPARAM, LRESULT, POINT, RECT, SetLastError, WPARAM,
         },
         Graphics::{
             Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute},
@@ -23,8 +23,8 @@ use windows::{
         UI::{
             Controls::{
                 EM_GETLINECOUNT, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
-                ShowScrollBar, TBM_SETPAGESIZE, TBM_SETPOS, TBM_SETRANGEMAX, TBM_SETRANGEMIN,
-                TBS_NOTICKS, TRACKBAR_CLASSW,
+                SetScrollInfo, ShowScrollBar, TBM_SETPAGESIZE, TBM_SETPOS, TBM_SETRANGEMAX,
+                TBM_SETRANGEMIN, TBS_NOTICKS, TRACKBAR_CLASSW,
             },
             HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
             Input::KeyboardAndMouse::{
@@ -51,6 +51,8 @@ use crate::{
 
 pub const WM_SETTINGS_WAKE: u32 = WM_APP + 12;
 const CLASS: PCWSTR = w!("ColorPicker.Settings.v1");
+const CONTENT_CLASS: PCWSTR = w!("ColorPicker.SettingsContent.v1");
+const CONTENT: usize = 200;
 const APPLY: usize = 1;
 const CLOSE: usize = 2;
 const CTRL: usize = 101;
@@ -72,9 +74,12 @@ const BORDER_VALUE: usize = 22;
 const TRANSPARENCY_LABEL: usize = 23;
 const TRANSPARENCY_VALUE: usize = 24;
 const STATUS: usize = 14;
-const CLIENT_WIDTH: i32 = 480;
+const CLIENT_WIDTH: i32 = 500;
 const CLIENT_HEIGHT: i32 = 588;
+const CONTENT_HEIGHT: i32 = 524;
+const FOOTER_HEIGHT: i32 = 64;
 const KEY_SUBCLASS: usize = 1;
+const SCROLL_SUBCLASS: usize = 2;
 // CommCtrl.h aliases TBM_GETPOS to WM_USER; windows-rs omits this alias.
 const TBM_GETPOS: u32 = WM_USER;
 const STYLE: WINDOW_STYLE =
@@ -117,6 +122,9 @@ struct Pending {
     capture: bool,
     focus_key: bool,
     appearance: bool,
+    scroll: Option<i32>,
+    reveal: Option<HWND>,
+    fit_work_area: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -141,6 +149,10 @@ struct CallbackState {
     recording: Cell<bool>,
     capture_hint: Cell<CaptureHint>,
     suppressed_keys: Cell<[u64; 4]>,
+    viewport: Cell<HWND>,
+    scroll_offset: Cell<i32>,
+    viewport_height: Cell<i32>,
+    wheel_remainder: Cell<i32>,
 }
 
 impl CallbackState {
@@ -296,10 +308,16 @@ impl SettingsWindow {
             lpszClassName: CLASS,
             ..Default::default()
         };
-        if unsafe { RegisterClassW(&class) } == 0
-            && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS
-        {
-            return Err(Error::from_thread());
+        for name in [CLASS, CONTENT_CLASS] {
+            let class = WNDCLASSW {
+                lpszClassName: name,
+                ..class
+            };
+            if unsafe { RegisterClassW(&class) } == 0
+                && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS
+            {
+                return Err(Error::from_thread());
+            }
         }
         let callback = Box::new(CallbackState {
             notify,
@@ -314,6 +332,10 @@ impl SettingsWindow {
             recording: Cell::new(false),
             capture_hint: Cell::new(CaptureHint::Ready),
             suppressed_keys: Cell::new([0; 4]),
+            viewport: Cell::new(HWND::default()),
+            scroll_offset: Cell::new(0),
+            viewport_height: Cell::new(0),
+            wheel_remainder: Cell::new(0),
         });
         let pointer = callback.as_ref() as *const CallbackState;
         let mut cursor = POINT::default();
@@ -353,6 +375,23 @@ impl SettingsWindow {
             )?;
         }
         theme::configure_window(hwnd, &window.callback.theme);
+        let viewport = unsafe {
+            CreateWindowExW(
+                WS_EX_CONTROLPARENT,
+                CONTENT_CLASS,
+                w!("设置内容"),
+                WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL,
+                0,
+                0,
+                1,
+                1,
+                Some(hwnd),
+                Some(HMENU(CONTENT as *mut _)),
+                Some(instance),
+                Some(pointer.cast()),
+            )?
+        };
+        window.callback.viewport.set(viewport);
         window.create_controls(config)?;
         window.place_initially(cursor)?;
         window.layout()?;
@@ -445,6 +484,7 @@ impl SettingsWindow {
             return Ok(Some(SettingsAction::Close));
         }
         if let Some(rect) = pending.dpi_rect {
+            let rect = fit_to_work_area(rect)?;
             unsafe {
                 SetWindowPos(
                     self.hwnd,
@@ -457,8 +497,30 @@ impl SettingsWindow {
                 )?;
             }
         }
-        if pending.layout {
+        if pending.fit_work_area {
+            let mut rect = RECT::default();
+            unsafe { GetWindowRect(self.hwnd, &mut rect)? };
+            let rect = fit_to_work_area(rect)?;
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    None,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                )?;
+            }
+        }
+        if let Some(offset) = pending.scroll {
+            self.callback.scroll_offset.set(offset);
+        }
+        if pending.layout || pending.scroll.is_some() || pending.fit_work_area {
             self.layout()?;
+        }
+        if let Some(hwnd) = pending.reveal {
+            self.reveal_control(hwnd)?;
         }
         if pending.default_style {
             self.update_default_style();
@@ -596,7 +658,8 @@ impl SettingsWindow {
 
     fn control(&self, class: PCWSTR, text: &str, id: usize, style: WINDOW_STYLE) -> Result<HWND> {
         let text = wide(text);
-        unsafe {
+        let footer = matches!(id, APPLY | CLOSE | STATUS);
+        let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 class,
@@ -606,12 +669,33 @@ impl SettingsWindow {
                 0,
                 1,
                 1,
-                Some(self.hwnd),
+                Some(if footer {
+                    self.hwnd
+                } else {
+                    self.callback.viewport.get()
+                }),
                 Some(HMENU(id as *mut _)),
                 Some(GetModuleHandleW(None)?.into()),
                 None,
-            )
+            )?
+        };
+        if !footer
+            && !unsafe {
+                SetWindowSubclass(
+                    hwnd,
+                    Some(scroll_control_proc),
+                    SCROLL_SUBCLASS,
+                    self.callback.as_ref() as *const CallbackState as usize,
+                )
+            }
+            .as_bool()
+        {
+            return Err(Error::new(
+                E_FAIL,
+                "Could not prepare settings focus scrolling",
+            ));
         }
+        Ok(hwnd)
     }
 
     fn read_config(&self) -> Result<Config> {
@@ -724,8 +808,8 @@ impl SettingsWindow {
         unsafe {
             AdjustWindowRectExForDpi(&mut outer, STYLE, false, EX_STYLE, dpi)?;
         }
-        let width = outer.right - outer.left;
-        let height = outer.bottom - outer.top;
+        let width = (outer.right - outer.left).min(work.right - work.left);
+        let height = (outer.bottom - outer.top).min(work.bottom - work.top);
         let x = (i64::from(center_x) - i64::from(width) / 2).max(i64::from(work.left)) as i32;
         let y = (i64::from(center_y) - i64::from(height) / 2).max(i64::from(work.top)) as i32;
         unsafe {
@@ -791,11 +875,36 @@ impl SettingsWindow {
             });
             drop(old);
         }
+        let mut client = RECT::default();
+        unsafe { GetClientRect(self.hwnd, &mut client)? };
+        let viewport_height = (client.bottom - dip(FOOTER_HEIGHT, dpi)).max(1);
+        let viewport = self.callback.viewport.get();
+        unsafe { MoveWindow(viewport, 0, 0, client.right, viewport_height, true)? };
+        self.callback.viewport_height.set(viewport_height);
+        let content_height = dip(CONTENT_HEIGHT, dpi);
+        let offset = self
+            .callback
+            .scroll_offset
+            .get()
+            .clamp(0, (content_height - viewport_height).max(0));
+        self.callback.scroll_offset.set(offset);
+        let scroll = SCROLLINFO {
+            cbSize: size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+            nMin: 0,
+            nMax: content_height - 1,
+            nPage: viewport_height as u32,
+            nPos: offset,
+            ..Default::default()
+        };
+        unsafe {
+            SetScrollInfo(viewport, SB_VERT, &scroll, true);
+        }
         let place = |hwnd, x, y, width, height| unsafe {
             MoveWindow(
                 hwnd,
                 dip(x, dpi),
-                dip(y, dpi),
+                dip(y, dpi) - offset,
                 dip(width, dpi),
                 dip(height, dpi),
                 true,
@@ -823,9 +932,38 @@ impl SettingsWindow {
         place(self.controls.transparency_value, 388, 433, 56, 24)?;
         place(self.controls.usage_heading, 24, 478, 64, 20)?;
         place(self.controls.usage_hint, 96, 478, 360, 40)?;
-        place(self.controls.status, 24, 532, 228, 40)?;
-        place(self.controls.close, 264, 532, 88, 36)?;
-        place(self.controls.apply, 364, 532, 92, 36)?;
+        let footer_top = viewport_height + dip(8, dpi);
+        let button_width = dip(92, dpi);
+        let gap = dip(12, dpi);
+        let margin = dip(24, dpi);
+        let apply_x = (client.right - margin - button_width).max(0);
+        let close_x = (apply_x - gap - button_width).max(0);
+        unsafe {
+            MoveWindow(
+                self.controls.status,
+                margin,
+                footer_top,
+                (close_x - gap - margin).max(1),
+                dip(40, dpi),
+                true,
+            )?;
+            MoveWindow(
+                self.controls.close,
+                close_x,
+                footer_top,
+                button_width,
+                dip(36, dpi),
+                true,
+            )?;
+            MoveWindow(
+                self.controls.apply,
+                apply_x,
+                footer_top,
+                button_width,
+                dip(36, dpi),
+                true,
+            )?;
+        }
         unsafe {
             SendMessageW(
                 self.controls.format,
@@ -842,6 +980,40 @@ impl SettingsWindow {
         }
         self.update_status_scrollbar()?;
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+        let _ = unsafe { InvalidateRect(Some(viewport), None, false) };
+        Ok(())
+    }
+
+    fn reveal_control(&self, hwnd: HWND) -> Result<()> {
+        let viewport = self.callback.viewport.get();
+        if !unsafe { IsChild(viewport, hwnd) }.as_bool() {
+            return Ok(());
+        }
+        let mut rect = RECT::default();
+        let mut origin = POINT::default();
+        unsafe {
+            GetWindowRect(hwnd, &mut rect)?;
+            if !ClientToScreen(viewport, &mut origin).as_bool() {
+                return Err(Error::from_thread());
+            }
+        }
+        let padding = dip(8, self.dpi()?);
+        let top = rect.top - origin.y;
+        let bottom = rect.bottom - origin.y;
+        let height = self.callback.viewport_height.get();
+        let delta = if top < padding {
+            top - padding
+        } else if bottom > height - padding {
+            bottom - height + padding
+        } else {
+            0
+        };
+        if delta != 0 {
+            self.callback
+                .scroll_offset
+                .set(self.callback.scroll_offset.get().saturating_add(delta));
+            self.layout()?;
+        }
         Ok(())
     }
 
@@ -898,6 +1070,87 @@ impl Drop for SettingsWindow {
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
+}
+
+fn fit_to_work_area(rect: RECT) -> Result<RECT> {
+    let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return Err(Error::from_thread());
+    }
+    let work = info.rcWork;
+    let width = (rect.right - rect.left).min(work.right - work.left).max(1);
+    let height = (rect.bottom - rect.top).min(work.bottom - work.top).max(1);
+    let left = rect.left.clamp(work.left, work.right - width);
+    let top = rect.top.clamp(work.top, work.bottom - height);
+    Ok(RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    })
+}
+
+fn paint_content(hwnd: HWND, offset: i32) -> LRESULT {
+    let mut paint = PAINTSTRUCT::default();
+    let dc = unsafe { BeginPaint(hwnd, &mut paint) };
+    if !dc.is_invalid() {
+        let saved = unsafe { SaveDC(dc) };
+        if saved != 0 {
+            let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+            let mut client = RECT::default();
+            unsafe {
+                let _ = GetClientRect(hwnd, &mut client);
+                SelectObject(dc, GetStockObject(DC_BRUSH));
+                SelectObject(dc, GetStockObject(DC_PEN));
+                SetDCBrushColor(dc, COLORREF(0xfaf7f5));
+                FillRect(dc, &client, HBRUSH(GetStockObject(DC_BRUSH).0));
+                SetDCBrushColor(dc, COLORREF(0xffffff));
+                SetDCPenColor(dc, COLORREF(0xf0e8e2));
+                for panel in PANELS {
+                    let _ = RoundRect(
+                        dc,
+                        dip(panel.left, dpi),
+                        dip(panel.top, dpi) - offset,
+                        dip(panel.right, dpi),
+                        dip(panel.bottom, dpi) - offset,
+                        dip(16, dpi),
+                        dip(16, dpi),
+                    );
+                }
+                let _ = RestoreDC(dc, saved);
+            }
+        }
+    }
+    let _ = unsafe { EndPaint(hwnd, &paint) };
+    LRESULT(0)
+}
+
+unsafe extern "system" fn scroll_control_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    subclass: usize,
+    reference: usize,
+) -> LRESULT {
+    catch_unwind(AssertUnwindSafe(|| {
+        let state = unsafe { &*(reference as *const CallbackState) };
+        match message {
+            WM_SETFOCUS => state.queue(|pending| pending.reveal = Some(hwnd)),
+            WM_NCDESTROY => {
+                let _ = unsafe { RemoveWindowSubclass(hwnd, Some(scroll_control_proc), subclass) };
+            }
+            _ => {}
+        }
+        // Native sliders and combos retain their wheel/arrow semantics. Other
+        // controls let DefWindowProc propagate an unhandled wheel to the pane.
+        unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+    }))
+    .unwrap_or_else(|_| std::process::abort())
 }
 
 fn font_line_height(hwnd: HWND, font: HFONT, dpi: u32) -> i32 {
@@ -1110,7 +1363,8 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     };
     match message {
-        WM_PAINT => state.theme.paint(hwnd, &PANELS),
+        WM_PAINT if hwnd == state.viewport.get() => paint_content(hwnd, state.scroll_offset.get()),
+        WM_PAINT => state.theme.paint(hwnd, &[]),
         WM_ERASEBKGND => LRESULT(1),
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
             let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut _)) } as usize;
@@ -1158,6 +1412,49 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             }
             LRESULT(0)
         }
+        WM_VSCROLL if hwnd == state.viewport.get() && lparam.0 == 0 => {
+            let mut info = SCROLLINFO {
+                cbSize: size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_ALL,
+                ..Default::default()
+            };
+            if unsafe { GetScrollInfo(hwnd, SB_VERT, &mut info) }.is_ok() {
+                let line = dip(28, unsafe { GetDpiForWindow(hwnd) }.max(96));
+                let current = state
+                    .pending
+                    .get()
+                    .scroll
+                    .unwrap_or(state.scroll_offset.get());
+                let next = match SCROLLBAR_COMMAND((wparam.0 & 0xffff) as i32) {
+                    SB_LINEUP => current - line,
+                    SB_LINEDOWN => current + line,
+                    SB_PAGEUP => current - info.nPage as i32,
+                    SB_PAGEDOWN => current + info.nPage as i32,
+                    SB_THUMBPOSITION | SB_THUMBTRACK => info.nTrackPos,
+                    SB_TOP => 0,
+                    SB_BOTTOM => info.nMax,
+                    _ => current,
+                };
+                state.queue(|pending| pending.scroll = Some(next));
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let delta = ((wparam.0 >> 16) as u16 as i16) as i32;
+            let total = state.wheel_remainder.get() + delta;
+            state.wheel_remainder.set(total % 120);
+            let steps = total / 120;
+            if steps != 0 {
+                let current = state
+                    .pending
+                    .get()
+                    .scroll
+                    .unwrap_or(state.scroll_offset.get());
+                let next = current - steps * dip(72, unsafe { GetDpiForWindow(hwnd) }.max(96));
+                state.queue(|pending| pending.scroll = Some(next));
+            }
+            LRESULT(0)
+        }
         WM_ACTIVATE if wparam.0 as u32 & 0xffff == WA_INACTIVE => {
             state.cancel_capture();
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
@@ -1172,8 +1469,12 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             }
             LRESULT(0)
         }
-        WM_SIZE => {
+        WM_SIZE if hwnd != state.viewport.get() => {
             state.queue(|pending| pending.layout = true);
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE | WM_SETTINGCHANGE if hwnd != state.viewport.get() => {
+            state.queue(|pending| pending.fit_work_area = true);
             LRESULT(0)
         }
         DM_GETDEFID => LRESULT(((DC_HASDEFID as usize) << 16 | state.default_id.get()) as isize),
