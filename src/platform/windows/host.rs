@@ -348,7 +348,7 @@ fn message_loop(
         // Menu APIs can pump messages; newly queued intentions stay in PENDING
         // and are consumed after the menu closes instead of disappearing.
         loop {
-            let pending = PENDING.replace(0);
+            let mut pending = PENDING.replace(0);
             if pending == 0 {
                 break;
             }
@@ -372,6 +372,14 @@ fn message_loop(
                         &settings.config.hotkey.label(),
                         settings.hotkey_id().is_some(),
                     );
+                    // The guide pumps a nested native loop. Merge any newly
+                    // received cancellation before an older launch can start
+                    // capture, and let the ordinary exit branch drain first.
+                    pending = after_guide_intentions(pending, PENDING.replace(0));
+                    if pending & EXIT != 0 {
+                        PENDING.set(PENDING.get() | pending);
+                        continue;
+                    }
                 }
             }
             // A topology, desktop/session or power transition invalidates the
@@ -847,6 +855,15 @@ fn dispatch_activation_intent(pending: u32, start: impl FnOnce(), ignored: impl 
     }
 }
 
+fn after_guide_intentions(pending: u32, received_during_guide: u32) -> u32 {
+    let combined = pending | received_during_guide;
+    if combined & (EXIT | ENVIRONMENT_CHANGED | STOP_PREVIEW) != 0 {
+        combined & !START_REQUEST
+    } else {
+        combined
+    }
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -911,6 +928,7 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         }
         WM_CLOSE => {
             enqueue(hwnd, EXIT);
+            super::onboarding::dismiss_pending();
             // Return from TrackPopupMenu's nested loop so the owner can drain
             // input and release resources even while the tray menu is open.
             let _ = unsafe { EndMenu() };
@@ -918,13 +936,16 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         WM_QUERYENDSESSION => return LRESULT(1),
         WM_ENDSESSION if wparam.0 != 0 => {
             enqueue(hwnd, EXIT);
+            super::onboarding::dismiss_pending();
             let _ = unsafe { EndMenu() };
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_WTSSESSION_CHANGE => {
-            enqueue(hwnd, ENVIRONMENT_CHANGED)
+            enqueue(hwnd, ENVIRONMENT_CHANGED);
+            super::onboarding::dismiss_pending();
         }
         WM_POWERBROADCAST => {
             enqueue(hwnd, ENVIRONMENT_CHANGED);
+            super::onboarding::dismiss_pending();
             return LRESULT(1);
         }
         WM_DESTROY => unsafe { PostQuitMessage(0) },
@@ -1009,6 +1030,22 @@ impl Drop for SessionNotifications {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_during_guide_preempts_the_older_launch_intention() {
+        for cancellation in [EXIT, ENVIRONMENT_CHANGED, STOP_PREVIEW] {
+            let pending = after_guide_intentions(
+                ACTIVATE | ONBOARDING_REQUEST | START_REQUEST,
+                cancellation | HOTKEY_ACTIVATE | START_REQUEST,
+            );
+            assert_eq!(pending & START_REQUEST, 0);
+            assert_ne!(pending & cancellation, 0);
+        }
+        assert_ne!(
+            after_guide_intentions(ACTIVATE | START_REQUEST, TRAY_ACTIVATE) & START_REQUEST,
+            0
+        );
+    }
 
     #[test]
     #[ignore = "requires an interactive Windows desktop; restores its own settings window"]

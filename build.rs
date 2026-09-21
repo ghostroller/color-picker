@@ -21,11 +21,11 @@ fn main() {
             ),
             format!("APP_VERSION_STRING=\"{version}\""),
         ];
-        embed_resource::compile("resources/app.rc", &definitions)
+        // Unit tests call the same native dialogs as the application. Embed
+        // Common Controls v6 in every executable, including lib test harnesses,
+        // so importing TaskDialogIndirect cannot fail before main starts.
+        embed_resource::compile_for_everything("resources/app.rc", &definitions)
             .manifest_required()
             .expect("failed to embed the required Windows manifest");
-        embed_resource::compile_for_examples("resources/app.rc", &definitions)
-            .manifest_required()
-            .expect("failed to embed the pixel fixture's required Windows manifest");
     }
 }
