@@ -19,7 +19,7 @@ Pinned upstream commit: `6ef32198ef1f7b7b375cd4b6b90896c2a58eb4c2` (2026-08-04).
 
 The upstream Inno Setup License grants use, modification and redistribution under
 its stated conditions. Its exact text is retained as `INNO-SETUP-LICENSE.txt`, and
-the installer also places that file in `{app}\licenses\inno-setup`. No source
+the package includes its text in `THIRD-PARTY-NOTICES.html`. No source
 notices or Inno Setup/translator attribution are removed.
 
 SHA-256 of the downloaded upstream bytes:

@@ -12,10 +12,14 @@ if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitProcess) {
 if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7 is required for bounded child-process cleanup.' }
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $PackageDirectory = (Resolve-Path -LiteralPath $PackageDirectory).Path
-foreach ($relative in @('color-picker.exe', 'LICENSE-STATUS.md', 'THIRD-PARTY-NOTICES.md', 'licenses/rust-library/COPYRIGHT-library.html')) {
+$payloadFiles = @('color-picker.exe', 'README.md', 'README.zh-CN.md', 'LICENSE', 'THIRD-PARTY-NOTICES.html')
+foreach ($relative in $payloadFiles) {
     if (-not (Test-Path -LiteralPath (Join-Path $PackageDirectory $relative) -PathType Leaf)) {
         throw "A complete portable payload is required: missing $relative"
     }
+}
+if (@(Get-ChildItem -LiteralPath $PackageDirectory -Force).Count -ne $payloadFiles.Count) {
+    throw 'The portable package must contain exactly the five runtime payload files.'
 }
 $CompilerPath = & (Join-Path $PSScriptRoot 'find-inno-setup.ps1') -CompilerPath $CompilerPath
 $CompilerPath = (Resolve-Path -LiteralPath $CompilerPath).Path
@@ -93,13 +97,19 @@ function Assert-Installed {
     if ($registration.DisplayVersion -cne $Version) {
         throw "Installed version differs from expected $Version."
     }
-    foreach ($relative in @('color-picker.exe', 'LICENSE-STATUS.md', 'THIRD-PARTY-NOTICES.md', 'licenses/rust-library/COPYRIGHT-library.html')) {
+    foreach ($relative in $payloadFiles) {
         $installed = Join-Path $installDirectory $relative
         if (-not (Test-Path -LiteralPath $installed -PathType Leaf) -or
             (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash -cne
             (Get-FileHash -LiteralPath (Join-Path $PackageDirectory $relative) -Algorithm SHA256).Hash) {
             throw "Installed file is missing or differs from payload: $relative"
         }
+    }
+    $expectedFiles = @($payloadFiles) + @('unins000.exe', 'unins000.dat')
+    $actualFiles = @(Get-ChildItem -LiteralPath $installDirectory -Force)
+    if ($actualFiles.Count -ne $expectedFiles.Count -or
+        @($actualFiles | Where-Object { $_.PSIsContainer -or $_.Name -cnotin $expectedFiles }).Count -ne 0) {
+        throw 'The installation must contain only five payload files and two uninstall files.'
     }
     $startupValue = Get-SmokeStartupValue
     $expectedStartup = '"{0}" --startup' -f $installedExe
@@ -127,18 +137,93 @@ function Assert-Uninstalled {
     }
 }
 
+function Get-FixtureHash {
+    param([string] $Contents)
+    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Contents)))
+}
+
+function Write-SmokeFixture {
+    param([string] $Path, [string] $Contents)
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if (-not $fullPath.StartsWith($caseRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Fixture files must remain inside the isolated case directory.'
+    }
+    $null = New-Item -ItemType Directory -Path (Split-Path -Parent $fullPath) -Force
+    [IO.File]::WriteAllText($fullPath, $Contents, [Text.UTF8Encoding]::new($false))
+}
+
+function Remove-SmokeFixture {
+    param([string] $Path)
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if (-not $fullPath.StartsWith($caseRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Fixture removal must remain inside the isolated case directory.'
+    }
+    # Deliberately nonrecursive, including when removing a junction itself.
+    if (Test-Path -LiteralPath $fullPath) { Remove-Item -LiteralPath $fullPath -Force }
+}
+
+function Assert-FixtureContents {
+    param([string] $Path, [string] $Contents)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or
+        [IO.File]::ReadAllText($Path) -cne $Contents) {
+        throw "Cleanup unexpectedly modified or removed a protected fixture: $Path"
+    }
+}
+
+function Add-LegacyFixtures {
+    Write-SmokeFixture (Join-Path $installDirectory 'docs/unchanged.txt') $originalFixture
+    Write-SmokeFixture (Join-Path $installDirectory 'licenses/nested/license.txt') $originalFixture
+    Write-SmokeFixture (Join-Path $installDirectory 'Cargo.lock') $originalFixture
+    Write-SmokeFixture (Join-Path $installDirectory 'docs/modified.txt') $modifiedFixture
+    Write-SmokeFixture (Join-Path $installDirectory 'docs/unknown.txt') $originalFixture
+    Write-SmokeFixture (Join-Path $caseRoot 'outside.txt') $originalFixture
+    Write-SmokeFixture (Join-Path $caseRoot 'outside-junction/keep.txt') $originalFixture
+    $null = New-Item -ItemType Junction -Path (Join-Path $installDirectory 'docs/junction') `
+        -Target (Join-Path $caseRoot 'outside-junction')
+}
+
+function Assert-LegacyCleanup {
+    foreach ($relative in @('docs/unchanged.txt', 'licenses', 'Cargo.lock')) {
+        if (Test-Path -LiteralPath (Join-Path $installDirectory $relative)) {
+            throw "An unchanged legacy file or empty parent directory was not removed: $relative"
+        }
+    }
+    Assert-FixtureContents (Join-Path $installDirectory 'docs/modified.txt') $modifiedFixture
+    Assert-FixtureContents (Join-Path $installDirectory 'docs/unknown.txt') $originalFixture
+    Assert-FixtureContents (Join-Path $caseRoot 'outside.txt') $originalFixture
+    Assert-FixtureContents (Join-Path $caseRoot 'outside-junction/keep.txt') $originalFixture
+    if (((Get-Item -LiteralPath (Join-Path $installDirectory 'docs/junction')).Attributes -band
+        [IO.FileAttributes]::ReparsePoint) -eq 0) { throw 'The protected junction was removed or replaced.' }
+    foreach ($relative in @('docs/junction', 'docs/modified.txt', 'docs/unknown.txt', 'docs')) {
+        Remove-SmokeFixture (Join-Path $installDirectory $relative)
+    }
+}
+
 # A GUID identity must be new. Do not reuse or mutate any previous installation.
 if ((Test-Path -LiteralPath $caseRoot) -or (Test-Path -LiteralPath $uninstallKey) -or
     $null -ne (Get-SmokeStartupValue) -or (Test-Path -LiteralPath $startShortcut) -or
     (Test-Path -LiteralPath $desktopShortcut)) { throw 'Smoke identity unexpectedly exists; refusing to reuse it.' }
 New-Item -ItemType Directory -Path $caseRoot | Out-Null
 $configurationBefore = Get-ConfigurationFingerprint
+$originalFixture = "Original legacy release fixture`n"
+$modifiedFixture = "Locally modified release fixture`n"
+$originalHash = Get-FixtureHash $originalFixture
+$fixtureManifest = Join-Path $caseRoot 'legacy-fixture.sha256'
+$manifestLines = @(Get-Content -LiteralPath (Join-Path $repositoryRoot 'installer/legacy-files.sha256'))
+foreach ($relative in @('docs/unchanged.txt', 'licenses/nested/license.txt', 'Cargo.lock', 'docs/modified.txt',
+    'docs/junction/keep.txt', 'docs/../../outside.txt', '../outside.txt', 'C:/outside.txt')) {
+    $manifestLines += "$originalHash  $relative"
+}
+# Even a manifest entry must not authorize deletion of a current runtime file.
+$manifestLines += "$(Get-FileHash -LiteralPath (Join-Path $PackageDirectory 'README.md') -Algorithm SHA256 | Select-Object -ExpandProperty Hash)  README.md"
+[IO.File]::WriteAllLines($fixtureManifest, $manifestLines, [Text.UTF8Encoding]::new($false))
 Write-Host "Isolated installer smoke: $caseRoot"
 Write-Host 'Installer versions 0.1.0 and 0.1.1 below are synthetic upgrade fixtures, not release versions.'
 try {
     foreach ($version in @('0.1.0', '0.1.1')) {
         $arguments = @('/Qp', "/DAppVersion=$version", "/DVersionInfoVersion=$version.0",
             "/DPayloadDir=$PackageDirectory", "/DOutputDir=$caseRoot", "/DOutputBaseName=setup-$version",
+            "/DLegacyManifest=$fixtureManifest",
             "/DSmokeTestId=$caseId", "/DDefaultInstallDir=$installDirectory",
             (Join-Path $repositoryRoot 'installer/color-picker.iss'))
         $null = Invoke-BoundedProcess $CompilerPath $arguments "compile-$version"
@@ -150,7 +235,9 @@ try {
     $null = Invoke-BoundedProcess $installedExe @('--check-environment') 'check-environment'
     $null = Invoke-SmokeInstall $older 'enable-tasks' @('/TASKS=startup,desktopicon')
     Assert-Installed '0.1.0' $true $true
+    Add-LegacyFixtures
     $null = Invoke-SmokeInstall $newer 'upgrade-preserve-tasks'
+    Assert-LegacyCleanup
     Assert-Installed '0.1.1' $true $true
     $moveCode = Invoke-SmokeInstall $newer 'reject-directory-move' -Destination (Join-Path $caseRoot 'moved') -AllowFailure
     if ($moveCode -eq 0 -or (Test-Path -LiteralPath (Join-Path $caseRoot 'moved/color-picker.exe'))) {
@@ -167,6 +254,27 @@ try {
     $null = Invoke-BoundedProcess $uninstaller @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
         "/LOG=$(Join-Path $caseRoot 'uninstall.setup.log')") 'uninstall'
     Assert-Uninstalled
+    # The cleanup guard must also reject a junction at the installation root or
+    # above it, even when the legacy file itself is an ordinary unchanged file.
+    foreach ($reparseCase in @('root', 'ancestor')) {
+        $junction = Join-Path $caseRoot "reparse-$reparseCase"
+        $junctionTarget = Join-Path $caseRoot "reparse-$reparseCase-target"
+        $null = New-Item -ItemType Directory -Path $junctionTarget
+        $null = New-Item -ItemType Junction -Path $junction -Target $junctionTarget
+        $installDirectory = if ($reparseCase -eq 'root') { $junction } else { Join-Path $junction 'child' }
+        $installedExe = Join-Path $installDirectory 'color-picker.exe'
+        $uninstaller = Join-Path $installDirectory 'unins000.exe'
+        Write-SmokeFixture (Join-Path $installDirectory 'docs/unchanged.txt') $originalFixture
+        $null = Invoke-SmokeInstall $newer "install-reparse-$reparseCase"
+        Assert-FixtureContents (Join-Path $installDirectory 'docs/unchanged.txt') $originalFixture
+        Remove-SmokeFixture (Join-Path $installDirectory 'docs/unchanged.txt')
+        Remove-SmokeFixture (Join-Path $installDirectory 'docs')
+        Assert-Installed '0.1.1' $false $false
+        $null = Invoke-BoundedProcess $uninstaller @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
+            "/LOG=$(Join-Path $caseRoot "uninstall-reparse-$reparseCase.setup.log")") "uninstall-reparse-$reparseCase"
+        Assert-Uninstalled
+        Remove-SmokeFixture $junction
+    }
 }
 finally {
     $cleanupError = $null

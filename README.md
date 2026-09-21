@@ -136,4 +136,4 @@ Further developer documentation (primarily Chinese): [UI previews](docs/ui-previ
 
 ## License
 
-A project redistribution license has not yet been selected. See [LICENSE-STATUS.md](LICENSE-STATUS.md). Third-party dependencies retain their own licenses; packaged builds include their license and notice files.
+Color Picker is licensed under the [MIT License](LICENSE). Third-party components retain their own licenses; packaged builds include their original copyright and license notices in `THIRD-PARTY-NOTICES.html`.

@@ -15,6 +15,9 @@
 #ifndef OutputBaseName
   #error OutputBaseName must be supplied by the package script
 #endif
+#ifndef LegacyManifest
+  #define LegacyManifest "legacy-files.sha256"
+#endif
 
 ; Production identity MUST stay unchanged across releases. Test installers use
 ; a separate identity, Run value, shortcuts and directory without touching it.
@@ -94,10 +97,14 @@ Name: "startup"; Description: "{cm:StartupTask}"; GroupDescription: "{cm:Optiona
 Name: "desktopicon"; Description: "{cm:DesktopTask}"; GroupDescription: "{cm:OptionalTasks}"; Flags: unchecked
 
 [Files]
-; Never include user configuration in PayloadDir. All package licenses and
-; documentation are retained, and only installed files enter the uninstall log.
-Source: "{#PayloadDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "languages\INNO-SETUP-LICENSE.txt"; DestDir: "{app}\licenses\inno-setup"; Flags: ignoreversion
+; Keep the installed payload explicit. The consolidated notices include the
+; installer notices; developer documents and build metadata stay outside it.
+Source: "{#PayloadDir}\color-picker.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\README.zh-CN.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\THIRD-PARTY-NOTICES.html"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#LegacyManifest}"; DestName: "legacy-files.sha256"; Flags: dontcopy
 
 [Icons]
 Name: "{autoprograms}\{#ApplicationName}"; Filename: "{app}\color-picker.exe"; WorkingDir: "{app}"
@@ -117,6 +124,8 @@ Root: HKCU64; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType
 Filename: "{app}\color-picker.exe"; Parameters: "--startup"; Description: "{cm:LaunchApp}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+#include "legacy-cleanup.iss"
+
 const
   InstalledKey = '{#UninstallRegistryKey}';
 
@@ -233,4 +242,12 @@ begin
     if not UninstallSilent then
       MsgBox(Reason, mbError, MB_OK);
   end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  // Only remove obsolete, unchanged release files after the new payload has
+  // been installed successfully. A canceled or failed install retains them.
+  if CurStep = ssPostInstall then
+    CleanupLegacyFiles;
 end;

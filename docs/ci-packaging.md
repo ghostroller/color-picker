@@ -60,10 +60,12 @@ Inno Setup 6.7.1，未提供 WinGet，因此不依赖预装编译器或 Chocolat
 
 普通构建保持预览包名称及构建信息；启用 `publish_release` 时，工作流给脚本传入 `-Release`，
 生成上面不含时间戳的发布名称。`package-installer.ps1` 将该开关传给 `package-windows.ps1`，
-使安装包、ZIP 和包内构建信息使用同一发布模式。脚本不覆盖已有输出。
+使安装包、ZIP 和构建信息使用同一发布模式。构建信息位于 `dist/` 下 ZIP 旁的
+`.build.json`，不再安装到用户目录。脚本不覆盖已有输出。
 
 上传前还会运行 `scripts/test-installer.ps1 -PackageDirectory <本次便携包目录>`：
 以独立 AppId、安装目录、启动项和快捷方式验证默认安装、任务启用与取消、升级保留、拒绝降级/改址、卸载清理。
+同时检查精简后的文件清单，以及旧文件清理时保留修改文件、未知文件和目录联接指向的数据。
 该检查使用真实 payload，`0.1.0` / `0.1.1` 仅为合成安装版本；不启动驻留程序，不修改用户配置。
 每个测试子进程限时 60 秒，测试结束后卸载自己的隔离实例，日志保留在 `target/installer-smoke/`。
 本地运行前需先安装固定版本的 Inno Setup，或通过 `-CompilerPath` 指向已安装的对应编译器。

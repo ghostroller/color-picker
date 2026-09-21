@@ -75,8 +75,9 @@ winget install --id JRSoftware.InnoSetup -e --version 6.7.3 --source winget --sc
 
 - `*-setup.exe` 与 `.exe.sha256`：安装包和校验。
 - `*.zip` 与 `.zip.sha256`：保留的便携包和校验。
-- `*-setup.build.json`：源码、构建器和产物路径；程序包内部 `build-info.json`
-  还包含是否有未提交改动、工具链、EXE 校验值和检查状态。
+- `*-setup.build.json`：源码、构建器和产物路径。
+- ZIP 旁的 `*.build.json`：是否有未提交改动、工具链、EXE 校验值和检查状态，
+  仅用于维护与 CI，不进入用户包。
 
 显式使用 `./scripts/package-installer.ps1 -Release` 可生成发布名称；
 `package-windows.ps1` 同样支持 `-Release`。以 `0.1.0` 为例，安装包为
@@ -108,6 +109,16 @@ CI 仅手动触发，默认 Actions 产物保留 30 天。维护者可在对应�
 作为长期下载来源。CI 不自动创建标签或推送版本；同标签已有 Release（包括草稿）时拒绝发布。
 失败留下的草稿需要人工排查，不会在重跑时覆盖。完整操作见 [CI 打包说明](ci-packaging.md)。
 
-许可证状态见 [LICENSE-STATUS.md](../LICENSE-STATUS.md)。
+从 0.2.1 开始，便携包只含主程序、两个完整 README、`LICENSE` 和
+`THIRD-PARTY-NOTICES.html`，安装版另有卸载程序及其数据文件。
+README 中未随包提供的开发文档、图片链接指向对应源码提交；构建信息仅保存在
+`dist/` 下 ZIP 旁的 `.build.json` 中，不进入安装目录。
+
+升级时，安装器在新文件安装成功后，按已发布版本的路径与 SHA256 清单移除旧文档、
+分散许可文件和构建资料。用户新增或修改的文件、重解析点及不可访问路径均保留，
+只移除空目录，不递归删除整个目录。配置仍位于 `%LOCALAPPDATA%\color-picker`，不参与清理。
+
+项目采用 [MIT 许可证](../LICENSE)。第三方组件的原始版权与许可文本随包汇总在
+`THIRD-PARTY-NOTICES.html`，不再创建独立的 `licenses/` 目录。
 Inno Setup 自身使用条件见 [官方许可](https://jrsoftware.org/files/is/license.txt)，
 后续商业使用时需按其许可安排构建工具授权。

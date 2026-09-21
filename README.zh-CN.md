@@ -136,4 +136,4 @@ cargo test --locked --test windows_capture --test windows_preview --test windows
 
 ## 许可
 
-项目尚未选定分发许可证，见 [LICENSE-STATUS.md](LICENSE-STATUS.md)。第三方依赖保留各自的许可，程序包包含相应许可证及声明文件。
+Color Picker 采用 [MIT 许可证](LICENSE)。第三方组件保留各自的许可，程序包中的 `THIRD-PARTY-NOTICES.html` 汇总其原始版权、许可证及声明。

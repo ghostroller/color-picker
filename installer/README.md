@@ -38,6 +38,31 @@ product's HKCU 64-bit uninstall key. Packaging accepts numeric `major.minor.patc
 Unreadable version metadata also stops replacement. Silent installs fail without
 showing the custom error dialog; `/LOG` captures the reason.
 
+## Package contents and upgrade cleanup
+
+User packages contain only `color-picker.exe`, both complete READMEs, `LICENSE`,
+and `THIRD-PARTY-NOTICES.html`. The installer adds its own uninstaller files.
+README links to omitted developer documentation and images point to the exact
+source commit on GitHub. Build provenance stays beside the package under `dist/`.
+
+After new files have been installed, `legacy-cleanup.iss` removes obsolete files
+only when their relative paths and SHA256 hashes match `legacy-files.sha256`.
+Modified or unknown files, inaccessible paths and reparse points are retained.
+Only empty directories are removed; no recursive directory deletion is used.
+This also cleans files left by an earlier upgrade from 0.1.0 to 0.2.0.
+
+The cleanup inventory was generated from the published portable ZIPs below,
+plus the unchanged vendored Inno license installed separately by those versions:
+
+| Published package | SHA256 |
+| --- | --- |
+| `color-picker-0.1.0-windows-x64.zip` | `468bfa51d215c0cc74e42ad796131b45f65b212f1184b60a7ce532c91baae7d4` |
+| `color-picker-0.2.0-windows-x64.zip` | `c363717cb6cc961baa717b0a0dcef8b9d05d954d8f1f8f91b1415272236c59b8` |
+
+Retain multiple hashes for files that changed between releases. Add entries
+only for obsolete published payload files, never user preferences or current
+payload paths. The manifest is embedded in the installer and is not installed.
+
 ## Isolated smoke builds
 
 Compile with `/DSmokeTestId=<unique-ASCII-id>` to derive a separate AppId, displayed
