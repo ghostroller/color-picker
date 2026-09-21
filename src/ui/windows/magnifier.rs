@@ -30,6 +30,7 @@ use super::frost::FrostedPanel;
 use crate::{
     app::{config::AppearanceConfig, diagnostics, i18n::tr},
     core::{
+        color::Rgb8,
         format::{ColorFormat, format_color},
         geometry::{ScreenPointPx, ScreenRectPx},
         state::{PickedColor, SampleKind},
@@ -53,6 +54,7 @@ struct State {
 
 #[derive(Default)]
 struct Footer {
+    rgb: Option<Rgb8>,
     hex: Vec<u16>,
     scale: Vec<u16>,
     coordinates: Vec<u16>,
@@ -89,6 +91,7 @@ impl State {
             },
         );
         self.footer = Footer {
+            rgb: self.hover.map(|pixel| pixel.rgb),
             hex: hex.encode_utf16().collect(),
             scale: format!("{factor}×").encode_utf16().collect(),
             coordinates: format!("{x}  {y}").encode_utf16().collect(),
@@ -793,6 +796,18 @@ impl Surface {
             self.dpi,
             self.appearance.border_width_dip,
         );
+        let color = footer.rgb.map_or(palette::EMPTY, |rgb| {
+            COLORREF(u32::from(rgb.r) | (u32::from(rgb.g) << 8) | (u32::from(rgb.b) << 16))
+        });
+        self.fill(
+            RECT {
+                left: 0,
+                top,
+                right: self.footer_swatch_width(footer, border)?,
+                bottom: self.height - border,
+            },
+            color,
+        )?;
         for FooterLabel {
             rect,
             font,
@@ -819,12 +834,27 @@ impl Surface {
         font.measure(self.dc.0, text)
     }
 
+    fn footer_swatch_width(&self, footer: &Footer, border: i32) -> Result<i32> {
+        // Fill the footer height flush to the left edge. Limit width on narrow
+        // snapshots without shrinking text below the existing smallest font.
+        let hex: Vec<u16> = "#DDDDDD".encode_utf16().collect();
+        let text_width = self.text_size(&self.narrow_font, &hex)?.cx
+            + self
+                .text_size(&self.narrow_font, &footer.compact_coordinates)?
+                .cx;
+        let remaining = self.width - border - text_width - 8;
+        Ok((footer_height(self.dpi) - border)
+            .min((self.width - border) / 8)
+            .min(remaining)
+            .max(0))
+    }
+
     fn footer_labels<'a>(
         &'a self,
         footer: &'a Footer,
         border: i32,
     ) -> Result<[FooterLabel<'a>; 3]> {
-        let left = 2;
+        let left = self.footer_swatch_width(footer, border)? + 2;
         let right = (self.width - border - 2).max(left);
         let available = right - left;
         let gap = 4;
@@ -1073,6 +1103,7 @@ mod tests {
 
     fn assert_single_row_footer_fits() {
         let footer = Footer {
+            rgb: Some(Rgb8::new(221, 221, 221)),
             hex: "#DDDDDD".encode_utf16().collect(),
             scale: "32×".encode_utf16().collect(),
             coordinates: "X -65535  Y -65535".encode_utf16().collect(),

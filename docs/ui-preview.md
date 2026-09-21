@@ -42,7 +42,8 @@
 边框超过 2 DIP 时按需增加高度，最大 42 DIP，避免底边遮挡坐标；设置预览共用这一布局。
 冻结像素区取消外围边距，按快照在初始 4× 下的实际物理像素范围收紧（每轴上限 240 DIP，
 并限制在工作区内）；边缘裁剪的快照允许矩形视口。信息栏固定为 28 DIP 单行，
-左列显示当前 hover 像素的 HEX 与倍率，右列显示原始物理屏幕 X/Y；
+色值左侧的色块贴齐信息栏左边缘，随当前 hover 像素同步更新；
+左列显示该像素的 HEX 与倍率，右列显示原始物理屏幕 X/Y；
 移到信息栏、边框或无效像素时显示占位符。窗口宽度跟随像素区，不为文字扩宽，
 不增加两侧留白。信息栏按实际文字宽度选择字号和间距；窄截图使用紧凑坐标，
 空间不足时省略倍率，优先保留完整 HEX 和 X/Y。
@@ -126,8 +127,10 @@ cargo run --example ui-preview -- result --color=F4F2F2 --output=target/result-p
 
 ![实时取色](images/ui-live.png)
 
-![冻结放大](images/ui-frozen.png)
+![English frozen preview with a hover color swatch](images/ui-frozen-en.png)
 
-屏幕边缘的窄快照保持原始像素比例，信息栏仍在同一行显示色值与坐标：
+![中文冻结放大与悬停色块](images/ui-frozen.png)
 
-![边缘快照](images/ui-frozen-edge.png)
+屏幕边缘的窄快照保持原始像素比例，信息栏仍在同一行显示色块、色值与坐标，窗口不为色块扩宽：
+
+![边缘快照与悬停色块](images/ui-frozen-edge.png)
