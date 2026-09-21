@@ -62,6 +62,24 @@ impl Drop for OwnedBitmap {
 pub(super) struct OwnedFont(HFONT);
 
 impl OwnedFont {
+    pub(super) fn measure(
+        &self,
+        dc: HDC,
+        text: &[u16],
+    ) -> Result<windows::Win32::Foundation::SIZE> {
+        let old = unsafe { SelectObject(dc, self.0.into()) };
+        if invalid_selection(old) {
+            return Err(Error::from_thread());
+        }
+        let mut size = windows::Win32::Foundation::SIZE::default();
+        let measured = unsafe { GetTextExtentPoint32W(dc, text, &mut size) };
+        unsafe {
+            SelectObject(dc, old);
+        }
+        measured.ok()?;
+        Ok(size)
+    }
+
     pub fn new(size: i32, weight: i32, dpi: u32) -> Result<Self> {
         let font = Self(unsafe {
             CreateFontW(

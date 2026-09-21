@@ -11,7 +11,7 @@ use windows::{
     Win32::{
         Foundation::{
             COLORREF, E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, ERROR_CLASS_ALREADY_EXISTS,
-            ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, RECT, SetLastError, WPARAM,
+            ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, RECT, SIZE, SetLastError, WPARAM,
         },
         Graphics::{
             Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute},
@@ -56,6 +56,7 @@ struct Footer {
     hex: Vec<u16>,
     scale: Vec<u16>,
     coordinates: Vec<u16>,
+    compact_coordinates: Vec<u16>,
 }
 
 impl State {
@@ -91,6 +92,9 @@ impl State {
             hex: hex.encode_utf16().collect(),
             scale: format!("{factor}×").encode_utf16().collect(),
             coordinates: format!("{x}  {y}").encode_utf16().collect(),
+            compact_coordinates: format!("{} {}", x.replace(' ', ""), y.replace(' ', ""))
+                .encode_utf16()
+                .collect(),
         };
     }
 
@@ -404,15 +408,10 @@ fn window_layout(
             / initial_scale
             * initial_scale
     };
-    let viewport_width = axis(image_width, i64::from(work.width()));
-    // Text follows display scaling; source pixels keep their exact integer
-    // magnification. Reserve a single row without stretching the pixel grid.
-    let width = viewport_width
-        .max(i64::from(dip(260, dpi)))
-        .min(i64::from(work.width()));
+    let width = axis(image_width, i64::from(work.width()));
     let footer = i64::from(footer_height(dpi));
     let viewport_height = axis(image_height, i64::from(work.height()) - footer);
-    if viewport_width < 32 || viewport_height < 32 {
+    if width < 32 || viewport_height < 32 {
         return Err(failure("工作区空间不足，无法显示完整像素格"));
     }
     let height = viewport_height + footer;
@@ -426,14 +425,10 @@ fn window_layout(
         right: (left + width) as i32,
         bottom: (top + height) as i32,
     };
-    // Near a monitor edge, keep the original pointer over the pixel grid,
-    // rather than over the extra space reserved for the information row.
-    let viewport_left =
-        (i64::from(focus.x) - viewport_width / 2).clamp(left, left + width - viewport_width);
     let viewport = ScreenRectPx {
-        left: viewport_left as i32,
+        left: bounds.left,
         top: bounds.top,
-        right: (viewport_left + viewport_width) as i32,
+        right: bounds.right,
         bottom: (top + viewport_height) as i32,
     };
     Ok((bounds, viewport))
@@ -441,24 +436,6 @@ fn window_layout(
 
 fn footer_height(dpi: u32) -> i32 {
     dip(28, dpi)
-}
-
-fn footer_columns(width: i32, dpi: u32, border: i32) -> [RECT; 3] {
-    let right = (width - border - dip(4, dpi)).max(0);
-    let column = |left, top, end| RECT {
-        left: dip(left, dpi).min(right),
-        top: dip(top, dpi),
-        right: dip(end, dpi).min(right),
-        bottom: footer_height(dpi) - border,
-    };
-    [
-        column(4, 3, 84),
-        column(88, 6, 112),
-        RECT {
-            right,
-            ..column(120, 6, 120)
-        },
-    ]
 }
 
 fn compact_rows(image: &mut FrozenImage) -> Result<()> {
@@ -558,6 +535,8 @@ struct Surface {
     _bitmap: OwnedBitmap,
     heading_font: OwnedFont,
     body_font: OwnedFont,
+    compact_font: OwnedFont,
+    narrow_font: OwnedFont,
     frost: Option<FrostedPanel>,
     appearance: AppearanceConfig,
     old_bitmap: HGDIOBJ,
@@ -588,6 +567,10 @@ impl Surface {
         }
         let heading_font = OwnedFont::new(13, 600, dpi)?;
         let body_font = OwnedFont::new(10, 400, dpi)?;
+        // Edge-cropped images can be only 132 physical pixels wide even at
+        // high DPI. Compact fonts fit that image; the window never grows.
+        let compact_font = OwnedFont::new(dip(8, dpi).min(12), 400, 96)?;
+        let narrow_font = OwnedFont::new(8, 400, 96)?;
         let frost = if capture_excluded && appearance.background_transparency_percent != 0 {
             match FrostedPanel::new(
                 width,
@@ -613,6 +596,8 @@ impl Surface {
             _bitmap: bitmap,
             heading_font,
             body_font,
+            compact_font,
+            narrow_font,
             frost,
             appearance,
             old_bitmap,
@@ -798,17 +783,13 @@ impl Surface {
             self.dpi,
             self.appearance.border_width_dip,
         );
-        let columns = footer_columns(self.width, self.dpi, border);
-        for (rect, font, color, text) in [
-            (columns[0], &self.heading_font, palette::TEXT, &footer.hex),
-            (columns[1], &self.body_font, palette::ACCENT, &footer.scale),
-            (
-                columns[2],
-                &self.body_font,
-                palette::SECONDARY,
-                &footer.coordinates,
-            ),
-        ] {
+        for FooterLabel {
+            rect,
+            font,
+            color,
+            text,
+        } in self.footer_labels(footer, border)?
+        {
             draw_text(
                 self.dc.0,
                 font,
@@ -822,6 +803,84 @@ impl Surface {
             )?;
         }
         Ok(())
+    }
+
+    fn text_size(&self, font: &OwnedFont, text: &[u16]) -> Result<SIZE> {
+        font.measure(self.dc.0, text)
+    }
+
+    fn footer_labels<'a>(
+        &'a self,
+        footer: &'a Footer,
+        border: i32,
+    ) -> Result<[FooterLabel<'a>; 3]> {
+        let left = 2;
+        let right = (self.width - border - 2).max(left);
+        let available = right - left;
+        let gap = 4;
+        let widest_hex: Vec<u16> = "#DDDDDD".encode_utf16().collect();
+        let choices = [
+            (
+                &self.heading_font,
+                &self.body_font,
+                footer.coordinates.as_slice(),
+            ),
+            (
+                &self.body_font,
+                &self.body_font,
+                footer.compact_coordinates.as_slice(),
+            ),
+            (
+                &self.compact_font,
+                &self.compact_font,
+                footer.compact_coordinates.as_slice(),
+            ),
+            (
+                &self.narrow_font,
+                &self.narrow_font,
+                footer.compact_coordinates.as_slice(),
+            ),
+        ];
+        for (index, (hex_font, info_font, coordinates)) in choices.into_iter().enumerate() {
+            let hex = self.text_size(hex_font, &widest_hex)?;
+            let position = self.text_size(info_font, coordinates)?;
+            let scale = self.text_size(info_font, &footer.scale)?;
+            if hex.cx + gap + position.cx > available && index != choices.len() - 1 {
+                continue;
+            }
+            let show_scale = hex.cx + position.cx + scale.cx + 3 * gap <= available;
+            let coordinate_left = (right - position.cx)
+                .max(left)
+                .max(left + available.min(hex.cx + gap));
+            let row_height = (footer_height(self.dpi) - border).max(0);
+            let rect = |x: i32, end: i32, height: i32| RECT {
+                left: x.min(right),
+                top: ((row_height - height) / 2).max(0),
+                right: end.min(right),
+                bottom: row_height,
+            };
+            return Ok([
+                FooterLabel {
+                    rect: rect(left, (left + hex.cx).min(coordinate_left - gap), hex.cy),
+                    font: hex_font,
+                    color: palette::TEXT,
+                    text: &footer.hex,
+                },
+                FooterLabel {
+                    rect: rect(left + hex.cx + gap, coordinate_left - gap, scale.cy),
+                    font: info_font,
+                    color: palette::ACCENT,
+                    text: if show_scale { &footer.scale } else { &[] },
+                },
+                FooterLabel {
+                    rect: rect(coordinate_left, right, position.cy),
+                    font: info_font,
+                    color: palette::SECONDARY,
+                    text: coordinates,
+                },
+            ]);
+        }
+        unreachable!("the smallest font always supplies a clipped layout")
     }
 
     fn brush(&self, color: COLORREF) -> Result<HBRUSH> {
@@ -851,6 +910,13 @@ impl Surface {
         }
         Ok(())
     }
+}
+
+struct FooterLabel<'a> {
+    rect: RECT,
+    font: &'a OwnedFont,
+    color: COLORREF,
+    text: &'a [u16],
 }
 
 impl Drop for Surface {
@@ -985,71 +1051,40 @@ mod tests {
     }
 
     #[test]
-    fn single_row_footer_has_room_for_full_labels_at_supported_desktop_scaling() {
+    fn single_row_footer_fits_the_actual_pixel_width_at_supported_desktop_scaling() {
+        let footer = Footer {
+            hex: "#DDDDDD".encode_utf16().collect(),
+            scale: "32×".encode_utf16().collect(),
+            coordinates: "X -65535  Y -65535".encode_utf16().collect(),
+            compact_coordinates: "X-65535 Y-65535".encode_utf16().collect(),
+        };
         for dpi in [96, 120, 144, 168, 192] {
-            let width = dip(260, dpi);
-            let surface = Surface::new(
-                640,
-                footer_height(dpi),
-                dpi,
-                false,
-                AppearanceConfig::default(),
-            )
-            .unwrap();
-            // Test against the thickest supported border, including a 5-digit
-            // negative source coordinate and the widest common HEX glyphs.
-            let columns = footer_columns(width, dpi, dip(6, dpi));
-            assert!(columns[0].right < columns[1].left);
-            assert!(columns[1].right < columns[2].left);
-            assert!(columns[0].top < columns[2].bottom && columns[2].top < columns[0].bottom);
-            let rows = [
-                ("#DDDDDD", columns[0], true),
-                ("32×", columns[1], false),
-                ("X -65535  Y -65535", columns[2], false),
-            ];
-            for (label, column, heading) in rows {
-                let rect = RECT {
-                    left: 0,
-                    top: 0,
-                    right: surface.width,
-                    bottom: surface.height,
-                };
-                surface.fill(rect, palette::PANEL).unwrap();
-                draw_text(
-                    surface.dc.0,
-                    if heading {
-                        &surface.heading_font
-                    } else {
-                        &surface.body_font
-                    },
-                    rect,
-                    palette::TEXT,
-                    &label.encode_utf16().collect::<Vec<_>>(),
+            for width in [132, 260] {
+                let surface = Surface::new(
+                    width,
+                    footer_height(dpi),
+                    dpi,
+                    false,
+                    AppearanceConfig::default(),
                 )
                 .unwrap();
-                let last_ink = (0..surface.width)
-                    .rev()
-                    .find(|&x| {
-                        (0..surface.height)
-                            .any(|y| unsafe { GetPixel(surface.dc.0, x, y) } != palette::PANEL)
-                    })
-                    .unwrap();
-                assert!(
-                    last_ink < column.right - column.left,
-                    "{label} clips at {dpi} DPI: {last_ink} >= {}",
-                    column.right - column.left
-                );
-                let last_row = (0..surface.height)
-                    .rev()
-                    .find(|&y| {
-                        (0..surface.width)
-                            .any(|x| unsafe { GetPixel(surface.dc.0, x, y) } != palette::PANEL)
-                    })
-                    .unwrap();
-                assert!(
-                    last_row < column.bottom - column.top,
-                    "{label} clips vertically at {dpi} DPI"
-                );
+                for border in [0, dip(6, dpi)] {
+                    let labels = surface.footer_labels(&footer, border).unwrap();
+                    assert!(labels[0].rect.right < labels[2].rect.left);
+                    for label in labels {
+                        if label.text.is_empty() {
+                            continue;
+                        }
+                        let size = surface.text_size(label.font, label.text).unwrap();
+                        assert!(
+                            size.cx <= label.rect.right - label.rect.left,
+                            "text clips at width {width}, {dpi} DPI"
+                        );
+                        assert!(size.cy <= label.rect.bottom - label.rect.top);
+                        assert!(label.rect.left >= 0 && label.rect.right <= width - border);
+                        assert!(label.rect.bottom <= footer_height(dpi) - border);
+                    }
+                }
             }
         }
     }
@@ -1163,10 +1198,10 @@ mod tests {
             assert_eq!(window.intersection(work), Some(window));
             assert_eq!(viewport.width(), viewport.height());
             assert_eq!(viewport.width(), dip(240, dpi).min(260) as u32 / 4 * 4);
-            assert!(viewport.left >= window.left && viewport.right <= window.right);
+            assert_eq!((viewport.left, viewport.right), (window.left, window.right));
             assert!(viewport.contains(ScreenPointPx { x: -1199, y: -699 }));
             assert_eq!(viewport.top, window.top);
-            assert_eq!(window.width(), dip(260, dpi) as u32);
+            assert_eq!(window.width(), viewport.width());
             assert_eq!(
                 window.height(),
                 viewport.height() + footer_height(dpi) as u32
@@ -1204,7 +1239,7 @@ mod tests {
         assert_eq!(viewport.width(), 132);
         assert_eq!(viewport.height(), 260);
         assert_eq!(window.height(), 309);
-        assert_eq!(window.width(), dip(260, 168) as u32);
+        assert_eq!(window.width(), 132);
         assert!(viewport.left <= -1 && viewport.right > -1);
         assert_eq!(window.intersection(work), Some(window));
         let mut view = ZoomView::new(
