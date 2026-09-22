@@ -62,6 +62,31 @@ struct Footer {
 }
 
 impl State {
+    fn hit_test(&self, point: ScreenPointPx) -> Option<SourcePixel> {
+        if !self.visible
+            || self.layout_invalidated
+            || self.paint_error.is_some()
+            || !self.accepts_pointer(point)
+        {
+            return None;
+        }
+        self.view.as_ref()?.hit_test(point)
+    }
+
+    fn draw(&self, target: HDC) -> Result<()> {
+        if let (Some(surface), Some(view), Some(bounds)) = (&self.surface, &self.view, self.bounds)
+        {
+            surface.draw(
+                target,
+                view,
+                bounds,
+                self.hover.map(|pixel| pixel.cache),
+                &self.footer,
+            )?;
+        }
+        Ok(())
+    }
+
     fn accepts_pointer(&self, point: ScreenPointPx) -> bool {
         self.bounds
             .zip(self.surface.as_ref())
@@ -299,14 +324,8 @@ impl MagnifierWindow {
 
     pub fn hit_test(&self, point: ScreenPointPx) -> Option<PickedColor> {
         let state = self.state.borrow();
-        if !state.visible
-            || state.layout_invalidated
-            || state.paint_error.is_some()
-            || !state.accepts_pointer(point)
-        {
-            return None;
-        }
-        let pixel = state.view.as_ref()?.hit_test(point)?;
+        // Confirm from the event coordinate, even if hover painting is delayed.
+        let pixel = state.hit_test(point)?;
         Some(PickedColor {
             rgb: pixel.rgb,
             source: pixel.source,
@@ -501,9 +520,7 @@ fn window_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> L
             WM_PAINT => {
                 let paint = PaintSession::begin(hwnd);
                 if let Ok(mut state) = state.try_borrow_mut()
-                    && let (Some(surface), Some(view), Some(bounds)) =
-                        (&state.surface, &state.view, state.bounds)
-                    && let Err(error) = surface.draw(paint.dc, view, bounds, &state.footer)
+                    && let Err(error) = state.draw(paint.dc)
                 {
                     state.paint_error = Some(error);
                 }
@@ -625,6 +642,7 @@ impl Surface {
         target: HDC,
         view: &ZoomView,
         bounds: ScreenRectPx,
+        hover: Option<CachePoint>,
         footer: &Footer,
     ) -> Result<()> {
         self.fill(
@@ -710,7 +728,9 @@ impl Surface {
                 )?;
             }
         }
-        if let Some(center) = view.cell_center(view.selected()) {
+        // The zoom anchor can differ from the pixel under the cursor after
+        // edge clamping. Highlight exactly the same hover used by the footer.
+        if let Some(center) = hover.and_then(|cache| view.cell_center(cache)) {
             let left = center.x - bounds.left - scale / 2;
             let top = center.y - bounds.top - scale / 2;
             self.frame(
@@ -1031,6 +1051,225 @@ fn failure(message: &'static str) -> Error {
 mod tests {
     use super::*;
 
+    fn edge_state(focus: ScreenPointPx, monitor: ScreenRectPx) -> State {
+        let work = ScreenRectPx {
+            bottom: monitor.bottom - 40,
+            ..monitor
+        };
+        let capture = crate::core::geometry::freeze_rect(focus, monitor).unwrap();
+        let mut snapshot = image(capture.width(), capture.height());
+        snapshot.origin = ScreenPointPx {
+            x: capture.left,
+            y: capture.top,
+        };
+        for y in 0..snapshot.height {
+            for x in 0..snapshot.width {
+                let offset = y as usize * snapshot.stride_bytes + x as usize * 4;
+                snapshot.bgrx[offset..offset + 4].copy_from_slice(&[
+                    17,
+                    y as u8 + 1,
+                    x as u8 + 1,
+                    0,
+                ]);
+            }
+        }
+        let (bounds, viewport) =
+            window_layout(focus, work, 96, snapshot.width, snapshot.height).unwrap();
+        let view = ZoomView::new(
+            snapshot,
+            viewport,
+            ZoomScale::X4,
+            CachePoint {
+                x: (focus.x - capture.left) as u32,
+                y: (focus.y - capture.top) as u32,
+            },
+        )
+        .unwrap();
+        let surface = Surface::new(
+            bounds.width() as i32,
+            bounds.height() as i32,
+            96,
+            false,
+            AppearanceConfig {
+                border_width_dip: 2,
+                background_transparency_percent: 0,
+            },
+        )
+        .unwrap();
+        let mut state = State {
+            view: Some(view),
+            surface: Some(surface),
+            bounds: Some(bounds),
+            visible: true,
+            ..Default::default()
+        };
+        state.hover = state.hit_test(focus);
+        state.refresh_text();
+        state
+    }
+
+    fn assert_hover_frame(state: &State, point: ScreenPointPx) {
+        let surface = state.surface.as_ref().unwrap();
+        let view = state.view.as_ref().unwrap();
+        let bounds = state.bounds.unwrap();
+        state.draw(surface.dc.0).unwrap();
+        assert_eq!(
+            state.hover,
+            state.hit_test(point),
+            "click mapping must agree"
+        );
+        assert_eq!(state.footer.rgb, state.hover.map(|pixel| pixel.rgb));
+        if let Some(pixel) = state.hover {
+            assert_eq!(
+                String::from_utf16(&state.footer.hex).unwrap(),
+                format_color(pixel.rgb, ColorFormat::Hex),
+            );
+            assert_eq!(
+                String::from_utf16(&state.footer.coordinates).unwrap(),
+                format!("X {}  Y {}", pixel.source.x, pixel.source.y),
+            );
+            let center = view.cell_center(pixel.cache).unwrap();
+            let scale = view.scale().factor() as i32;
+            assert_eq!(
+                unsafe {
+                    GetPixel(
+                        surface.dc.0,
+                        center.x - bounds.left - scale / 2 + 1,
+                        center.y - bounds.top - scale / 2,
+                    )
+                },
+                COLORREF(0x00ffffff),
+                "the actual GDI frame must surround hover.cache",
+            );
+        } else {
+            assert_eq!(String::from_utf16(&state.footer.hex).unwrap(), "—");
+            // No white pixels occur in the fixture or grid. Any white in the
+            // image would therefore be a stale current-pixel frame.
+            let drawn = local_rect(view.drawn_rect(), bounds);
+            for y in drawn.top..drawn.bottom {
+                for x in drawn.left..drawn.right - 2 {
+                    assert_ne!(
+                        unsafe { GetPixel(surface.dc.0, x, y) },
+                        COLORREF(0x00ffffff)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edge_highlight_uses_hover_instead_of_the_initial_zoom_anchor() {
+        for monitor in [
+            ScreenRectPx {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            ScreenRectPx {
+                left: -1920,
+                top: -1080,
+                right: 0,
+                bottom: 0,
+            },
+        ] {
+            for (x, y) in [
+                (20, 500),
+                (500, 20),
+                (20, 20),
+                (1900, 20),
+                (20, 1000),
+                (1900, 1000),
+            ] {
+                let focus = ScreenPointPx {
+                    x: monitor.left + x,
+                    y: monitor.top + y,
+                };
+                let state = edge_state(focus, monitor);
+                let hover = state.hover.unwrap();
+                if x == 20 && y == 500 {
+                    assert_eq!(hover.cache.x, 5);
+                    assert_eq!(state.view.as_ref().unwrap().selected().x, 20);
+                }
+                assert_hover_frame(&state, focus);
+            }
+        }
+    }
+
+    #[test]
+    fn hover_frame_and_footer_follow_zoom_clamping_exit_and_reentry() {
+        let focus = ScreenPointPx { x: 20, y: 500 };
+        let mut state = edge_state(
+            focus,
+            ScreenRectPx {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+        );
+        for scale in [
+            ZoomScale::X8,
+            ZoomScale::X16,
+            ZoomScale::X32,
+            ZoomScale::X16,
+            ZoomScale::X8,
+            ZoomScale::X4,
+        ] {
+            let drawn = state.view.as_ref().unwrap().drawn_rect();
+            let point = ScreenPointPx {
+                x: drawn.left + 3,
+                y: drawn.top + 3,
+            };
+            state.view.as_mut().unwrap().change_scale(scale, point);
+            state.hover = state.hit_test(point);
+            state.refresh_text();
+            assert_hover_frame(&state, point);
+        }
+        let bounds = state.bounds.unwrap();
+        let viewport = state.view.as_ref().unwrap().viewport();
+        for point in [
+            ScreenPointPx {
+                x: bounds.left + 20,
+                y: viewport.bottom + 1,
+            },
+            ScreenPointPx {
+                x: bounds.right - 1,
+                y: bounds.top + 20,
+            },
+            ScreenPointPx {
+                x: bounds.left - 1,
+                y: bounds.top + 20,
+            },
+            ScreenPointPx {
+                x: bounds.left + 20,
+                y: bounds.top + 20,
+            },
+        ] {
+            state.hover = state.hit_test(point);
+            state.refresh_text();
+            assert_hover_frame(&state, point);
+        }
+        let prior_hover = state.hover;
+        assert_eq!(
+            state.hit_test(ScreenPointPx {
+                x: bounds.left + 21,
+                y: bounds.top + 21,
+            }),
+            prior_hover,
+            "small movement within the same source cell keeps the target",
+        );
+        let other = ScreenPointPx {
+            x: bounds.left + 100,
+            y: bounds.top + 100,
+        };
+        assert_ne!(
+            state.hit_test(other),
+            prior_hover,
+            "clicks remap without waiting for hover"
+        );
+    }
+
     #[test]
     fn footer_tracks_hover_source_coordinates_across_pixels_and_zoom() {
         let mut snapshot = image(65, 65);
@@ -1202,7 +1441,7 @@ mod tests {
                 // Paint through the real GDI path into its own offscreen buffer.
                 // No desktop capture, visible window or synthesized input.
                 surface
-                    .draw(surface.dc.0, &view, bounds, &Footer::default())
+                    .draw(surface.dc.0, &view, bounds, None, &Footer::default())
                     .unwrap();
                 let source = view.source_view();
                 for y in [

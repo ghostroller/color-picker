@@ -1,5 +1,5 @@
 use color_picker::{
-    app::config::{AppearanceConfig, Config, ConfigStore, HotkeyConfig},
+    app::config::{AppearanceConfig, Config, ConfigError, ConfigStore, HotkeyConfig},
     app::i18n::Language,
     core::format::ColorFormat,
 };
@@ -40,6 +40,84 @@ impl Drop for TempDirectory {
         // The directory was created exclusively by this test, never adopted.
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn editing_session_rejects_external_changes_and_accepts_a_reloaded_revision() {
+    let directory = TempDirectory::new();
+    let store = ConfigStore::new(directory.path());
+    store.save(&Config::default()).unwrap();
+    let loaded = store.load();
+    let expected = loaded.revision.unwrap();
+    let draft = Config {
+        quick_pick: true,
+        ..loaded.config
+    };
+    let external = Config {
+        default_format: ColorFormat::Hsl,
+        ..Config::default()
+    };
+    store.save(&external).unwrap();
+    let external_bytes = std::fs::read(store.path()).unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            store.save_if_unchanged(&draft, &expected),
+            Err(ConfigError::ChangedSinceLoad(_))
+        ));
+        assert_eq!(std::fs::read(store.path()).unwrap(), external_bytes);
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+    let reloaded = store.load();
+    let revision = store
+        .save_if_unchanged(&draft, reloaded.revision.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(store.load().revision.as_ref(), Some(&revision));
+    // Consecutive Apply operations must carry forward the successful revision.
+    store.save_if_unchanged(&external, &revision).unwrap();
+    assert_eq!(store.load().config, external);
+}
+
+#[test]
+fn editing_revision_detects_external_creation_deletion_and_byte_only_edits() {
+    let directory = TempDirectory::new();
+    let store = ConfigStore::new(directory.path());
+    let missing = store.load().revision.unwrap();
+    let config = Config::default();
+    let created = store.save_if_unchanged(&config, &missing).unwrap();
+    assert!(matches!(
+        store.save_if_unchanged(&config, &missing),
+        Err(ConfigError::ChangedSinceLoad(_))
+    ));
+    let mut reformatted = std::fs::read(store.path()).unwrap();
+    reformatted.push(b' ');
+    std::fs::write(store.path(), &reformatted).unwrap();
+    assert!(matches!(
+        store.save_if_unchanged(&config, &created),
+        Err(ConfigError::ChangedSinceLoad(_))
+    ));
+    assert_eq!(std::fs::read(store.path()).unwrap(), reformatted);
+    let present = store.load().revision.unwrap();
+    std::fs::remove_file(store.path()).unwrap();
+    assert!(matches!(
+        store.save_if_unchanged(&config, &present),
+        Err(ConfigError::ChangedSinceLoad(_))
+    ));
+    assert!(!store.path().exists());
+}
+
+#[test]
+fn invalid_external_configuration_remains_protected_with_a_revision() {
+    let directory = TempDirectory::new();
+    let store = ConfigStore::new(directory.path());
+    let revision = store.load().revision.unwrap();
+    let invalid = b"{ invalid json }";
+    std::fs::write(store.path(), invalid).unwrap();
+    assert!(matches!(
+        store.save_if_unchanged(&Config::default(), &revision),
+        Err(ConfigError::ExistingFileProtected { .. })
+    ));
+    assert!(store.load().revision.is_none());
+    assert_eq!(std::fs::read(store.path()).unwrap(), invalid);
 }
 
 #[test]

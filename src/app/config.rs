@@ -189,6 +189,7 @@ pub enum ConfigError {
         reason: String,
     },
     ChangedDuringSave(PathBuf),
+    ChangedSinceLoad(PathBuf),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -216,6 +217,11 @@ impl std::fmt::Display for ConfigError {
                 "The settings file {} changed during saving and was not overwritten. Reload and try again",
                 path.display()
             )),
+            Self::ChangedSinceLoad(path) => formatter.write_str(&crate::tr_format!(
+                "配置文件 {} 在加载后已被外部修改，本次未覆盖，草稿仍保留。请重新启动程序以加载最新配置后再修改",
+                "The settings file {} changed externally after loading. It was not overwritten and your draft is retained. Restart the app to load the latest settings before editing again",
+                path.display()
+            )),
         }
     }
 }
@@ -235,7 +241,13 @@ pub struct LoadedConfig {
     pub config: Config,
     pub warning: Option<String>,
     pub save_allowed: bool,
+    pub revision: Option<ConfigRevision>,
 }
+
+/// Exact bytes observed during loading (including an absent file). Comparing
+/// bytes also detects formatting-only edits without a fingerprint collision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigRevision(Option<Vec<u8>>);
 
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
@@ -252,19 +264,22 @@ impl ConfigStore {
 
     pub fn load(&self) -> LoadedConfig {
         match self.read_checked() {
-            Ok(Some((config, _))) => LoadedConfig {
+            Ok(Some((config, bytes))) => LoadedConfig {
                 config,
                 warning: None,
                 save_allowed: true,
+                revision: Some(ConfigRevision(Some(bytes))),
             },
             Ok(None) => LoadedConfig {
                 config: Config::default(),
                 warning: None,
                 save_allowed: true,
+                revision: Some(ConfigRevision(None)),
             },
             Err(error) => LoadedConfig {
                 config: Config::default(),
                 save_allowed: false,
+                revision: None,
                 warning: Some(crate::tr_format!(
                     "配置无法使用：{error}。已使用默认设置；请修复或移走原文件并重新启动，当前不会覆盖该文件。",
                     "Cannot use the settings file: {error}. Defaults are active. Repair or move the original file, then restart. It will not be overwritten."
@@ -273,7 +288,27 @@ impl ConfigStore {
         }
     }
 
+    /// Save against the version present at the start of this call. Interactive
+    /// drafts must use `save_if_unchanged` with their loaded revision instead.
     pub fn save(&self, config: &Config) -> Result<(), ConfigError> {
+        self.save_checked(config, None).map(|_| ())
+    }
+
+    /// Save an editing session only if its loaded revision is still current.
+    /// The returned revision must replace the caller's after every success.
+    pub fn save_if_unchanged(
+        &self,
+        config: &Config,
+        expected: &ConfigRevision,
+    ) -> Result<ConfigRevision, ConfigError> {
+        self.save_checked(config, Some(expected))
+    }
+
+    fn save_checked(
+        &self,
+        config: &Config,
+        expected: Option<&ConfigRevision>,
+    ) -> Result<ConfigRevision, ConfigError> {
         config.validate()?;
         // The UI's save_allowed flag is not sufficient: the on-disk file may
         // have changed since startup, so protect invalid/future schemas again.
@@ -284,6 +319,9 @@ impl ConfigStore {
                 reason: error.to_string(),
             })?
             .map(|(_, bytes)| bytes);
+        if expected.is_some_and(|revision| revision.0 != previous) {
+            return Err(ConfigError::ChangedSinceLoad(self.path.clone()));
+        }
         let mut bytes = serde_json::to_vec_pretty(config).map_err(ConfigError::InvalidJson)?;
         bytes.push(b'\n');
         let parent = self
@@ -310,6 +348,8 @@ impl ConfigStore {
 
         // A second check catches an external edit during our temporary write,
         // while keeping the old file intact on every reported failure.
+        // This is not atomic compare-and-swap against arbitrary external writers:
+        // a writer can still race the final comparison and rename.
         let current = self
             .read_checked()
             .map_err(|error| ConfigError::ExistingFileProtected {
@@ -331,7 +371,7 @@ impl ConfigStore {
             )
         })?;
         temporary.committed = true;
-        Ok(())
+        Ok(ConfigRevision(Some(bytes)))
     }
 
     fn read_checked(&self) -> Result<Option<(Config, Vec<u8>)>, ConfigError> {

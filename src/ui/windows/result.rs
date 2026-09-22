@@ -28,9 +28,11 @@ use windows::{
             Controls::{
                 CDDS_PREPAINT, CDIS_DISABLED, CDIS_FOCUS, CDIS_HOT, CDIS_SELECTED,
                 CDRF_SKIPDEFAULT, DRAWITEMSTRUCT, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR,
+                SetScrollInfo,
             },
             HiDpi::GetDpiForWindow,
-            Input::KeyboardAndMouse::SetFocus,
+            Input::KeyboardAndMouse::{GetFocus, SetFocus},
+            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::*,
         },
     },
@@ -39,6 +41,7 @@ use windows::{
 
 use super::{
     drawing::{border_thickness, dip, draw_bottom_right_border},
+    layout::{self, SheetLayout, fit_to_work_area, reveal_offset},
     theme::{self, Font, Theme, Tone},
 };
 use crate::{
@@ -53,6 +56,8 @@ use crate::{
 
 pub const WM_RESULT_WAKE: u32 = WM_APP + 11;
 const CLASS: PCWSTR = w!("ColorPicker.Result.v1");
+const CONTENT_CLASS: PCWSTR = w!("ColorPicker.ResultContent.v1");
+const CONTENT: usize = 300;
 const COPY_DEFAULT: usize = 1;
 const CLOSE: usize = 2;
 const PICK_AGAIN: usize = 200;
@@ -66,8 +71,6 @@ const CLIENT_WIDTH: i32 = 420;
 const CLIENT_HEIGHT: i32 = 364;
 const CLIENT_HEIGHT_WITH_STATUS: i32 = 390;
 const SWATCH_HEIGHT: i32 = 112;
-const ROW_TOP: i32 = 156;
-const ROW_HEIGHT: i32 = 36;
 const STYLE: WINDOW_STYLE =
     WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0);
 const EX_STYLE: WINDOW_EX_STYLE = WINDOW_EX_STYLE(WS_EX_APPWINDOW.0 | WS_EX_CONTROLPARENT.0);
@@ -87,6 +90,9 @@ struct Pending {
     feedback_timer: Option<usize>,
     dpi_rect: Option<RECT>,
     layout: bool,
+    fit_work_area: bool,
+    scroll: Option<i32>,
+    reveal: Option<HWND>,
     default_style: bool,
     minimize: bool,
 }
@@ -105,6 +111,12 @@ struct CallbackState {
     active_timer: Cell<usize>,
     feedback_timer: Cell<usize>,
     default_id: Cell<usize>,
+    viewport: Cell<HWND>,
+    scroll_offset: Cell<i32>,
+    content_height: Cell<i32>,
+    viewport_height: Cell<i32>,
+    header_height: Cell<i32>,
+    wheel_remainder: Cell<i32>,
 }
 
 impl CallbackState {
@@ -277,17 +289,19 @@ impl ResultWindow {
         quick_pick: bool,
     ) -> Result<Self> {
         let instance = unsafe { GetModuleHandleW(None)? }.into();
-        let class = WNDCLASSW {
-            lpfnWndProc: Some(window_proc),
-            hInstance: instance,
-            hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
-            lpszClassName: CLASS,
-            ..Default::default()
-        };
-        if unsafe { RegisterClassW(&class) } == 0
-            && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS
-        {
-            return Err(Error::from_thread());
+        for name in [CLASS, CONTENT_CLASS] {
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance,
+                hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
+                lpszClassName: name,
+                ..Default::default()
+            };
+            if unsafe { RegisterClassW(&class) } == 0
+                && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS
+            {
+                return Err(Error::from_thread());
+            }
         }
         let callback = Box::new(CallbackState {
             notify_hwnd,
@@ -307,6 +321,12 @@ impl ResultWindow {
             active_timer: Cell::new(0),
             feedback_timer: Cell::new(0),
             default_id: Cell::new(COPY_DEFAULT),
+            viewport: Cell::new(HWND::default()),
+            scroll_offset: Cell::new(0),
+            content_height: Cell::new(0),
+            viewport_height: Cell::new(0),
+            header_height: Cell::new(0),
+            wheel_remainder: Cell::new(0),
         });
         let pointer = callback.as_ref() as *const CallbackState;
         let title = wide(tr("取色结果 — Color Picker", "Picked color — Color Picker"));
@@ -363,6 +383,23 @@ impl ResultWindow {
                 size_of::<BOOL>() as u32,
             )?;
         }
+        let viewport = unsafe {
+            CreateWindowExW(
+                WS_EX_CONTROLPARENT,
+                CONTENT_CLASS,
+                w!("Color formats"),
+                WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL,
+                0,
+                0,
+                1,
+                1,
+                Some(hwnd),
+                Some(HMENU(CONTENT as *mut _)),
+                Some(instance),
+                Some(pointer.cast()),
+            )?
+        };
+        window.callback.viewport.set(viewport);
         window.create_controls()?;
         window.place_initially()?;
         window.layout()?;
@@ -379,6 +416,21 @@ impl ResultWindow {
                 })
             });
         }
+        Ok(window)
+    }
+
+    /// A failed host copy opens an ordinary manual result. No copy is queued;
+    /// a later successful button copy must leave this visible window open.
+    pub fn new_after_copy_failure(
+        picked: PickedColor,
+        notify_hwnd: HWND,
+        default_format: ColorFormat,
+        appearance: AppearanceConfig,
+        failure: &str,
+    ) -> Result<Self> {
+        let window =
+            Self::new_with_appearance(picked, notify_hwnd, default_format, false, appearance)?;
+        window.copy_failed(failure)?;
         Ok(window)
     }
 
@@ -409,6 +461,7 @@ impl ResultWindow {
             return Ok(Some(action));
         }
         if let Some(rect) = pending.dpi_rect {
+            let rect = fit_to_work_area(rect, self.minimum_size()?)?;
             unsafe {
                 SetWindowPos(
                     self.hwnd,
@@ -421,8 +474,20 @@ impl ResultWindow {
                 )?;
             }
         }
-        if pending.layout {
+        if pending.fit_work_area {
+            self.fit_window()?;
+        }
+        if let Some(offset) = pending.scroll {
+            self.callback.scroll_offset.set(offset);
+        }
+        if pending.layout || pending.fit_work_area || pending.scroll.is_some() {
             self.layout()?;
+            if pending.scroll.is_none() {
+                self.reveal_control(unsafe { GetFocus() })?;
+            }
+        }
+        if let Some(control) = pending.reveal {
+            self.reveal_control(control)?;
         }
         if pending.default_style {
             self.update_default_style();
@@ -522,10 +587,12 @@ impl ResultWindow {
             WINDOW_EX_STYLE::default(),
         )?;
         self.controls.status = self.control(
-            w!("STATIC"),
+            w!("EDIT"),
             "",
             12,
-            WINDOW_STYLE(SS_NOPREFIX.0),
+            WS_TABSTOP
+                | WS_VSCROLL
+                | WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32),
             WINDOW_EX_STYLE::default(),
         )?;
         // Do not reserve an empty footer before a copy has produced feedback.
@@ -557,6 +624,22 @@ impl ResultWindow {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             )?
         };
+        for row in self.controls.rows {
+            for control in [row.edit, row.copy] {
+                if !unsafe {
+                    SetWindowSubclass(
+                        control,
+                        Some(scroll_control_proc),
+                        1,
+                        self.callback.as_ref() as *const CallbackState as usize,
+                    )
+                }
+                .as_bool()
+                {
+                    return Err(Error::from_thread());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -579,7 +662,17 @@ impl ResultWindow {
                 0,
                 1,
                 1,
-                Some(self.hwnd),
+                Some(
+                    if id == 11
+                        || (20..24).contains(&id)
+                        || (30..34).contains(&id)
+                        || (COPY_ROW..COPY_ROW + 4).contains(&id)
+                    {
+                        self.callback.viewport.get()
+                    } else {
+                        self.hwnd
+                    },
+                ),
                 Some(HMENU(id as *mut _)),
                 Some(GetModuleHandleW(None)?.into()),
                 None,
@@ -631,16 +724,25 @@ impl ResultWindow {
         let dpi = self.dpi()?;
         // WM_NCCALCSIZE makes the whole window client space: do not add the
         // former native caption/border dimensions back into the layout.
-        let width = dip(CLIENT_WIDTH, dpi);
-        let height = dip(CLIENT_HEIGHT, dpi);
-        let x = i64::from(self.picked.source.x).clamp(
-            i64::from(work.left),
-            (i64::from(work.right) - i64::from(width)).max(i64::from(work.left)),
-        ) as i32;
-        let y = i64::from(self.picked.source.y).clamp(
-            i64::from(work.top),
-            (i64::from(work.bottom) - i64::from(height)).max(i64::from(work.top)),
-        ) as i32;
+        // Placement must stay on the source monitor whose DPI was just read.
+        // The unbounded preferred rectangle can overlap a neighbouring screen.
+        let rect = layout::fit_rect(
+            RECT {
+                left: self.picked.source.x,
+                top: self.picked.source.y,
+                right: self.picked.source.x.saturating_add(dip(CLIENT_WIDTH, dpi)),
+                bottom: self.picked.source.y.saturating_add(dip(CLIENT_HEIGHT, dpi)),
+            },
+            work,
+            self.minimum_size()?,
+        )
+        .ok_or_else(layout::unavailable)?;
+        let (x, y, width, height) = (
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        );
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -660,27 +762,67 @@ impl ResultWindow {
         Ok(())
     }
 
+    fn minimum_size(&self) -> Result<(i32, i32)> {
+        let dpi = self.dpi()?;
+        Ok((
+            dip(240, dpi),
+            dip(if self.status_visible.get() { 262 } else { 206 }, dpi),
+        ))
+    }
+
+    fn fit_window(&self) -> Result<()> {
+        let dpi = self.dpi()?;
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(self.hwnd, &mut rect)? };
+        let work = layout::work_area(rect)?;
+        rect.right = rect.left.saturating_add(dip(CLIENT_WIDTH, dpi));
+        rect.bottom = rect.top.saturating_add(dip(
+            if self.status_visible.get() {
+                CLIENT_HEIGHT_WITH_STATUS
+            } else {
+                CLIENT_HEIGHT
+            },
+            dpi,
+        ));
+        let rect =
+            layout::fit_rect(rect, work, self.minimum_size()?).ok_or_else(layout::unavailable)?;
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                None,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )?
+        };
+        Ok(())
+    }
+
     fn layout(&self) -> Result<()> {
         let dpi = self.dpi()?;
         self.callback.theme.update_window_icons(self.hwnd);
         if self.resources.borrow().dpi != dpi {
             self.update_resources(dpi)?;
         }
-        let place = |hwnd, x, y, width, height| unsafe {
-            MoveWindow(
-                hwnd,
-                dip(x, dpi),
-                dip(y, dpi),
-                dip(width, dpi),
-                dip(height, dpi),
-                true,
-            )
-        };
-        // Leave the shared right border uncovered by this child window, even
-        // across fractional DPI changes. The parent uses WS_CLIPCHILDREN.
         let mut client = RECT::default();
+        unsafe { GetClientRect(self.hwnd, &mut client)? };
+        let narrow = client.right < dip(400, dpi);
+        let footer = dip(
+            if narrow { 94 } else { 54 } + if self.status_visible.get() { 56 } else { 0 },
+            dpi,
+        );
+        let header = dip(SWATCH_HEIGHT, dpi).min(client.bottom - footer - dip(64, dpi));
+        if header < dip(48, dpi) || client.right < dip(240, dpi) {
+            return Err(layout::unavailable());
+        }
+        let panes = SheetLayout::new(client.right, client.bottom, header, footer, dip(64, dpi))?;
+        let viewport = self.callback.viewport.get();
+        let viewport_height = panes.viewport.bottom - panes.viewport.top;
+        self.callback.viewport_height.set(viewport_height);
+        self.callback.header_height.set(header);
         unsafe {
-            GetClientRect(self.hwnd, &mut client)?;
             MoveWindow(
                 self.controls.swatch,
                 0,
@@ -692,7 +834,21 @@ impl ResultWindow {
                         dpi,
                         self.callback.border_width_dip,
                     ),
-                dip(SWATCH_HEIGHT, dpi),
+                header,
+                true,
+            )?;
+            MoveWindow(
+                viewport,
+                0,
+                header,
+                client.right
+                    - border_thickness(
+                        client.right,
+                        client.bottom,
+                        dpi,
+                        self.callback.border_width_dip,
+                    ),
+                viewport_height,
                 true,
             )?;
         }
@@ -700,30 +856,139 @@ impl ResultWindow {
             (CAPTION_MINIMIZE, self.controls.minimize),
             (CAPTION_CLOSE, self.controls.caption_close),
         ] {
-            let rect = caption_button_rect(id, client.right, dpi);
+            let r = caption_button_rect(id, client.right, dpi);
             unsafe {
                 MoveWindow(
                     button,
-                    rect.left,
-                    rect.top,
-                    rect.right - rect.left,
-                    rect.bottom - rect.top,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
                     true,
                 )?
             };
         }
-        place(self.controls.source, 20, 128, 380, 18)?;
-        for (index, row) in self.controls.rows.iter().enumerate() {
-            let y = ROW_TOP + index as i32 * ROW_HEIGHT;
-            place(row.label, 20, y + 9, 60, 18)?;
-            place(row.edit, 88, y + 7, 252, 22)?;
-            place(row.copy, 352, y + 4, 48, 28)?;
+        // Reserve scrollbar width before choosing a row layout. This avoids
+        // oscillating between wide and narrow layouts as the bar appears.
+        let content_width = ((i64::from(client.right) * 96) / i64::from(dpi)) as i32 - 20;
+        let geometry = result_content_layout(content_width);
+        let content_height = dip(geometry.height, dpi);
+        self.callback.content_height.set(content_height);
+        let offset = self
+            .callback
+            .scroll_offset
+            .get()
+            .clamp(0, (content_height - viewport_height).max(0));
+        self.callback.scroll_offset.set(offset);
+        let scroll = SCROLLINFO {
+            cbSize: size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+            nMin: 0,
+            nMax: content_height - 1,
+            nPage: viewport_height as u32,
+            nPos: offset,
+            ..Default::default()
+        };
+        unsafe {
+            SetScrollInfo(viewport, SB_VERT, &scroll, true);
         }
-        place(self.controls.default_copy, 20, 316, 160, 32)?;
-        place(self.controls.pick_again, 196, 316, 126, 32)?;
-        place(self.controls.close, 336, 316, 64, 32)?;
-        place(self.controls.status, 20, 354, 380, 28)?;
+        let place_content = |hwnd, r: RECT| unsafe {
+            MoveWindow(
+                hwnd,
+                dip(r.left, dpi),
+                dip(r.top, dpi) - offset,
+                dip(r.right - r.left, dpi),
+                dip(r.bottom - r.top, dpi),
+                true,
+            )
+        };
+        place_content(self.controls.source, geometry.source)?;
+        for (row, rects) in self.controls.rows.iter().zip(geometry.rows) {
+            for (hwnd, r) in [row.label, row.edit, row.copy].into_iter().zip(rects) {
+                place_content(hwnd, r)?;
+            }
+        }
+        let margin = dip(16, dpi);
+        let gap = dip(12, dpi);
+        let y = panes.actions.top + dip(8, dpi);
+        let width = client.right - 2 * margin;
+        let button_height = dip(32, dpi);
+        let place =
+            |hwnd, x, y, width| unsafe { MoveWindow(hwnd, x, y, width, button_height, true) };
+        let status_y = if narrow {
+            place(self.controls.default_copy, margin, y, width)?;
+            let second_y = y + dip(40, dpi);
+            let half = (width - gap) / 2;
+            place(self.controls.pick_again, margin, second_y, half)?;
+            place(
+                self.controls.close,
+                margin + half + gap,
+                second_y,
+                width - half - gap,
+            )?;
+            second_y + dip(40, dpi)
+        } else {
+            let close_width = dip(64, dpi);
+            let again_width = dip(126, dpi);
+            place(
+                self.controls.default_copy,
+                margin,
+                y,
+                width - close_width - again_width - 2 * gap,
+            )?;
+            place(
+                self.controls.pick_again,
+                client.right - margin - close_width - gap - again_width,
+                y,
+                again_width,
+            )?;
+            place(
+                self.controls.close,
+                client.right - margin - close_width,
+                y,
+                close_width,
+            )?;
+            y + dip(40, dpi)
+        };
+        unsafe {
+            MoveWindow(
+                self.controls.status,
+                margin,
+                status_y,
+                width,
+                dip(44, dpi),
+                true,
+            )?;
+        }
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+        let _ = unsafe { InvalidateRect(Some(viewport), None, false) };
+        Ok(())
+    }
+
+    fn reveal_control(&self, hwnd: HWND) -> Result<()> {
+        let viewport = self.callback.viewport.get();
+        if !unsafe { IsChild(viewport, hwnd) }.as_bool() {
+            return Ok(());
+        }
+        let mut rect = RECT::default();
+        let mut origin = POINT::default();
+        unsafe {
+            GetWindowRect(hwnd, &mut rect)?;
+            if !ClientToScreen(viewport, &mut origin).as_bool() {
+                return Err(Error::from_thread());
+            }
+        }
+        let offset = reveal_offset(
+            self.callback.scroll_offset.get(),
+            rect.top - origin.y,
+            rect.bottom - origin.y,
+            self.callback.viewport_height.get(),
+            self.callback.content_height.get(),
+            dip(8, self.dpi()?),
+        );
+        if self.callback.scroll_offset.replace(offset) != offset {
+            self.layout()?;
+        }
         Ok(())
     }
 
@@ -801,38 +1066,8 @@ impl ResultWindow {
         self.callback.status_tone.set(tone);
         let text = wide(text);
         unsafe { SetWindowTextW(self.controls.status, PCWSTR(text.as_ptr()))? };
-        if !self.status_visible.get() {
-            // Only a final failure needs this two-line detail area. Clamp
-            // upwards at the work-area edge so feedback stays on
-            // screen when the picked pixel was close to the taskbar.
-            let dpi = self.dpi()?;
-            let mut bounds = RECT::default();
-            let mut info = MONITORINFO {
-                cbSize: size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            unsafe {
-                GetWindowRect(self.hwnd, &mut bounds)?;
-                let monitor = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
-                if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-                    return Err(Error::from_thread());
-                }
-                let height = dip(CLIENT_HEIGHT_WITH_STATUS, dpi);
-                let top = bounds
-                    .top
-                    .min(info.rcWork.bottom - height)
-                    .max(info.rcWork.top);
-                SetWindowPos(
-                    self.hwnd,
-                    None,
-                    bounds.left,
-                    top,
-                    bounds.right - bounds.left,
-                    height,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                )?;
-            }
-            self.status_visible.set(true);
+        if !self.status_visible.replace(true) {
+            self.fit_window()?;
             self.layout()?;
         }
         let _ = unsafe { ShowWindow(self.controls.status, SW_SHOWNA) };
@@ -869,21 +1104,8 @@ impl ResultWindow {
         // from a final failure removes its now-empty footer at the same origin.
         unsafe { SetWindowTextW(self.controls.status, w!(""))? };
         let _ = unsafe { ShowWindow(self.controls.status, SW_HIDE) };
-        if self.status_visible.get() {
-            let mut bounds = RECT::default();
-            unsafe {
-                GetWindowRect(self.hwnd, &mut bounds)?;
-                SetWindowPos(
-                    self.hwnd,
-                    None,
-                    0,
-                    0,
-                    bounds.right - bounds.left,
-                    dip(CLIENT_HEIGHT, self.dpi()?),
-                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-                )?;
-            }
-            self.status_visible.set(false);
+        if self.status_visible.replace(false) {
+            self.fit_window()?;
             self.layout()?;
         }
         let timer = next_copy_token()?;
@@ -995,6 +1217,66 @@ impl Drop for ResultWindow {
     }
 }
 
+struct ResultContentLayout {
+    source: RECT,
+    rows: [[RECT; 3]; 4],
+    height: i32,
+}
+
+fn result_content_layout(width: i32) -> ResultContentLayout {
+    let rect = |x, y, w, h| RECT {
+        left: x,
+        top: y,
+        right: x + w,
+        bottom: y + h,
+    };
+    let narrow = width < 360;
+    let row_height = if narrow { 58 } else { 36 };
+    let row_top = if narrow { 52 } else { 44 };
+    ResultContentLayout {
+        source: rect(16, 12, width - 32, if narrow { 36 } else { 22 }),
+        rows: std::array::from_fn(|index| {
+            let y = row_top + index as i32 * row_height;
+            if narrow {
+                [
+                    rect(16, y + 4, 68, 18),
+                    rect(16, y + 28, width - 32, 24),
+                    rect(width - 64, y, 48, 26),
+                ]
+            } else {
+                [
+                    rect(16, y + 9, 60, 18),
+                    rect(84, y + 7, width - 160, 22),
+                    rect(width - 64, y + 4, 48, 28),
+                ]
+            }
+        }),
+        height: row_top + 4 * row_height + 8,
+    }
+}
+
+unsafe extern "system" fn scroll_control_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    subclass: usize,
+    reference: usize,
+) -> LRESULT {
+    catch_unwind(AssertUnwindSafe(|| {
+        let state = unsafe { &*(reference as *const CallbackState) };
+        match message {
+            WM_SETFOCUS => state.queue(|pending| pending.reveal = Some(hwnd)),
+            WM_NCDESTROY => {
+                let _ = unsafe { RemoveWindowSubclass(hwnd, Some(scroll_control_proc), subclass) };
+            }
+            _ => {}
+        }
+        unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+    }))
+    .unwrap_or_else(|_| std::process::abort())
+}
+
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
@@ -1018,7 +1300,7 @@ fn caption_button_rect(id: usize, width: i32, dpi: u32) -> RECT {
     }
 }
 
-fn caption_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+fn caption_hit_test(hwnd: HWND, lparam: LPARAM, header_height: i32) -> LRESULT {
     // Screen coordinates can be negative on monitors left/above the primary.
     let mut point = POINT {
         x: (lparam.0 as u16 as i16) as i32,
@@ -1040,7 +1322,7 @@ fn caption_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     {
         return LRESULT(HTCLIENT as isize);
     }
-    if inside(client) && point.y < dip(SWATCH_HEIGHT, dpi) {
+    if inside(client) && point.y < header_height {
         LRESULT(HTCAPTION as isize)
     } else {
         LRESULT(HTCLIENT as isize)
@@ -1191,18 +1473,6 @@ fn paint_result(hwnd: HWND, border_width_dip: u8) -> LRESULT {
         let saved = unsafe { SaveDC(hdc) };
         if saved != 0 {
             let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
-            unsafe { SetDCBrushColor(hdc, COLORREF(0x00f0eeeb)) };
-            // One continuous value list, separated only by quiet hairlines.
-            for index in 1..=4 {
-                let top = dip(ROW_TOP + index * ROW_HEIGHT, dpi);
-                let line = RECT {
-                    left: dip(20, dpi),
-                    top,
-                    right: client.right - dip(20, dpi),
-                    bottom: top + 1,
-                };
-                unsafe { FillRect(hdc, &line, HBRUSH(GetStockObject(DC_BRUSH).0)) };
-            }
             let _ =
                 draw_bottom_right_border(hdc, client.right, client.bottom, dpi, border_width_dip);
             let _ = unsafe { RestoreDC(hdc, saved) };
@@ -1240,14 +1510,23 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     };
     match message {
-        WM_NCCALCSIZE => LRESULT(0),
-        WM_NCHITTEST => caption_hit_test(hwnd, lparam),
+        WM_NCCALCSIZE if hwnd != state.viewport.get() => LRESULT(0),
+        WM_NCHITTEST if hwnd != state.viewport.get() => {
+            caption_hit_test(hwnd, lparam, state.header_height.get())
+        }
         // A fixed-size results sheet has no maximize/resize mode, even when
         // invoked through the system menu or a double click on its color field.
         WM_NCLBUTTONDBLCLK if wparam.0 == HTCAPTION as usize => LRESULT(0),
         WM_SYSCOMMAND if matches!((wparam.0 & 0xfff0) as u32, SC_MAXIMIZE | SC_SIZE) => LRESULT(0),
         WM_ERASEBKGND => LRESULT(1),
-        WM_PAINT => paint_result(hwnd, state.border_width_dip),
+        WM_PAINT => paint_result(
+            hwnd,
+            if hwnd == state.viewport.get() {
+                0
+            } else {
+                state.border_width_dip
+            },
+        ),
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {
             let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut _)) } as usize;
             let tone = if id == 12 {
@@ -1310,10 +1589,55 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             }
             LRESULT(0)
         }
-        WM_SIZE => {
+        WM_SIZE if hwnd != state.viewport.get() => {
             if wparam.0 != SIZE_MINIMIZED as usize {
                 state.queue(|pending| pending.layout = true);
             }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE | WM_SETTINGCHANGE if hwnd != state.viewport.get() => {
+            state.queue(|pending| pending.fit_work_area = true);
+            LRESULT(0)
+        }
+        WM_VSCROLL if hwnd == state.viewport.get() && lparam.0 == 0 => {
+            let mut info = SCROLLINFO {
+                cbSize: size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_ALL,
+                ..Default::default()
+            };
+            if unsafe { GetScrollInfo(hwnd, SB_VERT, &mut info) }.is_ok() {
+                let line = dip(28, unsafe { GetDpiForWindow(hwnd) }.max(96));
+                let current = state
+                    .pending
+                    .get()
+                    .scroll
+                    .unwrap_or(state.scroll_offset.get());
+                let next = match SCROLLBAR_COMMAND((wparam.0 & 0xffff) as i32) {
+                    SB_LINEUP => current - line,
+                    SB_LINEDOWN => current + line,
+                    SB_PAGEUP => current - info.nPage as i32,
+                    SB_PAGEDOWN => current + info.nPage as i32,
+                    SB_THUMBPOSITION | SB_THUMBTRACK => info.nTrackPos,
+                    SB_TOP => 0,
+                    SB_BOTTOM => info.nMax,
+                    _ => current,
+                };
+                state.queue(|pending| pending.scroll = Some(next));
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let total = state.wheel_remainder.get() + ((wparam.0 >> 16) as u16 as i16) as i32;
+            state.wheel_remainder.set(total % 120);
+            let current = state
+                .pending
+                .get()
+                .scroll
+                .unwrap_or(state.scroll_offset.get());
+            state.queue(|pending| {
+                pending.scroll =
+                    Some(current - total / 120 * dip(72, unsafe { GetDpiForWindow(hwnd) }.max(96)))
+            });
             LRESULT(0)
         }
         DM_GETDEFID => LRESULT(((DC_HASDEFID as usize) << 16 | state.default_id.get()) as isize),
@@ -1335,6 +1659,83 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn narrow_result_rows_fit_and_every_edit_and_copy_can_scroll_into_view() {
+        for width in [220, 260, 300, 350, 360, 400] {
+            let content = result_content_layout(width);
+            for r in std::iter::once(content.source).chain(content.rows.into_iter().flatten()) {
+                assert!(r.left >= 0 && r.right <= width && r.right > r.left);
+                assert!(r.top >= 0 && r.bottom <= content.height);
+                let offset = reveal_offset(0, r.top, r.bottom, 64, content.height, 8);
+                assert!(r.top - offset >= 0 && r.bottom - offset <= 64);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; resizes a hidden fixture without copying or input"]
+    fn small_result_viewport_keeps_actions_visible_and_reveals_focused_rows() {
+        let result = quick_result();
+        // Discard the constructor's quick-copy intention: this test uses no
+        // clipboard and delivers only messages to this hidden test fixture.
+        result.callback.pending.take();
+        result
+            .status(
+                "Long copy failure detail remains scrollable in a small work area.",
+                Tone::Error,
+            )
+            .unwrap();
+        let dpi = result.dpi().unwrap();
+        for width in [420, 320, 260] {
+            unsafe {
+                SetWindowPos(
+                    result.hwnd,
+                    None,
+                    0,
+                    0,
+                    dip(width, dpi),
+                    dip(300, dpi),
+                    SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
+                )
+                .unwrap();
+            }
+            result.process_pending().unwrap();
+            let bounds = |hwnd| {
+                let mut rect = RECT::default();
+                unsafe {
+                    GetWindowRect(hwnd, &mut rect).unwrap();
+                }
+                rect
+            };
+            let window = bounds(result.hwnd);
+            let viewport = bounds(result.callback.viewport.get());
+            let actions = [
+                result.controls.default_copy,
+                result.controls.pick_again,
+                result.controls.close,
+                result.controls.status,
+            ];
+            let before: Vec<_> = actions.map(bounds).into();
+            for rect in &before {
+                assert!(rect.left >= window.left && rect.right <= window.right);
+                assert!(rect.top >= viewport.bottom && rect.bottom <= window.bottom);
+            }
+            for row in result.controls.rows {
+                for control in [row.edit, row.copy] {
+                    unsafe {
+                        SendMessageW(control, WM_SETFOCUS, None, None);
+                    }
+                    result.process_pending().unwrap();
+                    let rect = bounds(control);
+                    assert!(rect.left >= viewport.left && rect.right <= viewport.right);
+                    assert!(rect.top >= viewport.top && rect.bottom <= viewport.bottom);
+                    assert_eq!(actions.map(bounds).as_slice(), before);
+                }
+            }
+            assert!(!unsafe { IsWindowVisible(result.hwnd) }.as_bool());
+        }
+    }
 
     #[test]
     #[ignore = "requires an interactive Windows desktop; displays a result window without copying"]
@@ -1473,6 +1874,38 @@ mod tests {
         let token = next_copy_token().unwrap();
         result.copy.borrow_mut().replace(token, target);
         result.copy.borrow().matching(token).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; displays a failed host copy without copying"]
+    fn failed_host_copy_opens_manual_result_and_later_success_keeps_it_open() {
+        let result = ResultWindow::new_after_copy_failure(
+            PickedColor {
+                rgb: crate::core::color::Rgb8::new(12, 34, 56),
+                source: crate::core::geometry::ScreenPointPx { x: 0, y: 0 },
+                kind: SampleKind::Frozen,
+            },
+            HWND::default(),
+            ColorFormat::CssRgb,
+            AppearanceConfig::default(),
+            "Simulated host copy failure",
+        )
+        .unwrap();
+        assert!(!result.quick_pick_pending.get());
+        assert!(result.callback.pending.get().copy.is_none());
+        assert!(result.copy.borrow().0.is_none());
+        assert!(result.status_visible.get());
+        assert!(unsafe { IsWindowVisible(result.hwnd) }.as_bool());
+        let token = next_copy_token().unwrap();
+        result
+            .copy
+            .borrow_mut()
+            .replace(token, target(ColorFormat::CssRgb, COPY_DEFAULT));
+        let request = result.copy.borrow().matching(token).unwrap();
+        result.finish_copy_attempt(request, Ok(())).unwrap();
+        assert!(unsafe { IsWindowVisible(result.hwnd) }.as_bool());
+        assert_eq!(result.process_pending().unwrap(), None);
+        assert!(!result.status_visible.get());
     }
 
     #[test]

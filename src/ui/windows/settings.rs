@@ -31,7 +31,7 @@ use windows::{
             },
             HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
             Input::KeyboardAndMouse::{
-                EnableWindow, SetFocus, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT, VK_TAB,
+                EnableWindow, GetFocus, SetFocus, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_SHIFT, VK_TAB,
             },
             Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::*,
@@ -42,6 +42,7 @@ use windows::{
 
 use super::{
     drawing::dip,
+    layout::{self, SheetLayout, fit_to_work_area, reveal_offset},
     theme::{self, Font, Theme, Tone},
 };
 use crate::{
@@ -92,8 +93,6 @@ const PREVIEW_HINT: usize = 27;
 const STATUS: usize = 14;
 const CLIENT_WIDTH: i32 = 500;
 const CLIENT_HEIGHT: i32 = 750;
-const CONTENT_HEIGHT: i32 = 686;
-const FOOTER_HEIGHT: i32 = 64;
 const KEY_SUBCLASS: usize = 1;
 const SCROLL_SUBCLASS: usize = 2;
 // CommCtrl.h aliases TBM_GETPOS to WM_USER; windows-rs omits this alias.
@@ -101,27 +100,6 @@ const TBM_GETPOS: u32 = WM_USER;
 const STYLE: WINDOW_STYLE =
     WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0);
 const EX_STYLE: WINDOW_EX_STYLE = WINDOW_EX_STYLE(WS_EX_APPWINDOW.0 | WS_EX_CONTROLPARENT.0);
-const PANELS: [RECT; 3] = [
-    RECT {
-        left: 24,
-        top: 88,
-        right: 456,
-        bottom: 220,
-    },
-    RECT {
-        left: 24,
-        top: 232,
-        right: 456,
-        bottom: 368,
-    },
-    RECT {
-        left: 24,
-        top: 380,
-        right: 456,
-        bottom: 628,
-    },
-];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsAction {
     Apply(Config),
@@ -169,6 +147,8 @@ struct CallbackState {
     viewport: Cell<HWND>,
     scroll_offset: Cell<i32>,
     viewport_height: Cell<i32>,
+    content_height: Cell<i32>,
+    content_width_dip: Cell<i32>,
     wheel_remainder: Cell<i32>,
     preview: RefCell<Option<AppearancePreview>>,
 }
@@ -372,6 +352,8 @@ impl SettingsWindow {
             viewport: Cell::new(HWND::default()),
             scroll_offset: Cell::new(0),
             viewport_height: Cell::new(0),
+            content_height: Cell::new(0),
+            content_width_dip: Cell::new(480),
             wheel_remainder: Cell::new(0),
             preview: RefCell::new(None),
         });
@@ -619,7 +601,7 @@ impl SettingsWindow {
             return Ok(Some(SettingsAction::Close));
         }
         if let Some(rect) = pending.dpi_rect {
-            let rect = fit_to_work_area(rect)?;
+            let rect = fit_to_work_area(rect, self.minimum_size()?)?;
             unsafe {
                 SetWindowPos(
                     self.hwnd,
@@ -635,7 +617,7 @@ impl SettingsWindow {
         if pending.fit_work_area {
             let mut rect = RECT::default();
             unsafe { GetWindowRect(self.hwnd, &mut rect)? };
-            let rect = fit_to_work_area(rect)?;
+            let rect = fit_to_work_area(rect, self.minimum_size()?)?;
             unsafe {
                 SetWindowPos(
                     self.hwnd,
@@ -653,6 +635,9 @@ impl SettingsWindow {
         }
         if pending.layout || pending.scroll.is_some() || pending.fit_work_area {
             self.layout()?;
+            if pending.scroll.is_none() {
+                self.reveal_control(unsafe { GetFocus() })?;
+            }
         }
         if let Some(hwnd) = pending.reveal {
             self.reveal_control(hwnd)?;
@@ -702,7 +687,7 @@ impl SettingsWindow {
             ));
         }
         let label = WINDOW_STYLE(SS_NOPREFIX.0);
-        let check = WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32);
+        let check = WS_TABSTOP | WINDOW_STYLE((BS_AUTOCHECKBOX | BS_MULTILINE) as u32);
         let combo = WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32);
         let button = WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32);
         let slider = WS_TABSTOP | WINDOW_STYLE(TBS_NOTICKS);
@@ -1046,10 +1031,29 @@ impl SettingsWindow {
         unsafe {
             AdjustWindowRectExForDpi(&mut outer, STYLE, false, EX_STYLE, dpi)?;
         }
-        let width = (outer.right - outer.left).min(work.right - work.left);
-        let height = (outer.bottom - outer.top).min(work.bottom - work.top);
-        let x = (i64::from(center_x) - i64::from(width) / 2).max(i64::from(work.left)) as i32;
-        let y = (i64::from(center_y) - i64::from(height) / 2).max(i64::from(work.top)) as i32;
+        let width = outer.right - outer.left;
+        let height = outer.bottom - outer.top;
+        let x = (i64::from(center_x) - i64::from(width) / 2) as i32;
+        let y = (i64::from(center_y) - i64::from(height) / 2) as i32;
+        // Keep the monitor used to choose DPI even when the preferred rectangle
+        // extends farther into a neighbouring display than this work area.
+        let rect = layout::fit_rect(
+            RECT {
+                left: x,
+                top: y,
+                right: x + width,
+                bottom: y + height,
+            },
+            work,
+            self.minimum_size()?,
+        )
+        .ok_or_else(layout::unavailable)?;
+        let (x, y, width, height) = (
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        );
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -1065,6 +1069,17 @@ impl SettingsWindow {
         pending.dpi_rect = None;
         self.callback.pending.set(pending);
         Ok(())
+    }
+
+    fn minimum_size(&self) -> Result<(i32, i32)> {
+        let dpi = self.dpi()?;
+        let mut outer = RECT {
+            right: dip(280, dpi),
+            bottom: dip(180, dpi),
+            ..Default::default()
+        };
+        unsafe { AdjustWindowRectExForDpi(&mut outer, STYLE, false, EX_STYLE, dpi)? };
+        Ok((outer.right - outer.left, outer.bottom - outer.top))
     }
 
     fn layout(&self) -> Result<()> {
@@ -1137,11 +1152,24 @@ impl SettingsWindow {
         }
         let mut client = RECT::default();
         unsafe { GetClientRect(self.hwnd, &mut client)? };
-        let viewport_height = (client.bottom - dip(FOOTER_HEIGHT, dpi)).max(1);
+        let narrow = client.right < dip(480, dpi);
+        let panes = SheetLayout::new(
+            client.right,
+            client.bottom,
+            0,
+            dip(if narrow { 100 } else { 64 }, dpi),
+            dip(80, dpi),
+        )?;
+        let viewport_height = panes.viewport.bottom;
         let viewport = self.callback.viewport.get();
         unsafe { MoveWindow(viewport, 0, 0, client.right, viewport_height, true)? };
         self.callback.viewport_height.set(viewport_height);
-        let content_height = dip(CONTENT_HEIGHT, dpi);
+        // Keep a stable scrollbar gutter while measuring responsive content.
+        let content_width = ((i64::from(client.right) * 96) / i64::from(dpi)) as i32 - 20;
+        self.callback.content_width_dip.set(content_width);
+        let geometry = settings_content_layout(content_width);
+        let content_height = dip(geometry.height, dpi);
+        self.callback.content_height.set(content_height);
         let offset = self
             .callback
             .scroll_offset
@@ -1160,69 +1188,49 @@ impl SettingsWindow {
         unsafe {
             SetScrollInfo(viewport, SB_VERT, &scroll, true);
         }
-        let place = |hwnd, x, y, width, height| unsafe {
-            MoveWindow(
-                hwnd,
-                dip(x, dpi),
-                dip(y, dpi) - offset,
-                dip(width, dpi),
-                dip(height, dpi),
-                true,
-            )
-        };
-        place(self.controls.title, 24, 22, 220, 30)?;
-        place(self.controls.language_label, 252, 29, 72, 24)?;
-        place(self.controls.language, 326, 22, 130, 160)?;
-        place(self.controls.subtitle, 24, 58, 432, 20)?;
-        place(self.controls.hotkey_label, 40, 100, 396, 24)?;
-        place(self.controls.ctrl, 40, 128, 88, 26)?;
-        place(self.controls.alt, 140, 128, 88, 26)?;
-        place(self.controls.shift, 240, 128, 100, 26)?;
-        place(self.controls.key_label, 40, 171, 48, 24)?;
-        place(self.controls.key, 88, 164, 132, 36)?;
-        place(self.controls.hint, 228, 164, 212, 40)?;
-        place(self.controls.copy_heading, 40, 244, 396, 24)?;
-        place(self.controls.format_label, 40, 279, 108, 24)?;
-        place(self.controls.format, 156, 272, 180, 160)?;
-        place(self.controls.quick_pick, 40, 304, 396, 26)?;
-        place(self.controls.auto_copy, 40, 334, 396, 26)?;
-        place(self.controls.appearance_heading, 40, 392, 396, 24)?;
-        place(self.controls.border_label, 40, 427, 112, 24)?;
-        place(self.controls.border_width, 156, 420, 220, 30)?;
-        place(self.controls.border_value, 388, 427, 56, 24)?;
-        place(self.controls.transparency_label, 40, 463, 112, 24)?;
-        place(self.controls.background_transparency, 156, 456, 220, 30)?;
-        place(self.controls.transparency_value, 388, 463, 56, 24)?;
-        place(self.controls.preview_heading, 40, 494, 396, 20)?;
-        place(
-            self.controls.preview,
-            40,
-            518,
-            settings_preview::WIDTH,
-            settings_preview::HEIGHT,
-        )?;
-        place(self.controls.preview_hint, 40, 594, 396, 20)?;
-        place(self.controls.usage_heading, 24, 640, 64, 20)?;
-        place(self.controls.usage_hint, 96, 640, 360, 40)?;
-        let footer_top = viewport_height + dip(8, dpi);
+        for (id, rect) in geometry.controls {
+            let control = unsafe { GetDlgItem(Some(viewport), id as i32)? };
+            // COMBOBOX uses the requested height for its opened dropdown.
+            let height = if matches!(id, LANGUAGE | FORMAT) {
+                160
+            } else {
+                rect.bottom - rect.top
+            };
+            unsafe {
+                MoveWindow(
+                    control,
+                    dip(rect.left, dpi),
+                    dip(rect.top, dpi) - offset,
+                    dip(rect.right - rect.left, dpi),
+                    dip(height, dpi),
+                    true,
+                )?;
+            }
+        }
+        let footer_top = panes.actions.top + dip(8, dpi);
         let button_width = dip(92, dpi);
         let gap = dip(12, dpi);
-        let margin = dip(24, dpi);
-        let apply_x = (client.right - margin - button_width).max(0);
-        let close_x = (apply_x - gap - button_width).max(0);
+        let margin = dip(16, dpi);
+        let apply_x = client.right - margin - button_width;
+        let close_x = apply_x - gap - button_width;
+        let button_y = footer_top + if narrow { dip(44, dpi) } else { 0 };
         unsafe {
             MoveWindow(
                 self.controls.status,
                 margin,
                 footer_top,
-                (close_x - gap - margin).max(1),
+                if narrow {
+                    client.right - 2 * margin
+                } else {
+                    close_x - gap - margin
+                },
                 dip(40, dpi),
                 true,
             )?;
             MoveWindow(
                 self.controls.close,
                 close_x,
-                footer_top,
+                button_y,
                 button_width,
                 dip(36, dpi),
                 true,
@@ -1230,7 +1238,7 @@ impl SettingsWindow {
             MoveWindow(
                 self.controls.apply,
                 apply_x,
-                footer_top,
+                button_y,
                 button_width,
                 dip(36, dpi),
                 true,
@@ -1272,21 +1280,15 @@ impl SettingsWindow {
                 return Err(Error::from_thread());
             }
         }
-        let padding = dip(8, self.dpi()?);
-        let top = rect.top - origin.y;
-        let bottom = rect.bottom - origin.y;
-        let height = self.callback.viewport_height.get();
-        let delta = if top < padding {
-            top - padding
-        } else if bottom > height - padding {
-            bottom - height + padding
-        } else {
-            0
-        };
-        if delta != 0 {
-            self.callback
-                .scroll_offset
-                .set(self.callback.scroll_offset.get().saturating_add(delta));
+        let offset = reveal_offset(
+            self.callback.scroll_offset.get(),
+            rect.top - origin.y,
+            rect.bottom - origin.y,
+            self.callback.viewport_height.get(),
+            self.callback.content_height.get(),
+            dip(8, self.dpi()?),
+        );
+        if self.callback.scroll_offset.replace(offset) != offset {
             self.layout()?;
         }
         Ok(())
@@ -1347,29 +1349,117 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
-fn fit_to_work_area(rect: RECT) -> Result<RECT> {
-    let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST) };
-    let mut info = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        return Err(Error::from_thread());
-    }
-    let work = info.rcWork;
-    let width = (rect.right - rect.left).min(work.right - work.left).max(1);
-    let height = (rect.bottom - rect.top).min(work.bottom - work.top).max(1);
-    let left = rect.left.clamp(work.left, work.right - width);
-    let top = rect.top.clamp(work.top, work.bottom - height);
-    Ok(RECT {
-        left,
-        top,
-        right: left + width,
-        bottom: top + height,
-    })
+struct SettingsContentLayout {
+    controls: Vec<(usize, RECT)>,
+    panels: [RECT; 3],
+    height: i32,
 }
 
-fn paint_content(hwnd: HWND, offset: i32) -> LRESULT {
+fn settings_content_layout(width: i32) -> SettingsContentLayout {
+    let rect = |x, y, w, h| RECT {
+        left: x,
+        top: y,
+        right: x + w,
+        bottom: y + h,
+    };
+    if width >= 460 {
+        let rows = [
+            (TITLE, 24, 22, 220, 30),
+            (LANGUAGE_LABEL, 252, 29, 72, 24),
+            (LANGUAGE, 326, 22, 130, 28),
+            (SUBTITLE, 24, 58, 432, 20),
+            (10, 40, 100, 396, 24),
+            (CTRL, 40, 128, 88, 26),
+            (ALT, 140, 128, 88, 26),
+            (SHIFT, 240, 128, 100, 26),
+            (11, 40, 171, 48, 24),
+            (KEY, 88, 164, 132, 36),
+            (12, 228, 164, 212, 40),
+            (COPY_HEADING, 40, 244, 396, 24),
+            (13, 40, 279, 108, 24),
+            (FORMAT, 156, 272, 180, 28),
+            (QUICK_PICK, 40, 304, 396, 26),
+            (AUTO_COPY, 40, 334, 396, 26),
+            (APPEARANCE_HEADING, 40, 392, 396, 24),
+            (BORDER_LABEL, 40, 427, 112, 24),
+            (BORDER_WIDTH, 156, 420, 220, 30),
+            (BORDER_VALUE, 388, 427, 56, 24),
+            (TRANSPARENCY_LABEL, 40, 463, 112, 24),
+            (BACKGROUND_TRANSPARENCY, 156, 456, 220, 30),
+            (TRANSPARENCY_VALUE, 388, 463, 56, 24),
+            (PREVIEW_HEADING, 40, 494, 396, 20),
+            (
+                APPEARANCE_PREVIEW,
+                40,
+                518,
+                settings_preview::WIDTH,
+                settings_preview::HEIGHT,
+            ),
+            (PREVIEW_HINT, 40, 594, 396, 20),
+            (USAGE_HEADING, 24, 640, 64, 20),
+            (USAGE_HINT, 96, 640, 360, 40),
+        ];
+        SettingsContentLayout {
+            controls: rows
+                .into_iter()
+                .map(|(id, x, y, w, h)| (id, rect(x, y, w, h)))
+                .collect(),
+            panels: [
+                rect(24, 88, 432, 132),
+                rect(24, 232, 432, 136),
+                rect(24, 380, 432, 248),
+            ],
+            height: 686,
+        }
+    } else {
+        let inner = width - 56;
+        let full = width - 32;
+        let rows = [
+            (TITLE, 16, 22, full, 30),
+            (SUBTITLE, 16, 58, full, 40),
+            (LANGUAGE_LABEL, 16, 104, full, 24),
+            (LANGUAGE, 16, 132, 180.min(full), 28),
+            (10, 28, 188, inner, 24),
+            (CTRL, 28, 220, 76, 26),
+            (ALT, 112, 220, 72, 26),
+            (SHIFT, 28, 252, 100, 26),
+            (11, 28, 288, inner, 24),
+            (KEY, 28, 316, 132, 36),
+            (12, 28, 360, inner, 64),
+            (COPY_HEADING, 28, 460, inner, 24),
+            (13, 28, 492, inner, 24),
+            (FORMAT, 28, 524, 180.min(inner), 28),
+            (QUICK_PICK, 28, 560, inner, 52),
+            (AUTO_COPY, 28, 620, inner, 52),
+            (APPEARANCE_HEADING, 28, 708, inner, 24),
+            (BORDER_LABEL, 28, 740, inner - 68, 24),
+            (BORDER_VALUE, width - 84, 740, 56, 24),
+            (BORDER_WIDTH, 28, 772, inner, 30),
+            (TRANSPARENCY_LABEL, 28, 812, inner - 68, 24),
+            (TRANSPARENCY_VALUE, width - 84, 812, 56, 24),
+            (BACKGROUND_TRANSPARENCY, 28, 844, inner, 30),
+            (PREVIEW_HEADING, 28, 884, inner, 40),
+            (APPEARANCE_PREVIEW, 28, 930, inner, 72),
+            (PREVIEW_HINT, 28, 1010, inner, 40),
+            (USAGE_HEADING, 16, 1076, full, 24),
+            (USAGE_HINT, 16, 1108, full, 88),
+        ];
+        SettingsContentLayout {
+            controls: rows
+                .into_iter()
+                .map(|(id, x, y, w, h)| (id, rect(x, y, w, h)))
+                .collect(),
+            panels: [
+                rect(16, 176, full, 260),
+                rect(16, 448, full, 236),
+                rect(16, 696, full, 366),
+            ],
+            height: 1212,
+        }
+    }
+}
+
+fn paint_content(hwnd: HWND, offset: i32, width: i32) -> LRESULT {
     let mut paint = PAINTSTRUCT::default();
     let dc = unsafe { BeginPaint(hwnd, &mut paint) };
     if !dc.is_invalid() {
@@ -1385,7 +1475,7 @@ fn paint_content(hwnd: HWND, offset: i32) -> LRESULT {
                 FillRect(dc, &client, HBRUSH(GetStockObject(DC_BRUSH).0));
                 SetDCBrushColor(dc, COLORREF(0xffffff));
                 SetDCPenColor(dc, COLORREF(0xf0e8e2));
-                for panel in PANELS {
+                for panel in settings_content_layout(width).panels {
                     let _ = RoundRect(
                         dc,
                         dip(panel.left, dpi),
@@ -1650,7 +1740,11 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     };
     match message {
-        WM_PAINT if hwnd == state.viewport.get() => paint_content(hwnd, state.scroll_offset.get()),
+        WM_PAINT if hwnd == state.viewport.get() => paint_content(
+            hwnd,
+            state.scroll_offset.get(),
+            state.content_width_dip.get(),
+        ),
         WM_PAINT => state.theme.paint(hwnd, &[]),
         WM_ERASEBKGND => LRESULT(1),
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
@@ -1770,7 +1864,7 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             }
             LRESULT(0)
         }
-        WM_SIZE if hwnd != state.viewport.get() => {
+        WM_SIZE if hwnd != state.viewport.get() && wparam.0 != SIZE_MINIMIZED as usize => {
             state.queue(|pending| pending.layout = true);
             LRESULT(0)
         }
@@ -1789,5 +1883,46 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             DefWindowProcW(hwnd, message, wparam, lparam)
         },
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod responsive_layout_tests {
+    use super::*;
+
+    #[test]
+    fn settings_content_reflows_without_horizontal_clipping_or_hidden_focus() {
+        for width in [260, 300, 364, 430, 459, 460, 480] {
+            let geometry = settings_content_layout(width);
+            assert_eq!(geometry.controls.len(), 28);
+            for (id, r) in geometry.controls {
+                assert!(
+                    r.left >= 0 && r.right <= width && r.right > r.left,
+                    "{id} at {width}: {r:?}"
+                );
+                assert!(r.top >= 0 && r.bottom <= geometry.height);
+                if matches!(
+                    id,
+                    CTRL | ALT
+                        | SHIFT
+                        | KEY
+                        | FORMAT
+                        | LANGUAGE
+                        | QUICK_PICK
+                        | AUTO_COPY
+                        | BORDER_WIDTH
+                        | BACKGROUND_TRANSPARENCY
+                ) {
+                    let offset = reveal_offset(0, r.top, r.bottom, 80, geometry.height, 8);
+                    assert!(
+                        r.top - offset >= 0 && r.bottom - offset <= 80,
+                        "{id} at {width}"
+                    );
+                }
+            }
+            for r in geometry.panels {
+                assert!(r.left >= 0 && r.right <= width && r.bottom <= geometry.height);
+            }
+        }
     }
 }

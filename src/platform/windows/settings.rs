@@ -7,7 +7,7 @@ use super::{
     hotkey::{DEFAULT_HOTKEY_ID, HotkeyGuard},
 };
 use crate::app::{
-    config::{Config, ConfigStore},
+    config::{Config, ConfigRevision, ConfigStore},
     diagnostics,
     i18n::{set_language, tr},
 };
@@ -17,13 +17,15 @@ pub struct SettingsRuntime {
     pub notice: Option<String>,
     pub save_allowed: bool,
     store: Option<ConfigStore>,
+    revision: Option<ConfigRevision>,
     hotkey: Option<HotkeyGuard>,
     next_id: i32,
 }
 
 impl SettingsRuntime {
     pub fn load(hwnd: HWND) -> Self {
-        let (store, config, notice, save_allowed) = match config_path::default_config_path() {
+        let config_path = config_path::default_config_path();
+        let (store, config, notice, save_allowed, revision) = match config_path {
             Ok(path) => {
                 diagnostics::event(format_args!("config.path path={}", path.display()));
                 let store = ConfigStore::new(path);
@@ -33,6 +35,7 @@ impl SettingsRuntime {
                     loaded.config,
                     loaded.warning,
                     loaded.save_allowed,
+                    loaded.revision,
                 )
             }
             Err(error) => (
@@ -43,6 +46,7 @@ impl SettingsRuntime {
                     "The settings folder could not be found. Defaults are in use and saving is disabled. Restart to retry: {error}"
                 )),
                 false,
+                None,
             ),
         };
         set_language(config.language);
@@ -51,6 +55,7 @@ impl SettingsRuntime {
             notice,
             save_allowed,
             store,
+            revision,
             hotkey: None,
             next_id: DEFAULT_HOTKEY_ID + 1,
         };
@@ -98,6 +103,10 @@ impl SettingsRuntime {
             "配置目录不可用。",
             "The settings folder is unavailable.",
         ))?;
+        let expected = self.revision.as_ref().ok_or(tr(
+            "配置版本不可用，请重新启动程序后重试。",
+            "The loaded settings revision is unavailable. Restart the app and try again.",
+        ))?;
         // The old key stays registered on both registration and save failures.
         // Each attempted ID is fresh; delayed WM_HOTKEY for a retired ID is ignored.
         let replacement = if config.hotkey != self.config.hotkey || self.hotkey.is_none() {
@@ -119,12 +128,15 @@ impl SettingsRuntime {
             None
         };
         // On failure replacement drops here, unregistering only the temporary key.
-        store.save(&config).map_err(|error| {
-            crate::tr_format!(
-                "保存失败，原设置未更改：{error}",
-                "Could not save. Your previous settings are unchanged: {error}"
-            )
-        })?;
+        let revision = store
+            .save_if_unchanged(&config, expected)
+            .map_err(|error| {
+                crate::tr_format!(
+                    "保存失败，原设置未更改：{error}",
+                    "Could not save. Your previous settings are unchanged: {error}"
+                )
+            })?;
+        self.revision = Some(revision);
         self.config = config;
         set_language(self.config.language);
         let old_hotkey = replacement.and_then(|guard| self.hotkey.replace(guard));
@@ -248,6 +260,7 @@ mod tests {
             config: original.clone(),
             notice: None,
             save_allowed: true,
+            revision: store.load().revision,
             store: Some(store),
             hotkey: Some(old),
             next_id: 1000,
@@ -288,6 +301,35 @@ mod tests {
         drop(released_temporary);
         drop(lock);
 
+        // An external valid edit after load must roll back a newly registered
+        // shortcut just like an I/O failure, retaining the accepted revision.
+        let external = Config {
+            default_format: ColorFormat::CssRgb,
+            ..original.clone()
+        };
+        runtime.store.as_ref().unwrap().save(&external).unwrap();
+        let accepted_revision = runtime.revision.clone();
+        let error = runtime
+            .apply(
+                owner.0,
+                Config {
+                    hotkey: chord("F10"),
+                    ..original.clone()
+                },
+            )
+            .unwrap_err();
+        assert!(error.contains("外部修改"), "{error}");
+        assert_eq!(runtime.config, original);
+        assert_eq!(runtime.revision, accepted_revision);
+        assert_eq!(runtime.hotkey_id(), Some(101));
+        assert_eq!(runtime.store.as_ref().unwrap().load().config, external);
+        drop(
+            HotkeyGuard::register_config(probe.0, 210, &chord("F10"))
+                .expect("conflicting revision must release its temporary hotkey"),
+        );
+        // Restore the exact accepted bytes to continue the successful-save test.
+        std::fs::write(&path, &original_bytes).unwrap();
+
         let updated = Config {
             language: Language::English,
             hotkey: chord("F11"),
@@ -303,6 +345,10 @@ mod tests {
         assert_eq!(language(), Language::English);
         assert_ne!(runtime.hotkey_id(), Some(101));
         assert_eq!(runtime.store.as_ref().unwrap().load().config, updated);
+        assert_eq!(
+            runtime.store.as_ref().unwrap().load().revision,
+            runtime.revision
+        );
         // The host can publish hotkey_id() before dropping this retired guard.
         assert!(HotkeyGuard::register_config(probe.0, 206, &original.hotkey).is_err());
         drop(retired);

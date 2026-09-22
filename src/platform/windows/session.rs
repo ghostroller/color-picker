@@ -1,10 +1,14 @@
 //! Main-thread session timer and desktop helpers. No timer callbacks or workers.
 
 use crate::core::geometry::ScreenPointPx;
-use std::{marker::PhantomData, rc::Rc};
+use std::{
+    marker::PhantomData,
+    rc::Rc,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use windows::{
     Win32::{
-        Foundation::{E_INVALIDARG, HWND, POINT},
+        Foundation::{E_FAIL, E_INVALIDARG, HWND, POINT},
         Graphics::Dwm::DwmFlush,
         UI::WindowsAndMessaging::{GetCursorPos, KillTimer, SetTimer},
     },
@@ -12,6 +16,15 @@ use windows::{
 };
 
 pub const SAMPLE_INTERVAL_MS: u32 = 17;
+static NEXT_TIMER_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// Host sampling and clipboard retries share a window, so their timer IDs must
+/// come from one non-reusing namespace. Killed timers can still be queued.
+pub(crate) fn next_timer_id() -> Result<usize> {
+    NEXT_TIMER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| Error::new(E_FAIL, "Host timer IDs exhausted. Restart the app."))
+}
 
 pub struct SessionTimer {
     hwnd: HWND,

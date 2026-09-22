@@ -203,8 +203,9 @@ fn cached_selection_and_native_result_controls_smoke() {
     };
     assert!(unsafe { ClientToScreen(result_hwnd, &mut caption_point) }.as_bool());
     assert_eq!(hit_test(caption_point), HTCAPTION as isize);
+    let result_content = unsafe { GetDlgItem(Some(result_hwnd), 300) }.unwrap();
     for (index, format) in ColorFormat::ALL.into_iter().enumerate() {
-        let edit = unsafe { GetDlgItem(Some(result_hwnd), 30 + index as i32) }.unwrap();
+        let edit = unsafe { GetDlgItem(Some(result_content), 30 + index as i32) }.unwrap();
         let mut text = [0_u16; 128];
         let length = unsafe { GetWindowTextW(edit, &mut text) };
         assert!(length > 0);
@@ -322,8 +323,8 @@ fn cached_selection_and_native_result_controls_smoke() {
     let mut original = RECT::default();
     unsafe { GetWindowRect(settings_hwnd, &mut original) }.unwrap();
     assert!(original.top >= work.top && original.bottom <= work.bottom);
-    // A short work area is simulated by resizing only this fixture. The footer
-    // stays fixed while native controls scroll, and keyboard focus reveals them.
+    // A narrow, short work area is simulated by resizing only this fixture.
+    // Content reflows, the footer stays fixed, and focus reveals scrolled rows.
     let settings_dpi = unsafe { GetDpiForWindow(settings_hwnd) };
     unsafe {
         SetWindowPos(
@@ -331,7 +332,7 @@ fn cached_selection_and_native_result_controls_smoke() {
             None,
             original.left,
             original.top,
-            original.right - original.left,
+            (380 * settings_dpi / 96) as i32,
             (360 * settings_dpi / 96) as i32,
             SWP_NOACTIVATE | SWP_NOZORDER,
         )
@@ -343,6 +344,17 @@ fn cached_selection_and_native_result_controls_smoke() {
     unsafe {
         GetWindowRect(settings_content, &mut viewport_bounds).unwrap();
         GetWindowRect(apply, &mut footer_before).unwrap();
+    }
+    for id in [110, 101, 102, 103, 104, 105, 106, 107, 108, 109] {
+        let control = unsafe { GetDlgItem(Some(settings_content), id) }.unwrap();
+        let mut bounds = RECT::default();
+        unsafe {
+            GetWindowRect(control, &mut bounds).unwrap();
+        }
+        assert!(
+            bounds.left >= viewport_bounds.left && bounds.right <= viewport_bounds.right,
+            "control {id} must reflow inside the narrow viewport"
+        );
     }
     for button in [apply, close] {
         let mut bounds = RECT::default();

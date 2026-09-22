@@ -169,8 +169,10 @@ impl InputSession {
             finish: AtomicBool::new(false),
             reject: AtomicBool::new(false),
             failure: AtomicU64::new(0),
-            movement: AtomicU64::new(0),
-            movement_pending: AtomicBool::new(false),
+            movement: MovementMailbox::default(),
+            record_movement: crate::app::diagnostics::enabled(),
+            movement_events: AtomicU64::new(0),
+            movement_wakes: AtomicU64::new(0),
         });
         let (sender, receiver) = sync_channel(64);
         let thread_shared = shared.clone();
@@ -211,21 +213,23 @@ impl InputSession {
         self.receiver.try_iter().take(64).collect()
     }
     pub fn take_movement(&self) -> Option<ScreenPointPx> {
-        // Clear before reading so a racing producer always retains a wakeup.
-        if !self.shared.movement_pending.swap(false, Ordering::AcqRel) {
-            return None;
-        }
-        let packed = self.shared.movement.load(Ordering::Acquire);
-        Some(ScreenPointPx {
-            x: packed as u32 as i32,
-            y: (packed >> 32) as u32 as i32,
-        })
+        self.shared.movement.take()
+    }
+    pub fn set_movement_notifications(&self, enabled: bool) {
+        self.shared.movement.set_enabled(enabled);
+    }
+    pub fn movement_counts(&self) -> (u64, u64) {
+        (
+            self.shared.movement_events.load(Ordering::Relaxed),
+            self.shared.movement_wakes.load(Ordering::Relaxed),
+        )
     }
     pub fn reject_candidate(&self) -> Result<()> {
         self.shared.reject.store(true, Ordering::Release);
         self.shared.signal_control()
     }
     pub fn request_finish(&self) -> Result<()> {
+        self.set_movement_notifications(false);
         self.shared.finish.store(true, Ordering::Release);
         self.shared.signal_control()
     }
@@ -296,8 +300,10 @@ struct Shared {
     finish: AtomicBool,
     reject: AtomicBool,
     failure: AtomicU64,
-    movement: AtomicU64,
-    movement_pending: AtomicBool,
+    movement: MovementMailbox,
+    record_movement: bool,
+    movement_events: AtomicU64,
+    movement_wakes: AtomicU64,
 }
 
 impl Shared {
@@ -359,11 +365,154 @@ impl Shared {
         }
     }
     fn moved(&self, point: ScreenPointPx) {
-        let packed = u64::from(point.x as u32) | (u64::from(point.y as u32) << 32);
-        self.movement.store(packed, Ordering::Release);
-        if !self.movement_pending.swap(true, Ordering::AcqRel) {
+        if self.record_movement {
+            self.movement_events.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.movement.publish(point) {
+            if self.record_movement {
+                self.movement_wakes.fetch_add(1, Ordering::Relaxed);
+            }
             self.notify();
         }
+    }
+}
+
+// One hook-thread producer and one UI-thread consumer. The UI alone changes
+// enabled state. Combining enabled/pending with an epoch prevents a producer
+// paused during a mode switch from setting pending in the next Frozen period.
+#[derive(Default)]
+struct MovementMailbox {
+    state: AtomicU64,
+    point: AtomicU64,
+}
+
+impl MovementMailbox {
+    const ENABLED: u64 = 1;
+    const PENDING: u64 = 2;
+    const FLAGS: u64 = Self::ENABLED | Self::PENDING;
+
+    fn set_enabled(&self, enabled: bool) {
+        let epoch = (self.state.load(Ordering::Acquire) & !Self::FLAGS).wrapping_add(4);
+        self.state
+            .store(epoch | u64::from(enabled), Ordering::Release);
+    }
+
+    fn publish(&self, point: ScreenPointPx) -> bool {
+        let state = self.state.load(Ordering::Acquire);
+        if state & Self::ENABLED == 0 {
+            return false;
+        }
+        self.publish_in_epoch(point, state)
+    }
+
+    fn publish_in_epoch(&self, point: ScreenPointPx, mut state: u64) -> bool {
+        let packed = u64::from(point.x as u32) | (u64::from(point.y as u32) << 32);
+        self.point.store(packed, Ordering::Release);
+        let epoch = state & !Self::FLAGS;
+        loop {
+            match self.state.compare_exchange_weak(
+                state,
+                state | Self::PENDING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return state & Self::PENDING == 0,
+                Err(current) if current & Self::ENABLED != 0 && current & !Self::FLAGS == epoch => {
+                    // A consumer may have cleared pending after our point was
+                    // stored. Retry in the same epoch to retain its next wake.
+                    state = current;
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
+    fn take(&self) -> Option<ScreenPointPx> {
+        // Clear before reading so a racing producer always retains a wakeup.
+        let state = self.state.fetch_and(!Self::PENDING, Ordering::AcqRel);
+        if state & Self::FLAGS != Self::FLAGS {
+            return None;
+        }
+        let packed = self.point.load(Ordering::Acquire);
+        Some(ScreenPointPx {
+            x: packed as u32 as i32,
+            y: (packed >> 32) as u32 as i32,
+        })
+    }
+}
+
+#[cfg(test)]
+mod movement_tests {
+    use super::*;
+
+    #[test]
+    fn live_movement_never_wakes_and_frozen_coalesces_the_latest_point() {
+        let mailbox = MovementMailbox::default();
+        for x in 0..10_000 {
+            assert!(!mailbox.publish(ScreenPointPx { x, y: -500 }));
+        }
+        assert_eq!(mailbox.take(), None);
+        mailbox.set_enabled(true);
+        assert!(mailbox.publish(ScreenPointPx { x: -1920, y: -1080 }));
+        assert!(!mailbox.publish(ScreenPointPx { x: -10, y: 500 }));
+        assert_eq!(mailbox.take(), Some(ScreenPointPx { x: -10, y: 500 }));
+        assert_eq!(mailbox.take(), None);
+        assert!(mailbox.publish(ScreenPointPx { x: 42, y: 63 }));
+    }
+
+    #[test]
+    fn a_mode_switch_discards_pending_and_rejects_an_inflight_old_epoch() {
+        let mailbox = MovementMailbox::default();
+        mailbox.set_enabled(true);
+        assert!(mailbox.publish(ScreenPointPx { x: 1, y: 1 }));
+        let old_state = mailbox.state.load(Ordering::Acquire);
+        mailbox.set_enabled(false);
+        assert_eq!(mailbox.take(), None);
+        assert!(!mailbox.publish(ScreenPointPx { x: 2, y: 2 }));
+        mailbox.set_enabled(true);
+        assert!(!mailbox.publish_in_epoch(ScreenPointPx { x: 3, y: 3 }, old_state));
+        assert_eq!(mailbox.take(), None);
+        assert!(mailbox.publish(ScreenPointPx { x: 4, y: 4 }));
+        assert_eq!(mailbox.take(), Some(ScreenPointPx { x: 4, y: 4 }));
+    }
+
+    #[test]
+    fn a_consumer_racing_a_coalesced_move_retains_a_new_wake() {
+        let mailbox = MovementMailbox::default();
+        mailbox.set_enabled(true);
+        let first = ScreenPointPx { x: 1, y: -1 };
+        let last = ScreenPointPx { x: 2, y: -2 };
+        assert!(mailbox.publish(first));
+        let producer_state = mailbox.state.load(Ordering::Acquire);
+        assert_eq!(mailbox.take(), Some(first));
+        // The producer started while pending was set, then the UI cleared it.
+        assert!(mailbox.publish_in_epoch(last, producer_state));
+        assert_eq!(mailbox.take(), Some(last));
+    }
+
+    #[test]
+    fn movement_during_repeated_mode_switches_does_not_suppress_the_next_move() {
+        let mailbox = Arc::new(MovementMailbox::default());
+        let producer_mailbox = mailbox.clone();
+        let producer = std::thread::spawn(move || {
+            for x in 0..10_000 {
+                producer_mailbox.publish(ScreenPointPx { x, y: -x });
+            }
+        });
+        for _ in 0..1_000 {
+            mailbox.set_enabled(true);
+            mailbox.take();
+            mailbox.set_enabled(false);
+            assert_eq!(mailbox.take(), None);
+        }
+        producer.join().unwrap();
+        mailbox.set_enabled(true);
+        let last = ScreenPointPx {
+            x: i32::MIN,
+            y: i32::MAX,
+        };
+        assert!(mailbox.publish(last));
+        assert_eq!(mailbox.take(), Some(last));
     }
 }
 

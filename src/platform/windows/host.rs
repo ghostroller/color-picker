@@ -38,7 +38,10 @@ use windows::{
 
 use crate::{
     app::{controller::PreviewController, diagnostics, i18n::tr},
-    core::format::{ColorFormat, format_color},
+    core::{
+        format::{ColorFormat, format_color},
+        state::PickedColor,
+    },
     ui::windows::{
         result::{ResultAction, ResultWindow, WM_RESULT_WAKE},
         settings::{SettingsAction, SettingsWindow, WM_SETTINGS_WAKE},
@@ -46,6 +49,7 @@ use crate::{
 };
 
 use super::{
+    copy_job::{CopyJob, CopyProgress, CopyTimer},
     input::WM_INPUT_WAKE,
     instance::{InstanceStatus, SingleInstance, instance_key},
     settings::SettingsRuntime,
@@ -80,6 +84,7 @@ const INPUT_WAKE: u32 = 16384;
 const RESULT_WAKE: u32 = 32768;
 const SETTINGS_WAKE: u32 = 65536;
 const ONBOARDING_REQUEST: u32 = 131072;
+const COPY_TICK: u32 = 262144;
 // shellapi.h defines this expression; windows 0.62.2 does not emit that macro.
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 
@@ -99,6 +104,8 @@ thread_local! {
     static PREVIEW_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static ACTIVE_TIMER: Cell<usize> = const { Cell::new(0) };
     static PENDING_TIMER: Cell<usize> = const { Cell::new(0) };
+    static ACTIVE_COPY_TIMER: Cell<Option<CopyTimer>> = const { Cell::new(None) };
+    static PENDING_COPY_TIMER: Cell<Option<CopyTimer>> = const { Cell::new(None) };
     static SAMPLE_ATTEMPTS: Cell<u64> = const { Cell::new(0) };
     static PREVIEW_SESSION: Cell<u64> = const { Cell::new(0) };
     static PICKER_STATE: Cell<isize> = const { Cell::new(0) };
@@ -224,6 +231,7 @@ fn message_loop(
     let mut controller = PreviewController::new(hwnd);
     controller.set_appearance(settings.config.appearance);
     let mut result_window: Option<ResultWindow> = None;
+    let mut copy_job = CopyJob::new(hwnd);
     let mut settings_window: Option<SettingsWindow> = None;
     let mut exiting = false;
     let mut deferred_menu = false;
@@ -240,6 +248,12 @@ fn message_loop(
         // Broadcasts/exit already received must invalidate a pending candidate
         // before worker completion can promote it to Result and auto-copy it.
         let cancellation = PENDING.get() & (EXIT | ENVIRONMENT_CHANGED | STOP_PREVIEW);
+        if cancellation != 0 || PENDING.get() & START_REQUEST != 0 {
+            let canceled = cancel_quick_copy(&mut copy_job);
+            if canceled && cancellation != 0 {
+                controller.close_result()?;
+            }
+        }
         if cancellation & EXIT != 0 {
             exiting = true;
             result_window.take();
@@ -263,36 +277,50 @@ fn message_loop(
             && !exiting
         {
             result_window.take();
-            match ResultWindow::new_with_behavior(
-                picked,
-                hwnd,
-                settings.config.default_format,
-                settings.config.auto_copy_on_pick,
-                settings.config.appearance,
-                settings.config.quick_pick,
-            ) {
-                Ok(window) => {
-                    result_window = Some(window);
-                    diagnostics::event(format_args!(
-                        "{} resources_released_before_copy=true",
-                        if settings.config.quick_pick {
-                            "result.quick_copy_started"
-                        } else {
-                            "result.shown"
-                        }
-                    ));
-                }
-                Err(error) => {
-                    controller.close_result()?;
-                    notify(
-                        tray,
-                        tr("结果窗口无法显示", "Could not show the picked color"),
-                        &crate::tr_format!(
-                            "已取色 {}。{error}",
-                            "Picked {}. {error}",
-                            format_color(picked.rgb, ColorFormat::Hex)
-                        ),
-                    );
+            cancel_quick_copy(&mut copy_job);
+            if settings.config.quick_pick {
+                // take_result only yields after the input thread has exited and
+                // capture resources have been released. The existing hidden
+                // host is a valid clipboard owner; successful copying needs no UI.
+                diagnostics::event(format_args!(
+                    "result.quick_copy_started resources_released_before_copy=true"
+                ));
+                let progress = copy_job.start(picked, settings.config.default_format);
+                ACTIVE_COPY_TIMER.set(copy_job.timer());
+                finish_quick_copy(
+                    progress,
+                    hwnd,
+                    tray,
+                    settings,
+                    &mut controller,
+                    &mut result_window,
+                )?;
+            } else {
+                match ResultWindow::new_with_appearance(
+                    picked,
+                    hwnd,
+                    settings.config.default_format,
+                    settings.config.auto_copy_on_pick,
+                    settings.config.appearance,
+                ) {
+                    Ok(window) => {
+                        result_window = Some(window);
+                        diagnostics::event(format_args!(
+                            "result.shown resources_released_before_copy=true"
+                        ));
+                    }
+                    Err(error) => {
+                        controller.close_result()?;
+                        notify(
+                            tray,
+                            tr("结果窗口无法显示", "Could not show the picked color"),
+                            &crate::tr_format!(
+                                "已取色 {}。{error}",
+                                "Picked {}. {error}",
+                                format_color(picked.rgb, ColorFormat::Hex)
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -302,7 +330,7 @@ fn message_loop(
                     result_window.take();
                     controller.close_result()?;
                     if action == ResultAction::PickAgain && !exiting && cancellation == 0 {
-                        activate(tray, &mut controller, &mut result_window);
+                        activate(tray, &mut controller, &mut result_window, &mut copy_job);
                     }
                 }
                 Ok(None) => {}
@@ -380,6 +408,7 @@ fn message_loop(
             if pending & EXIT != 0 {
                 diagnostics::event(format_args!("host.exit_requested"));
                 exiting = true;
+                cancel_quick_copy(&mut copy_job);
                 result_window.take();
                 settings_window.take();
                 controller.stop("host_exit");
@@ -410,11 +439,17 @@ fn message_loop(
             // A topology, desktop/session or power transition invalidates the
             // current DC and coordinates. Never automatically resume capture.
             if pending & ENVIRONMENT_CHANGED != 0 {
+                if cancel_quick_copy(&mut copy_job) {
+                    controller.close_result()?;
+                }
                 controller.stop("environment_changed");
                 publish_preview_status(&controller);
                 diagnostics::event(format_args!("environment.changed"));
             }
             if pending & STOP_PREVIEW != 0 {
+                if cancel_quick_copy(&mut copy_job) {
+                    controller.close_result()?;
+                }
                 controller.stop("diagnostic_request");
                 publish_preview_status(&controller);
             }
@@ -462,7 +497,7 @@ fn message_loop(
             }
             dispatch_activation_intent(
                 pending,
-                || activate(tray, &mut controller, &mut result_window),
+                || activate(tray, &mut controller, &mut result_window, &mut copy_job),
                 || {
                     diagnostics::event(format_args!(
                         "activation.ignored reason=picker_or_settings_active"
@@ -488,10 +523,13 @@ fn message_loop(
                     Some(TrayCommand::Start) => {
                         diagnostics::event(format_args!("tray.menu_selected command=start"));
                         if !explain_settings_block(settings_window.as_ref()) {
-                            activate(tray, &mut controller, &mut result_window);
+                            activate(tray, &mut controller, &mut result_window, &mut copy_job);
                         }
                     }
                     Some(TrayCommand::Stop) => {
+                        if cancel_quick_copy(&mut copy_job) {
+                            controller.close_result()?;
+                        }
                         controller.stop("tray_menu");
                         diagnostics::event(format_args!("tray.menu_selected command=stop"));
                     }
@@ -502,6 +540,7 @@ fn message_loop(
                                 let _ = SetForegroundWindow(window.hwnd());
                             }
                         } else {
+                            cancel_quick_copy(&mut copy_job);
                             result_window.take();
                             controller.close_result()?;
                             controller.open_settings()?;
@@ -527,11 +566,33 @@ fn message_loop(
                     Some(TrayCommand::Exit) => {
                         diagnostics::event(format_args!("tray.menu_selected command=exit"));
                         exiting = true;
+                        cancel_quick_copy(&mut copy_job);
                         controller.stop("host_exit");
                     }
                     None => {}
                 }
                 publish_preview_status(&controller);
+            }
+            if pending & COPY_TICK != 0
+                && let Some(timer) = PENDING_COPY_TIMER.take()
+            {
+                // A nested menu/guide may have received a newer activation or
+                // cancellation while the previous timer intention was draining.
+                if !exiting
+                    && PENDING.get() & (EXIT | ENVIRONMENT_CHANGED | STOP_PREVIEW | START_REQUEST)
+                        == 0
+                {
+                    let progress = copy_job.on_timer(timer);
+                    ACTIVE_COPY_TIMER.set(copy_job.timer());
+                    finish_quick_copy(
+                        progress,
+                        hwnd,
+                        tray,
+                        settings,
+                        &mut controller,
+                        &mut result_window,
+                    )?;
+                }
             }
             if pending & SAMPLE_TICK != 0 {
                 let timer = PENDING_TIMER.replace(0);
@@ -580,6 +641,7 @@ fn message_loop(
         }
         if status == 0 {
             exiting = true;
+            cancel_quick_copy(&mut copy_job);
             result_window.take();
             settings_window.take();
             controller.stop("quit_message");
@@ -631,6 +693,7 @@ fn activate(
     tray: &TrayIcon,
     controller: &mut PreviewController,
     result_window: &mut Option<ResultWindow>,
+    copy_job: &mut CopyJob,
 ) {
     if !controller.activation_allowed() {
         diagnostics::event(format_args!(
@@ -639,6 +702,7 @@ fn activate(
         return;
     }
     if !controller.active() {
+        cancel_quick_copy(copy_job);
         // Destroy the result and flush before sampling so it cannot become part
         // of the next pick, including a hotkey pressed over that same window.
         result_window.take();
@@ -673,6 +737,80 @@ fn activate(
         }
     }
     publish_preview_status(controller);
+}
+
+fn cancel_quick_copy(job: &mut CopyJob) -> bool {
+    let pending = job.is_pending();
+    ACTIVE_COPY_TIMER.set(None);
+    PENDING_COPY_TIMER.set(None);
+    job.cancel();
+    pending
+}
+
+fn finish_quick_copy(
+    progress: CopyProgress,
+    hwnd: HWND,
+    tray: &TrayIcon,
+    settings: &SettingsRuntime,
+    controller: &mut PreviewController,
+    result_window: &mut Option<ResultWindow>,
+) -> Result<()> {
+    complete_quick_copy(
+        progress,
+        || controller.close_result(),
+        result_window,
+        |picked, format, message| match ResultWindow::new_after_copy_failure(
+            picked,
+            hwnd,
+            format,
+            settings.config.appearance,
+            message,
+        ) {
+            Ok(window) => Some(window),
+            Err(error) => {
+                notify(
+                    tray,
+                    tr("结果窗口无法显示", "Could not show the picked color"),
+                    &crate::tr_format!(
+                        "已取色 {}。{message}。{error}",
+                        "Picked {}. {message}. {error}",
+                        format_color(picked.rgb, ColorFormat::Hex)
+                    ),
+                );
+                None
+            }
+        },
+    )
+}
+
+/// Keep the result-window factory behind the terminal failure branch so the
+/// same host dispatch can be tested without creating UI or using the clipboard.
+fn complete_quick_copy<W>(
+    progress: CopyProgress,
+    close_result: impl FnOnce() -> Result<()>,
+    result_window: &mut Option<W>,
+    show_failure: impl FnOnce(PickedColor, ColorFormat, &str) -> Option<W>,
+) -> Result<()> {
+    match progress {
+        CopyProgress::Pending => {}
+        CopyProgress::Copied => {
+            close_result()?;
+            diagnostics::event(format_args!(
+                "result.quick_copy_succeeded result_window_created=false"
+            ));
+        }
+        CopyProgress::Failed {
+            picked,
+            format,
+            message,
+        } => {
+            *result_window = show_failure(picked, format, &message);
+            if result_window.is_none() {
+                close_result()?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn publish_preview_status(controller: &PreviewController) {
@@ -963,6 +1101,14 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             PENDING_TIMER.set(wparam.0);
             enqueue(hwnd, SAMPLE_TICK);
         }
+        WM_TIMER
+            if ACTIVE_COPY_TIMER
+                .get()
+                .is_some_and(|timer| timer.id == wparam.0) =>
+        {
+            PENDING_COPY_TIMER.set(ACTIVE_COPY_TIMER.get());
+            enqueue(hwnd, COPY_TICK);
+        }
         WM_STOP_PREVIEW if DIAGNOSTICS.get() => enqueue(hwnd, STOP_PREVIEW),
         WM_ACTIVATE_PICKER => enqueue(
             hwnd,
@@ -1105,6 +1251,82 @@ impl Drop for SessionNotifications {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_host_quick_copy_never_calls_the_result_window_factory() {
+        use crate::{
+            core::{color::Rgb8, geometry::ScreenPointPx, state::SampleKind},
+            platform::windows::copy_job::CopyPlatform,
+        };
+
+        struct ClipboardSuccess;
+        impl CopyPlatform for ClipboardSuccess {
+            fn copy(
+                &mut self,
+                owner: HWND,
+                text: &str,
+            ) -> std::result::Result<(), super::super::clipboard::ClipboardError> {
+                assert_eq!(owner, HWND(456_usize as *mut _));
+                assert_eq!(text, "#123456");
+                Ok(())
+            }
+            fn arm(&mut self, _: HWND, _: usize, _: u32) -> Result<()> {
+                panic!("successful copy must not arm a timer");
+            }
+            fn disarm(&mut self, _: HWND, _: usize) {
+                panic!("no timer should exist");
+            }
+        }
+        let mut job = CopyJob::with_platform(HWND(456_usize as *mut _), ClipboardSuccess);
+        let progress = job.start(
+            PickedColor {
+                rgb: Rgb8 {
+                    r: 0x12,
+                    g: 0x34,
+                    b: 0x56,
+                },
+                source: ScreenPointPx { x: 10, y: 20 },
+                kind: SampleKind::Live,
+            },
+            ColorFormat::Hex,
+        );
+        let closed = Cell::new(false);
+        let mut result: Option<()> = None;
+        complete_quick_copy(
+            progress,
+            || {
+                closed.set(true);
+                Ok(())
+            },
+            &mut result,
+            |_, _, _| {
+                panic!("successful quick pick must not create ResultWindow or child controls");
+            },
+        )
+        .unwrap();
+        assert!(closed.get());
+        assert!(result.is_none());
+        assert!(!job.is_pending());
+        assert!(job.timer().is_none());
+    }
+
+    #[test]
+    fn stale_copy_timer_is_rejected_at_host_receipt_after_cancellation() {
+        let hwnd = HWND::default();
+        let timer = CopyTimer {
+            id: 9123,
+            request: 9122,
+        };
+        ACTIVE_COPY_TIMER.set(Some(timer));
+        let mut job = CopyJob::new(hwnd);
+        cancel_quick_copy(&mut job);
+        PENDING.set(0);
+        // DefWindowProc does not operate on any real window here. In particular,
+        // the old timer must not enqueue host work or create a retry request.
+        unsafe { window_proc_inner(hwnd, WM_TIMER, WPARAM(timer.id), LPARAM(0)) };
+        assert!(PENDING_COPY_TIMER.get().is_none());
+        assert_eq!(PENDING.get() & COPY_TICK, 0);
+    }
 
     #[test]
     fn cancellation_during_guide_preempts_the_older_launch_intention() {

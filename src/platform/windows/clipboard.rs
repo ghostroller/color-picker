@@ -47,7 +47,7 @@ impl From<Error> for ClipboardError {
 pub struct Clipboard;
 
 impl Clipboard {
-    /// No retries here: the result UI owns its bounded, cancelable retry timer.
+    /// Callers own their bounded, cancelable retry timers.
     pub fn copy_text(owner: HWND, text: &str) -> Result<(), ClipboardError> {
         if !unsafe { IsWindow(Some(owner)) }.as_bool() || text.contains('\0') {
             return Err(Error::new(E_INVALIDARG, "Clipboard owner or text is invalid").into());

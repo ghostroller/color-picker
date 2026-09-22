@@ -11,7 +11,7 @@ use crate::{
         capture::GdiSampler,
         input::{InputEvent, InputSession},
         monitors::Monitors,
-        session::{SessionTimer, cursor_position, flush_composition},
+        session::{SessionTimer, cursor_position, flush_composition, next_timer_id},
     },
     ui::windows::{magnifier::MagnifierWindow, preview::PreviewWindow},
 };
@@ -27,7 +27,6 @@ pub struct PreviewController {
     host: HWND,
     machine: StateMachine,
     timer: Option<SessionTimer>,
-    next_timer: usize,
     session: Option<SessionResources>,
     sample_attempts: u64,
     completed: Option<PickedColor>,
@@ -47,6 +46,7 @@ struct SessionResources {
     failures: u32,
     input_failure_reported: bool,
     last_sample: Option<PickedColor>,
+    sample_start: u64,
 }
 
 impl PreviewController {
@@ -55,7 +55,6 @@ impl PreviewController {
             host,
             machine: StateMachine::new(),
             timer: None,
-            next_timer: 0,
             session: None,
             sample_attempts: 0,
             completed: None,
@@ -100,6 +99,7 @@ impl PreviewController {
                 failures: 0,
                 input_failure_reported: false,
                 last_sample: None,
+                sample_start: self.sample_attempts,
             })
         })();
         match resources {
@@ -228,7 +228,6 @@ impl PreviewController {
             return Ok(());
         };
         let events = resources.input.drain_events();
-        let movement = resources.input.take_movement();
         let mut error = None;
         for event in events {
             if let Err(failure) = self.handle_input(event) {
@@ -236,6 +235,12 @@ impl PreviewController {
                 error.get_or_insert(failure);
             }
         }
+        // Mode switches clear the movement epoch. Read after control events so
+        // a pre-switch position cannot replace a newly initialized hover.
+        let movement = self
+            .session
+            .as_ref()
+            .and_then(|resources| resources.input.take_movement());
         if let Some(point) = movement
             && matches!(self.state(), AppState::Frozen { .. })
             && let Err(failure) = self.queue_frozen_hover(point)
@@ -300,6 +305,16 @@ impl PreviewController {
                 .machine
                 .session_id()
                 .expect("resources belong to an active session");
+            if let Some(resources) = self.session.as_ref() {
+                let (movement_events, movement_wakes) = resources.input.movement_counts();
+                diagnostics::event(format_args!(
+                    "session.counts session={} movement_events={} movement_wakes={} samples={}",
+                    session.0,
+                    movement_events,
+                    movement_wakes,
+                    self.sample_attempts.saturating_sub(resources.sample_start),
+                ));
+            }
             self.timer.take();
             self.session.take();
             self.transition(Event::InputStopped(session))?;
@@ -518,6 +533,12 @@ impl PreviewController {
             monitor.work_area,
             resources.appearance,
         )?);
+        resources.input.set_movement_notifications(true);
+        // Capture any cursor movement that happened while building the frozen
+        // window with notifications disabled. Later movement stays coalesced.
+        if let Some(magnifier) = resources.magnifier.as_ref() {
+            magnifier.update_hover(cursor_position()?)?;
+        }
         let session = resources.input.session_id();
         self.transition(Event::Freeze(session))?;
         self.pending_hover = None;
@@ -535,6 +556,7 @@ impl PreviewController {
         let Some(resources) = self.session.as_mut() else {
             return Ok(());
         };
+        resources.input.set_movement_notifications(false);
         if let Some(magnifier) = resources.magnifier.take() {
             magnifier.hide();
         }
@@ -581,17 +603,8 @@ impl PreviewController {
     }
 
     fn replace_timer(&mut self) -> Result<()> {
-        self.next_timer = self.next_timer.checked_add(1).ok_or_else(|| {
-            Error::new(
-                E_FAIL,
-                tr(
-                    "取色计时器已用尽，请重启程序。",
-                    "Picker timers are exhausted. Restart the app.",
-                ),
-            )
-        })?;
         // Preserve the old timer if creating its replacement fails.
-        let replacement = SessionTimer::start(self.host, self.next_timer)?;
+        let replacement = SessionTimer::start(self.host, next_timer_id()?)?;
         self.timer = Some(replacement);
         Ok(())
     }

@@ -6,6 +6,7 @@ use windows::Win32::UI::HiDpi::{
 pub mod capture;
 pub mod clipboard;
 pub mod config_path;
+pub(crate) mod copy_job;
 pub mod host;
 pub mod hotkey;
 pub(crate) mod icon;

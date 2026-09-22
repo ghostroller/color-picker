@@ -47,6 +47,9 @@ impl AppearancePreview {
     pub(super) fn paint(&self, dc: HDC, bounds: RECT) -> Result<()> {
         let width = dip(WIDTH, self.dpi);
         let height = dip(HEIGHT, self.dpi);
+        let visible_width = (bounds.right - bounds.left).min(width);
+        let overlay_width = dip(OVERLAY_WIDTH, self.dpi);
+        let source_x = (width - overlay_width) / 2 - (visible_width - overlay_width) / 2;
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -69,9 +72,9 @@ impl AppearancePreview {
                     dc,
                     bounds.left,
                     bounds.top,
-                    width as u32,
+                    visible_width as u32,
                     height as u32,
-                    0,
+                    source_x,
                     0,
                     0,
                     height as u32,
@@ -86,7 +89,9 @@ impl AppearancePreview {
                     tr("无法绘制外观示例", "Could not draw appearance example"),
                 ));
             }
-            let x = bounds.left + (width - dip(OVERLAY_WIDTH, self.dpi)) / 2;
+            // Crop only the generated background on narrow panes. The example
+            // overlay keeps its real DPI font size and stays centered/visible.
+            let x = bounds.left + (visible_width - dip(OVERLAY_WIDTH, self.dpi)) / 2;
             let overlay_height = dip(
                 live_preview_height_dip(self.appearance.border_width_dip),
                 self.dpi,
