@@ -442,8 +442,8 @@ fn initial_freeze_keeps_original_pixels_at_all_edges_across_dpi_sizes() {
             bottom: 980,
         },
     ] {
-        for dpi in [96, 120, 144, 192] {
-            let size = ((240 * dpi + 48) / 96).min(65 * 4);
+        for dpi in [96, 120, 144, 168, 192, 240, 288] {
+            let size = (240 * dpi + 48) / 96;
             for x in [
                 monitor.left,
                 monitor.left + 1,
@@ -477,7 +477,12 @@ fn initial_freeze_keeps_original_pixels_at_all_edges_across_dpi_sizes() {
                         point,
                         "{dpi} DPI: {point:?}"
                     );
-                    assert_eq!((view.image().width, view.image().height), (65, 65));
+                    let capture_size = (size as u32 / 4).max(65);
+                    assert_eq!(
+                        (view.image().width, view.image().height),
+                        (capture_size, capture_size)
+                    );
+                    assert_eq!(view.drawn_rect(), viewport);
                     assert_eq!(view.hit_test(point).unwrap().cache, view.selected());
                 }
             }
@@ -493,14 +498,14 @@ fn capture_planning_matches_centered_cells_for_fractional_viewport_sizes() {
         right: 1000,
         bottom: 1000,
     };
-    for size in [239, 241, 242, 243, 259, 261, 300, 480] {
+    for size in [239, 241, 242, 243, 259, 261, 300, 419, 420, 421, 480] {
         let viewport = ScreenRectPx {
             left: -100,
             top: -100,
             right: -100 + size,
             bottom: -100 + size,
         };
-        let padding = (size - (size / 4).min(65) * 4) / 2;
+        let padding = (size % 4) / 2;
         for point in [
             ScreenPointPx {
                 x: -100 + padding,
@@ -521,6 +526,71 @@ fn capture_planning_matches_centered_cells_for_fractional_viewport_sizes() {
                 point,
                 "{size}: {point:?}"
             );
+        }
+    }
+}
+
+#[test]
+fn enlarged_dpi_views_keep_integer_zoom_and_the_original_cursor_anchor() {
+    let monitor = ScreenRectPx {
+        left: -3840,
+        top: -2160,
+        right: 0,
+        bottom: 0,
+    };
+    for size in [300, 420, 480] {
+        for point in [
+            ScreenPointPx { x: -3820, y: -2140 },
+            ScreenPointPx { x: -1920, y: -1080 },
+            ScreenPointPx { x: -21, y: -21 },
+        ] {
+            let left = (point.x - size / 2).clamp(monitor.left, monitor.right - size);
+            let top = (point.y - size / 2).clamp(monitor.top, monitor.bottom - size);
+            let viewport = ScreenRectPx {
+                left,
+                top,
+                right: left + size,
+                bottom: top + size,
+            };
+            let mut view = planned_view(point, monitor, viewport);
+            let original = view.hit_test(point).unwrap();
+            let allocation = view.image().bgrx.as_ptr();
+            assert_eq!(original.source, point);
+            assert_eq!(view.drawn_rect(), viewport);
+            for scale in [
+                ZoomScale::X8,
+                ZoomScale::X16,
+                ZoomScale::X32,
+                ZoomScale::X16,
+                ZoomScale::X8,
+                ZoomScale::X4,
+            ] {
+                view.change_scale(scale, point);
+                assert_eq!(view.hit_test(point), Some(original), "{size}px {scale:?}");
+                assert_eq!(view.image().bgrx.as_ptr(), allocation);
+                assert_eq!(view.viewport(), viewport);
+                let drawn = view.drawn_rect();
+                assert_eq!(drawn.width() % scale.factor(), 0);
+                assert_eq!(drawn.height() % scale.factor(), 0);
+                assert_eq!(drawn.intersection(viewport), Some(drawn));
+                let source = view.source_view();
+                assert!(source.x + source.width <= view.image().width);
+                assert!(source.y + source.height <= view.image().height);
+                for cache in [
+                    CachePoint {
+                        x: source.x,
+                        y: source.y,
+                    },
+                    CachePoint {
+                        x: source.x + source.width - 1,
+                        y: source.y + source.height - 1,
+                    },
+                ] {
+                    let pixel = view.hit_test(view.cell_center(cache).unwrap()).unwrap();
+                    assert_eq!(pixel.cache, cache);
+                    assert_eq!(pixel.rgb, view.image().pixel_at(cache.x, cache.y).unwrap());
+                }
+            }
         }
     }
 }

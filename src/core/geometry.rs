@@ -1,5 +1,8 @@
 //! Screen coordinates are physical pixels; rectangles are left/top inclusive.
 
+/// Bound a frozen BGRX snapshot to at most 1 MiB of pixel storage.
+pub const MAX_FREEZE_SIDE_PX: u32 = 512;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScreenPointPx {
     pub x: i32,
@@ -64,7 +67,9 @@ pub fn freeze_rect(point: ScreenPointPx, monitor: ScreenRectPx) -> Option<Screen
 
 /// Plan a snapshot after the image viewport has been placed on screen.
 ///
-/// Keep the 65 × 65 capture size at monitor edges by moving it inward. When
+/// Cache at least 65 pixels per axis, growing to fill the viewport at its
+/// initial integer scale, up to `MAX_FREEZE_SIDE_PX`. Keep that capture size
+/// at monitor edges by moving it inward. When
 /// `point` is in the integer-pixel drawing area, also include the source view
 /// that puts that original screen pixel under the cursor. If monitor bounds
 /// prevent an exact anchor, the source view is clamped to the monitor first.
@@ -78,8 +83,14 @@ pub fn freeze_rect_for_view(
     if !monitor.contains(point) || viewport.is_empty() || scale == 0 {
         return None;
     }
-    let width = monitor.width().min(65);
-    let height = monitor.height().min(65);
+    let width = (viewport.width() / scale)
+        .max(65)
+        .min(monitor.width())
+        .min(MAX_FREEZE_SIDE_PX);
+    let height = (viewport.height() / scale)
+        .max(65)
+        .min(monitor.height())
+        .min(MAX_FREEZE_SIDE_PX);
     let (drawn_left, visible_width) =
         image_axis_layout(viewport.left, viewport.width(), width, scale);
     let (drawn_top, visible_height) =

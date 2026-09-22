@@ -756,6 +756,7 @@ fn edge_freeze_preserves_initial_source_and_standard_window_size() {
         },
     ] {
         let mut captures = 0;
+        let mut capture_size = None;
         let appearance = color_picker::app::config::AppearanceConfig {
             background_transparency_percent: 0,
             ..Default::default()
@@ -769,8 +770,7 @@ fn edge_freeze_preserves_initial_source_and_standard_window_size() {
                 captures += 1;
                 assert_eq!(rect.intersection(monitor.bounds), Some(rect));
                 assert!(rect.contains(focus));
-                assert_eq!(rect.width(), monitor.bounds.width().min(65));
-                assert_eq!(rect.height(), monitor.bounds.height().min(65));
+                capture_size = Some((rect.width(), rect.height()));
                 let mut bgrx = Vec::with_capacity((rect.width() * rect.height() * 4) as usize);
                 for y in 0..rect.height() {
                     for x in 0..rect.width() {
@@ -794,6 +794,18 @@ fn edge_freeze_preserves_initial_source_and_standard_window_size() {
         .unwrap();
         assert_eq!(captures, 1, "freeze must use one immutable snapshot");
         let bounds = magnifier.rect().unwrap();
+        let dpi = unsafe { GetDpiForWindow(magnifier.hwnd()) };
+        let footer_height = (28 * dpi + 48) / 96;
+        assert_eq!(
+            capture_size,
+            Some((
+                (bounds.width() / 4).max(65).min(monitor.bounds.width()),
+                ((bounds.height() - footer_height) / 4)
+                    .max(65)
+                    .min(monitor.bounds.height()),
+            )),
+            "capture grows with the DPI-scaled viewport without changing pixel magnification"
+        );
         assert_eq!(bounds.intersection(work), Some(bounds));
         let size = (bounds.width(), bounds.height());
         assert_eq!(size, *standard_size.get_or_insert(size));

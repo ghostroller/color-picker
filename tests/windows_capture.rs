@@ -4,7 +4,10 @@
 mod pixel_fixture;
 
 use color_picker::{
-    core::{color::Rgb8, geometry::ScreenRectPx},
+    core::{
+        color::Rgb8,
+        geometry::{MAX_FREEZE_SIDE_PX, ScreenRectPx},
+    },
     platform::windows::capture::{CaptureError, GdiSampler},
 };
 use pixel_fixture::{PixelFixture, STRIPE_TOP, ScopedPmv2, gdi_objects};
@@ -75,15 +78,46 @@ fn screen_sampler_matches_known_pixels_and_releases_gdi_objects() {
             );
         }
     }
-    assert!(matches!(
-        sampler.capture_rect(ScreenRectPx {
-            left: origin.x,
-            top: origin.y,
-            right: origin.x + 66,
-            bottom: origin.y + 1,
-        }),
-        Err(CaptureError::InvalidRectangle)
-    ));
+    for (width, height) in [(75, 75), (105, 105), (120, 120)] {
+        let enlarged = sampler
+            .capture_rect(ScreenRectPx {
+                left: origin.x,
+                top: origin.y,
+                right: origin.x + width,
+                bottom: origin.y + height,
+            })
+            .unwrap();
+        assert_eq!(enlarged.width, width as u32);
+        assert_eq!(enlarged.height, height as u32);
+        assert_eq!(enlarged.stride_bytes, width as usize * 4);
+        for y in 0..height as u32 {
+            for x in 0..width as u32 {
+                assert_eq!(
+                    enlarged.pixel_at(x, y),
+                    Some(Rgb8::new(
+                        (90 + x) as u8,
+                        (60 + y) as u8,
+                        ((90 + x) ^ (60 + y)) as u8,
+                    ))
+                );
+            }
+        }
+    }
+    for (width, height) in [
+        (MAX_FREEZE_SIDE_PX + 1, 1),
+        (1, MAX_FREEZE_SIDE_PX + 1),
+        (0, 1),
+    ] {
+        assert!(matches!(
+            sampler.capture_rect(ScreenRectPx {
+                left: origin.x,
+                top: origin.y,
+                right: origin.x + width as i32,
+                bottom: origin.y + height as i32,
+            }),
+            Err(CaptureError::InvalidRectangle)
+        ));
+    }
     let updated = Rgb8::new(23, 211, 84);
     assert_ne!(original, updated);
     fixture.change_pixel(101, 73, updated).unwrap();

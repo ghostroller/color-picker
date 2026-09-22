@@ -18,7 +18,7 @@ use windows::{
 
 use crate::core::{
     color::Rgb8,
-    geometry::{ScreenPointPx, ScreenRectPx},
+    geometry::{MAX_FREEZE_SIDE_PX, ScreenPointPx, ScreenRectPx},
     zoom::FrozenImage,
 };
 
@@ -28,7 +28,7 @@ pub enum CaptureError {
     DesktopUnavailable,
     /// The physical screen point is outside every display, including display gaps.
     NoMonitor,
-    /// Freeze capture is limited to a nonempty local area of at most 65 × 65.
+    /// Freeze capture must be nonempty and bounded by `MAX_FREEZE_SIDE_PX` per axis.
     InvalidRectangle,
     Api(Error),
 }
@@ -40,8 +40,9 @@ impl std::fmt::Display for CaptureError {
             Self::NoMonitor => {
                 formatter.write_str("the source is not contained in one actual monitor")
             }
-            Self::InvalidRectangle => formatter.write_str(
-                "freeze capture requires a nonempty area no larger than 65 by 65 pixels",
+            Self::InvalidRectangle => write!(
+                formatter,
+                "freeze capture requires a nonempty area no larger than {MAX_FREEZE_SIDE_PX} by {MAX_FREEZE_SIDE_PX} pixels",
             ),
             Self::Api(error) => write!(formatter, "screen capture failed: {error}"),
         }
@@ -178,7 +179,10 @@ impl GdiSampler {
     /// The caller clips to a monitor and hides/flushed owned overlays first.
     /// This validation rejects crossing monitors even if their edges touch.
     pub fn capture_rect(&mut self, rect: ScreenRectPx) -> Result<FrozenImage, CaptureError> {
-        if rect.is_empty() || rect.width() > 65 || rect.height() > 65 {
+        if rect.is_empty()
+            || rect.width() > MAX_FREEZE_SIDE_PX
+            || rect.height() > MAX_FREEZE_SIDE_PX
+        {
             return Err(CaptureError::InvalidRectangle);
         }
         let monitor = unsafe {
@@ -210,7 +214,7 @@ impl GdiSampler {
         }
         let width = rect.width();
         let height = rect.height();
-        // The preceding 65-pixel limit makes these dimensions and sizes small,
+        // The preceding per-axis limit makes these dimensions and sizes small,
         // positive and representable in both GDI's i32 and usize arithmetic.
         let stride_bytes = width as usize * 4;
         let length = stride_bytes * height as usize;

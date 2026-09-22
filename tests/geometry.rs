@@ -1,5 +1,5 @@
 use color_picker::core::geometry::{
-    ScreenPointPx, ScreenRectPx, freeze_rect, freeze_rect_for_view,
+    MAX_FREEZE_SIDE_PX, ScreenPointPx, ScreenRectPx, freeze_rect, freeze_rect_for_view,
 };
 
 #[test]
@@ -184,6 +184,68 @@ fn planned_freeze_keeps_full_size_at_all_negative_monitor_edges() {
 }
 
 #[test]
+fn planned_freeze_grows_with_dpi_and_preserves_the_complete_initial_view() {
+    let monitor = ScreenRectPx {
+        left: -3840,
+        top: -2160,
+        right: 0,
+        bottom: 0,
+    };
+    for (dpi, size, pixels) in [(120, 300, 75), (168, 420, 105), (192, 480, 120)] {
+        assert_eq!(size, (240 * dpi + 48) / 96);
+        for x in [monitor.left, monitor.left + 20, -1920, -21, -1] {
+            for y in [monitor.top, monitor.top + 20, -1080, -21, -1] {
+                let point = ScreenPointPx { x, y };
+                let left = (x - size / 2).clamp(monitor.left, monitor.right - size);
+                let top = (y - size / 2).clamp(monitor.top, monitor.bottom - size);
+                let viewport = ScreenRectPx {
+                    left,
+                    top,
+                    right: left + size,
+                    bottom: top + size,
+                };
+                let capture = freeze_rect_for_view(point, monitor, viewport, 4).unwrap();
+                assert_eq!((capture.width(), capture.height()), (pixels, pixels));
+                assert_eq!(capture.intersection(monitor), Some(capture));
+                assert!(capture.contains(point));
+                // These caches have exactly one source pixel per initial cell.
+                assert_eq!(capture.left, x - (x - left) / 4);
+                assert_eq!(capture.top, y - (y - top) / 4);
+            }
+        }
+    }
+}
+
+#[test]
+fn planned_freeze_sizes_axes_independently_and_bounds_memory() {
+    let monitor = ScreenRectPx {
+        left: -10000,
+        top: -10000,
+        right: 10000,
+        bottom: 10000,
+    };
+    let point = ScreenPointPx { x: 0, y: 0 };
+    for (width, height, scale, expected) in [
+        (420, 300, 4, (105, 75)),
+        (420, 240, 4, (105, 65)),
+        (480, 420, 8, (65, 65)),
+        (4096, 4096, 4, (MAX_FREEZE_SIDE_PX, MAX_FREEZE_SIDE_PX)),
+    ] {
+        let viewport = ScreenRectPx {
+            left: -width / 2,
+            top: -height / 2,
+            right: width / 2,
+            bottom: height / 2,
+        };
+        let capture = freeze_rect_for_view(point, monitor, viewport, scale).unwrap();
+        assert_eq!((capture.width(), capture.height()), expected);
+        assert!(capture.area() * 4 <= 1024 * 1024);
+        assert!(capture.contains(point));
+        assert_eq!(capture.intersection(monitor), Some(capture));
+    }
+}
+
+#[test]
 fn planned_freeze_falls_back_around_a_cursor_outside_the_drawn_area() {
     let monitor = ScreenRectPx {
         left: -1920,
@@ -192,8 +254,8 @@ fn planned_freeze_falls_back_around_a_cursor_outside_the_drawn_area() {
         bottom: 0,
     };
     let viewport = ScreenRectPx {
-        left: -300,
-        top: -300,
+        left: -303,
+        top: -303,
         right: 0,
         bottom: 0,
     };
@@ -203,7 +265,7 @@ fn planned_freeze_falls_back_around_a_cursor_outside_the_drawn_area() {
         ScreenPointPx { x: -1920, y: -1080 },
     ] {
         let capture = freeze_rect_for_view(point, monitor, viewport, 4).unwrap();
-        assert_eq!((capture.width(), capture.height()), (65, 65));
+        assert_eq!((capture.width(), capture.height()), (75, 75));
         assert!(capture.contains(point));
         assert_eq!(capture.intersection(monitor), Some(capture));
     }
@@ -248,8 +310,8 @@ fn planned_freeze_handles_tiny_monitors_and_integer_limits() {
             },
         ] {
             let capture = freeze_rect_for_view(point, monitor, monitor, 4).unwrap();
-            assert_eq!(capture.width(), monitor.width().min(65));
-            assert_eq!(capture.height(), monitor.height().min(65));
+            assert_eq!(capture.width(), monitor.width().min(MAX_FREEZE_SIDE_PX));
+            assert_eq!(capture.height(), monitor.height().min(MAX_FREEZE_SIDE_PX));
             assert!(capture.contains(point));
             assert_eq!(capture.intersection(monitor), Some(capture));
         }

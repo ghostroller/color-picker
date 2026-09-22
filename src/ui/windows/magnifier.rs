@@ -32,7 +32,7 @@ use crate::{
     core::{
         color::Rgb8,
         format::{ColorFormat, format_color},
-        geometry::{ScreenPointPx, ScreenRectPx, freeze_rect_for_view},
+        geometry::{MAX_FREEZE_SIDE_PX, ScreenPointPx, ScreenRectPx, freeze_rect_for_view},
         state::{PickedColor, SampleKind},
         zoom::{CachePoint, FrozenImage, SourcePixel, ZoomScale, ZoomView},
     },
@@ -421,7 +421,7 @@ impl PreparedMagnifier {
         image
             .validate()
             .map_err(|_| Error::new(E_INVALIDARG, "Invalid frozen image"))?;
-        if image.width > 65 || image.height > 65 {
+        if image.width > MAX_FREEZE_SIDE_PX || image.height > MAX_FREEZE_SIDE_PX {
             return Err(Error::new(
                 E_INVALIDARG,
                 "Frozen image exceeds the local capture limits",
@@ -500,11 +500,15 @@ fn window_layout(
     }
     let initial_scale = i64::from(ZoomScale::X4.factor());
     let cap = i64::from(dip(240, dpi));
-    // Use the same viewport at the screen center and edges. Only the available
-    // work area can shrink it. The 65 source pixels need at most 260 physical
-    // pixels at 4×, even at high DPI. Round down to complete initial cells.
+    // Keep a consistent logical size across monitors. Capture planning grows
+    // the source area to fill this viewport at a true 4× physical-pixel scale.
+    // Round down to whole cells and retain a bounded local capture allocation.
     let axis = |available: i64| {
-        (65 * initial_scale).min(cap).min(available) / initial_scale * initial_scale
+        (i64::from(MAX_FREEZE_SIDE_PX) * initial_scale)
+            .min(cap)
+            .min(available)
+            / initial_scale
+            * initial_scale
     };
     let width = axis(i64::from(work.width()));
     let footer = i64::from(footer_height(dpi));
@@ -888,12 +892,14 @@ impl Surface {
         let color = footer.rgb.map_or(palette::EMPTY, |rgb| {
             COLORREF(u32::from(rgb.r) | (u32::from(rgb.g) << 8) | (u32::from(rgb.b) << 16))
         });
+        let side = self.footer_swatch_width(footer, border)?;
+        let swatch_top = top + (self.height - border - top - side).max(0) / 2;
         self.fill(
             RECT {
                 left: 0,
-                top,
-                right: self.footer_swatch_width(footer, border)?,
-                bottom: self.height - border,
+                top: swatch_top,
+                right: side,
+                bottom: swatch_top + side,
             },
             color,
         )?;
@@ -924,17 +930,16 @@ impl Surface {
     }
 
     fn footer_swatch_width(&self, footer: &Footer, border: i32) -> Result<i32> {
-        // Fill the footer height flush to the left edge. Limit width on narrow
-        // work areas without shrinking text below the existing smallest font.
+        // Fill the visible footer height with a square on normal desktops.
+        // Reserve every label, including scale, before shrinking it on unusually
+        // narrow work areas. Width is physical pixels, not a DPI-scaled fraction.
         let hex: Vec<u16> = "#DDDDDD".encode_utf16().collect();
-        let text_width = self.text_size(&self.narrow_font, &hex)?.cx
-            + self
-                .text_size(&self.narrow_font, &footer.compact_coordinates)?
-                .cx;
-        let remaining = self.width - border - text_width - 8;
+        let hex = self.text_size(&self.narrow_font, &hex)?;
+        let position = self.text_size(&self.narrow_font, &footer.compact_coordinates)?;
+        let scale = self.text_size(&self.narrow_font, &footer.scale)?;
+        let text_width = hex.cx + position.cx + scale.cx + 8;
         Ok((footer_height(self.dpi) - border)
-            .min((self.width - border) / 8)
-            .min(remaining)
+            .min(self.width - border - text_width - 4)
             .max(0))
     }
 
@@ -947,12 +952,18 @@ impl Surface {
         let right = (self.width - border - 2).max(left);
         let available = right - left;
         let gap = 4;
+        let row_height = (footer_height(self.dpi) - border).max(0);
         let widest_hex: Vec<u16> = "#DDDDDD".encode_utf16().collect();
         let choices = [
             (
                 &self.heading_font,
                 &self.body_font,
                 footer.coordinates.as_slice(),
+            ),
+            (
+                &self.heading_font,
+                &self.body_font,
+                footer.compact_coordinates.as_slice(),
             ),
             (
                 &self.body_font,
@@ -970,36 +981,39 @@ impl Surface {
                 footer.compact_coordinates.as_slice(),
             ),
         ];
+        // All three labels stay on one row. Normal windows scale in DIP so
+        // normal fonts fit; smaller fonts are only a fallback for short work areas.
         for (index, (hex_font, info_font, coordinates)) in choices.into_iter().enumerate() {
             let hex = self.text_size(hex_font, &widest_hex)?;
             let position = self.text_size(info_font, coordinates)?;
             let scale = self.text_size(info_font, &footer.scale)?;
-            if hex.cx + gap + position.cx > available && index != choices.len() - 1 {
+            if (hex.cx + position.cx + scale.cx + 2 * gap > available
+                || hex.cy.max(position.cy).max(scale.cy) > row_height)
+                && index != choices.len() - 1
+            {
                 continue;
             }
-            let show_scale = hex.cx + position.cx + scale.cx + 3 * gap <= available;
-            let coordinate_left = (right - position.cx)
-                .max(left)
-                .max(left + available.min(hex.cx + gap));
-            let row_height = (footer_height(self.dpi) - border).max(0);
+            let scale_left = (left + hex.cx + gap).min(right);
+            let coordinate_left =
+                (right - position.cx).max((scale_left + scale.cx + gap).min(right));
             let rect = |x: i32, end: i32, height: i32| RECT {
                 left: x.min(right),
                 top: ((row_height - height) / 2).max(0),
-                right: end.min(right),
+                right: end.max(x).min(right),
                 bottom: row_height,
             };
             return Ok([
                 FooterLabel {
-                    rect: rect(left, (left + hex.cx).min(coordinate_left - gap), hex.cy),
+                    rect: rect(left, left + hex.cx, hex.cy),
                     font: hex_font,
                     color: palette::TEXT,
                     text: &footer.hex,
                 },
                 FooterLabel {
-                    rect: rect(left + hex.cx + gap, coordinate_left - gap, scale.cy),
+                    rect: rect(scale_left, coordinate_left - gap, scale.cy),
                     font: info_font,
                     color: palette::ACCENT,
-                    text: if show_scale { &footer.scale } else { &[] },
+                    text: &footer.scale,
                 },
                 FooterLabel {
                     rect: rect(coordinate_left, right, position.cy),
@@ -1404,26 +1418,84 @@ mod tests {
     }
 
     #[test]
-    fn single_row_footer_fits_the_actual_pixel_width_at_supported_desktop_scaling() {
+    fn desktop_footer_keeps_the_normal_dpi_scaled_font_sizes() {
         use crate::app::i18n::{Language, language, set_language};
         let previous_language = language();
-        for language in [Language::SimplifiedChinese, Language::English] {
-            set_language(language);
-            assert_single_row_footer_fits();
-        }
-        set_language(previous_language);
-    }
-
-    fn assert_single_row_footer_fits() {
         let footer = Footer {
             rgb: Some(Rgb8::new(221, 221, 221)),
             hex: "#DDDDDD".encode_utf16().collect(),
             scale: "32×".encode_utf16().collect(),
+            coordinates: "X -3840  Y 2160".encode_utf16().collect(),
+            compact_coordinates: "X-3840 Y2160".encode_utf16().collect(),
+        };
+        for language in [Language::SimplifiedChinese, Language::English] {
+            set_language(language);
+            for dpi in [96, 120, 144, 168, 192, 240, 288] {
+                for border in [0, 2, 6] {
+                    let surface = Surface::new(
+                        dip(240, dpi) / 4 * 4,
+                        footer_height(dpi),
+                        dpi,
+                        false,
+                        AppearanceConfig {
+                            border_width_dip: border,
+                            background_transparency_percent: 0,
+                        },
+                    )
+                    .unwrap();
+                    for (index, label) in surface
+                        .footer_labels(&footer, dip(i32::from(border), dpi))
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                    {
+                        let normal_font = if index == 0 {
+                            &surface.heading_font
+                        } else {
+                            &surface.body_font
+                        };
+                        let expected = surface.text_size(normal_font, label.text).unwrap();
+                        let actual = surface.text_size(label.font, label.text).unwrap();
+                        assert_eq!(
+                            actual.cy, expected.cy,
+                            "footer text shrank at {dpi} DPI, label={index}, border={border}"
+                        );
+                        assert!(actual.cx <= label.rect.right - label.rect.left);
+                        assert!(actual.cy <= label.rect.bottom - label.rect.top);
+                        assert_eq!(
+                            label.rect.bottom,
+                            footer_height(dpi) - dip(i32::from(border), dpi)
+                        );
+                    }
+                }
+            }
+        }
+        set_language(previous_language);
+    }
+
+    #[test]
+    fn footer_preserves_all_information_at_supported_desktop_scaling() {
+        use crate::app::i18n::{Language, language, set_language};
+        let previous_language = language();
+        for language in [Language::SimplifiedChinese, Language::English] {
+            set_language(language);
+            for factor in [4, 8, 16, 32] {
+                assert_footer_fits(factor);
+            }
+        }
+        set_language(previous_language);
+    }
+
+    fn assert_footer_fits(factor: u32) {
+        let footer = Footer {
+            rgb: Some(Rgb8::new(221, 221, 221)),
+            hex: "#DDDDDD".encode_utf16().collect(),
+            scale: format!("{factor}×").encode_utf16().collect(),
             coordinates: "X -65535  Y -65535".encode_utf16().collect(),
             compact_coordinates: "X-65535 Y-65535".encode_utf16().collect(),
         };
-        for dpi in [96, 120, 144, 168, 192] {
-            for width in [132, 260] {
+        for dpi in [96, 120, 144, 168, 192, 240, 288] {
+            for width in [dip(240, dpi) / 4 * 4] {
                 let surface = Surface::new(
                     width,
                     footer_height(dpi),
@@ -1432,12 +1504,20 @@ mod tests {
                     AppearanceConfig::default(),
                 )
                 .unwrap();
-                for border in [0, dip(6, dpi)] {
+                for border in [0, dip(2, dpi), dip(6, dpi)] {
                     let labels = surface.footer_labels(&footer, border).unwrap();
-                    assert!(labels[0].rect.right < labels[2].rect.left);
-                    for label in labels {
-                        if label.text.is_empty() {
-                            continue;
+                    assert_eq!(labels[0].text, footer.hex);
+                    assert_eq!(labels[1].text, footer.scale, "倍率不能因 DPI 变化而消失");
+                    assert!(!labels[2].text.is_empty());
+                    for (index, label) in labels.iter().enumerate() {
+                        for other in &labels[index + 1..] {
+                            assert!(
+                                label.rect.right <= other.rect.left
+                                    || other.rect.right <= label.rect.left
+                                    || label.rect.bottom <= other.rect.top
+                                    || other.rect.bottom <= label.rect.top,
+                                "footer labels overlap"
+                            );
                         }
                         let size = surface.text_size(label.font, label.text).unwrap();
                         assert!(
@@ -1446,8 +1526,67 @@ mod tests {
                         );
                         assert!(size.cy <= label.rect.bottom - label.rect.top);
                         assert!(label.rect.left >= 0 && label.rect.right <= width - border);
-                        assert!(label.rect.bottom <= footer_height(dpi) - border);
+                        assert_eq!(
+                            label.rect.bottom,
+                            footer_height(dpi) - border,
+                            "all labels stay on a single row"
+                        );
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_hover_swatch_stays_square_after_the_border_is_painted() {
+        let footer = Footer {
+            rgb: Some(Rgb8::new(221, 221, 221)),
+            hex: "#DDDDDD".encode_utf16().collect(),
+            scale: "32×".encode_utf16().collect(),
+            coordinates: "X -65535  Y -65535".encode_utf16().collect(),
+            compact_coordinates: "X-65535 Y-65535".encode_utf16().collect(),
+        };
+        for dpi in [96, 120, 144, 168, 192, 240, 288] {
+            for width in [dip(240, dpi) / 4 * 4] {
+                for border in [0, 2, 6] {
+                    let height = footer_height(dpi);
+                    let surface = Surface::new(
+                        width,
+                        height,
+                        dpi,
+                        false,
+                        AppearanceConfig {
+                            border_width_dip: border,
+                            background_transparency_percent: 0,
+                        },
+                    )
+                    .unwrap();
+                    let bounds = ScreenRectPx {
+                        left: 0,
+                        top: 0,
+                        right: width,
+                        bottom: height,
+                    };
+                    surface.draw_footer(0, &footer, bounds).unwrap();
+                    draw_bottom_right_border(surface.dc.0, width, height, dpi, border).unwrap();
+                    let color = COLORREF(0x00dddddd);
+                    let rows: Vec<_> = (0..height)
+                        .filter(|&y| unsafe { GetPixel(surface.dc.0, 0, y) == color })
+                        .collect();
+                    assert!(
+                        !rows.is_empty(),
+                        "missing hover swatch at {dpi} DPI, width={width}"
+                    );
+                    let y = rows[rows.len() / 2];
+                    let visible_width = (0..width)
+                        .take_while(|&x| unsafe { GetPixel(surface.dc.0, x, y) == color })
+                        .count();
+                    assert_eq!(
+                        visible_width,
+                        rows.len(),
+                        "non-square swatch at {dpi} DPI, width={width}, border={border}"
+                    );
+                    assert_eq!(rows.len() as i32, height - dip(i32::from(border), dpi));
                 }
             }
         }
@@ -1561,7 +1700,7 @@ mod tests {
                 window_layout(ScreenPointPx { x: -1199, y: -699 }, work, dpi).unwrap();
             assert_eq!(window.intersection(work), Some(window));
             assert_eq!(viewport.width(), viewport.height());
-            assert_eq!(viewport.width(), dip(240, dpi).min(260) as u32 / 4 * 4);
+            assert_eq!(viewport.width(), dip(240, dpi) as u32 / 4 * 4);
             assert_eq!((viewport.left, viewport.right), (window.left, window.right));
             assert!(viewport.contains(ScreenPointPx { x: -1199, y: -699 }));
             assert_eq!(viewport.top, window.top);
@@ -1599,15 +1738,15 @@ mod tests {
         let (window, viewport) = window_layout(ScreenPointPx { x: -1, y: -1 }, work, 168).unwrap();
         let (center_window, _) =
             window_layout(ScreenPointPx { x: -500, y: -400 }, work, 168).unwrap();
-        assert_eq!(viewport.width(), 260);
-        assert_eq!(viewport.height(), 260);
-        assert_eq!(window.height(), 309);
+        assert_eq!(viewport.width(), 420);
+        assert_eq!(viewport.height(), 420);
+        assert_eq!(window.height(), 469);
         assert_eq!(window.width(), center_window.width());
         assert_eq!(window.height(), center_window.height());
         assert!(viewport.left <= -1 && viewport.right > -1);
         assert_eq!(window.intersection(work), Some(window));
         let mut view = ZoomView::new(
-            image(65, 65),
+            image(105, 105),
             viewport,
             ZoomScale::X4,
             CachePoint { x: 32, y: 32 },
@@ -1663,7 +1802,7 @@ mod tests {
         };
         for size in 1..=7 {
             let (_, viewport) = window_layout(ScreenPointPx { x: 50, y: 50 }, work, 168).unwrap();
-            assert_eq!((viewport.width(), viewport.height()), (260, 260));
+            assert_eq!((viewport.width(), viewport.height()), (420, 420));
             let mut view = ZoomView::new(
                 image(size, 8 - size),
                 viewport,
