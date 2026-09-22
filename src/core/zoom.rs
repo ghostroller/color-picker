@@ -1,7 +1,7 @@
 //! Immutable BGRX snapshots and integer-pixel magnifier mapping.
 
 use crate::core::color::Rgb8;
-use crate::core::geometry::{ScreenPointPx, ScreenRectPx};
+use crate::core::geometry::{ScreenPointPx, ScreenRectPx, image_axis_layout};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrozenImage {
@@ -173,6 +173,38 @@ impl ZoomView {
         })
     }
 
+    /// Initialize with the original source pixel under `anchor_screen` when
+    /// the cache and drawn area allow it. Keep `focus` as the selection even
+    /// when bounds require a different pixel under the cursor.
+    pub fn new_anchored(
+        image: FrozenImage,
+        viewport: ScreenRectPx,
+        scale: ZoomScale,
+        focus: CachePoint,
+        anchor_screen: ScreenPointPx,
+    ) -> Result<Self, ZoomError> {
+        let mut view = Self::new(image, viewport, scale, focus)?;
+        if view.drawn_rect.contains(anchor_screen) {
+            view.source_view.x = anchored_origin(
+                focus.x,
+                anchor_screen.x,
+                view.drawn_rect.left,
+                view.source_view.width,
+                view.image.width,
+                scale,
+            );
+            view.source_view.y = anchored_origin(
+                focus.y,
+                anchor_screen.y,
+                view.drawn_rect.top,
+                view.source_view.height,
+                view.image.height,
+                scale,
+            );
+        }
+        Ok(view)
+    }
+
     pub fn image(&self) -> &FrozenImage {
         &self.image
     }
@@ -307,18 +339,16 @@ fn layout(
     scale: ZoomScale,
 ) -> (ScreenRectPx, u32, u32) {
     let k = scale.factor();
-    let width = image.width.min(viewport.width() / k);
-    let height = image.height.min(viewport.height() / k);
+    let (left, width) = image_axis_layout(viewport.left, viewport.width(), image.width, k);
+    let (top, height) = image_axis_layout(viewport.top, viewport.height(), image.height, k);
     let drawn_width = width * k;
     let drawn_height = height * k;
-    let left = i64::from(viewport.left) + i64::from((viewport.width() - drawn_width) / 2);
-    let top = i64::from(viewport.top) + i64::from((viewport.height() - drawn_height) / 2);
     (
         ScreenRectPx {
-            left: left as i32,
-            top: top as i32,
-            right: (left + i64::from(drawn_width)) as i32,
-            bottom: (top + i64::from(drawn_height)) as i32,
+            left,
+            top,
+            right: (i64::from(left) + i64::from(drawn_width)) as i32,
+            bottom: (i64::from(top) + i64::from(drawn_height)) as i32,
         },
         width,
         height,

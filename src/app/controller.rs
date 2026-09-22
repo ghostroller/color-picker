@@ -4,7 +4,7 @@
 use crate::{
     app::{config::AppearanceConfig, diagnostics, i18n::tr},
     core::{
-        geometry::{ScreenPointPx, ScreenRectPx, freeze_rect},
+        geometry::{ScreenPointPx, ScreenRectPx},
         state::{AppState, Event, PickedColor, SampleKind, StateMachine},
     },
     platform::windows::{
@@ -500,39 +500,27 @@ impl PreviewController {
                 ),
             )
         })?;
-        let rect = freeze_rect(point, monitor.bounds).ok_or_else(|| {
-            Error::new(
-                E_FAIL,
-                tr(
-                    "无法确定冻结区域",
-                    "Could not determine the area to freeze.",
-                ),
-            )
-        })?;
         self.timer.take();
         // Frozen does not retain a hidden Live window or its font/backbuffer.
         if let Some(preview) = resources.preview.take() {
             preview.hide();
         }
         flush_composition()?;
-        let image = resources
-            .sampler
-            .as_mut()
-            .ok_or_else(|| {
-                Error::new(
-                    E_FAIL,
-                    tr("实时采样资源不可用", "Live sampling is unavailable."),
-                )
-            })?
-            .capture_rect(rect)
-            .map_err(platform_error)?;
-        resources.sampler.take();
-        resources.magnifier = Some(MagnifierWindow::with_appearance(
-            image,
+        let sampler = resources.sampler.as_mut().ok_or_else(|| {
+            Error::new(
+                E_FAIL,
+                tr("实时采样资源不可用", "Live sampling is unavailable."),
+            )
+        })?;
+        let magnifier = MagnifierWindow::capture_with_appearance(
             point,
+            monitor.bounds,
             monitor.work_area,
             resources.appearance,
-        )?);
+            |rect| sampler.capture_rect(rect).map_err(platform_error),
+        )?;
+        resources.sampler.take();
+        resources.magnifier = Some(magnifier);
         resources.input.set_movement_notifications(true);
         // Capture any cursor movement that happened while building the frozen
         // window with notifications disabled. Later movement stays coalesced.

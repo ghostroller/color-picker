@@ -33,6 +33,8 @@ The live preview follows your pointer and shows the color, HEX value, and physic
 
 The frozen preview uses a snapshot, so you can inspect a tiny target without chasing moving content. As you hover over its grid, the information bar updates the HEX value and the pixel's original screen X/Y coordinates alongside the zoom level. A color swatch sits flush against the information bar's left edge, beside the HEX value, and follows the hovered pixel without widening the window. Clicking its border or information bar does not select a color. While picking, mouse clicks and scrolling are consumed by the picker; normal input resumes when the session ends.
 
+The frozen window keeps the same size at screen edges as at the center, unless the work area is too small. On the first freeze, the snapshot position adapts to keep the original source pixel under the pointer when it is inside a selectable pixel cell. The right border, bottom information bar, and taskbar area remain outside the selectable grid. Later zoom changes still respect snapshot bounds, so the source pixel may shift under the pointer near those bounds.
+
 ![English frozen preview with a hover color swatch, HEX value, source coordinates, and zoom level](docs/images/ui-frozen-en.png)
 
 Starting again during an active pick does not create another session. The tray menu shows your current shortcut and whether Windows registered it successfully. Closing a result window leaves the app in the tray. To quit completely, right-click the tray icon and choose **Exit**.

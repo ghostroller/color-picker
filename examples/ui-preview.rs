@@ -8,6 +8,7 @@
 //! --border=N / --transparency=N override appearance for this fixture only.
 //! --language=en / --language=zh-CN select the interface language without saving.
 //! --output=path.bmp exports this fixture's client area, then exits.
+//! frozen-edge uses a focus near the work area's top-left corner.
 
 #[cfg(not(windows))]
 fn main() {
@@ -147,10 +148,18 @@ mod fixture {
             .clamp(1, 600);
         let cursor = cursor_position()?;
         let monitors = Monitors::enumerate()?;
-        let work = monitors.at(cursor).expect("cursor monitor").work_area;
-        let focus = ScreenPointPx {
-            x: work.left + (work.width() / 2) as i32,
-            y: work.top + (work.height() / 2) as i32,
+        let monitor = monitors.at(cursor).expect("cursor monitor");
+        let work = monitor.work_area;
+        let focus = if mode == "frozen-edge" {
+            ScreenPointPx {
+                x: work.left + 20.min(work.width() / 2) as i32,
+                y: work.top + 20.min(work.height() / 2) as i32,
+            }
+        } else {
+            ScreenPointPx {
+                x: work.left + (work.width() / 2) as i32,
+                y: work.top + (work.height() / 2) as i32,
+            }
         };
         let _backdrop = if std::env::args().any(|arg| arg == "--backdrop") {
             Some(backdrop(focus)?)
@@ -205,34 +214,37 @@ mod fixture {
                 Scene::Live(window)
             }
             "frozen" | "frozen-edge" => {
-                let width = if mode == "frozen-edge" { 33_usize } else { 65 };
-                let origin = ScreenPointPx {
-                    x: focus.x - (width / 2) as i32,
-                    y: focus.y - 32,
-                };
-                let mut bgrx = Vec::with_capacity(width * 65 * 4);
-                for y in 0..65 {
-                    for x in 0..width {
-                        let cell = ((x / 8) + (y / 8)) % 2;
-                        let color = if cell == 0 {
-                            rgb
-                        } else {
-                            Rgb8::new(207, 225, 213)
-                        };
-                        bgrx.extend_from_slice(&[color.b, color.g, color.r, 255]);
-                    }
-                }
-                let window = MagnifierWindow::with_appearance(
-                    FrozenImage {
-                        origin,
-                        width: width as u32,
-                        height: 65,
-                        stride_bytes: width * 4,
-                        bgrx,
-                    },
+                let window = MagnifierWindow::capture_with_appearance(
                     focus,
+                    monitor.bounds,
                     work,
                     config.appearance,
+                    |rect| {
+                        let width = rect.width() as usize;
+                        let height = rect.height() as usize;
+                        let mut bgrx = Vec::with_capacity(width * height * 4);
+                        for y in 0..height {
+                            for x in 0..width {
+                                let cell = ((x / 8) + (y / 8)) % 2;
+                                let color = if cell == 0 {
+                                    rgb
+                                } else {
+                                    Rgb8::new(207, 225, 213)
+                                };
+                                bgrx.extend_from_slice(&[color.b, color.g, color.r, 255]);
+                            }
+                        }
+                        Ok(FrozenImage {
+                            origin: ScreenPointPx {
+                                x: rect.left,
+                                y: rect.top,
+                            },
+                            width: rect.width(),
+                            height: rect.height(),
+                            stride_bytes: width * 4,
+                            bgrx,
+                        })
+                    },
                 )?;
                 window.update_hover(focus)?;
                 Scene::Frozen(window)

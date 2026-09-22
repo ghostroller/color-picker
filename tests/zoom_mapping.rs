@@ -1,5 +1,5 @@
 use color_picker::core::color::Rgb8;
-use color_picker::core::geometry::{ScreenPointPx, ScreenRectPx};
+use color_picker::core::geometry::{ScreenPointPx, ScreenRectPx, freeze_rect_for_view};
 use color_picker::core::zoom::{
     CachePoint, FrozenImage, ImageError, ZoomError, ZoomScale, ZoomView,
 };
@@ -377,4 +377,261 @@ fn zoom_steps_are_bounded_and_lowest_step_exits() {
     assert_eq!(ZoomScale::X8.increase(), ZoomScale::X16);
     assert_eq!(ZoomScale::X16.increase(), ZoomScale::X32);
     assert_eq!(ZoomScale::X32.increase(), ZoomScale::X32);
+}
+
+fn planned_view(point: ScreenPointPx, monitor: ScreenRectPx, viewport: ScreenRectPx) -> ZoomView {
+    let capture = freeze_rect_for_view(point, monitor, viewport, 4).unwrap();
+    let mut image = fixture(capture.width(), capture.height());
+    image.origin = ScreenPointPx {
+        x: capture.left,
+        y: capture.top,
+    };
+    let focus = CachePoint {
+        x: (i64::from(point.x) - i64::from(capture.left)) as u32,
+        y: (i64::from(point.y) - i64::from(capture.top)) as u32,
+    };
+    ZoomView::new_anchored(image, viewport, ZoomScale::X4, focus, point).unwrap()
+}
+
+#[test]
+fn initial_left_edge_freeze_keeps_source_x20_under_the_cursor() {
+    let monitor = ScreenRectPx {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1080,
+    };
+    let viewport = ScreenRectPx {
+        left: 0,
+        top: 380,
+        right: 240,
+        bottom: 620,
+    };
+    let point = ScreenPointPx { x: 20, y: 500 };
+    let mut view = planned_view(point, monitor, viewport);
+    let hit = view.hit_test(point).unwrap();
+    assert_eq!(hit.source, point);
+    assert_eq!(hit.cache, view.selected());
+    assert_eq!(view.image().width, 65);
+    assert_eq!(view.source_view().width, 60);
+    assert_eq!(view.select_at(point), Some(hit));
+    // The first zoom uses that same selected source pixel.
+    view.change_scale(ZoomScale::X8, point);
+    assert_eq!(view.hit_test(point), Some(hit));
+}
+
+#[test]
+fn initial_freeze_keeps_original_pixels_at_all_edges_across_dpi_sizes() {
+    for monitor in [
+        ScreenRectPx {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        },
+        ScreenRectPx {
+            left: -1920,
+            top: -1080,
+            right: 0,
+            bottom: 0,
+        },
+        ScreenRectPx {
+            left: -1920,
+            top: -100,
+            right: 0,
+            bottom: 980,
+        },
+    ] {
+        for dpi in [96, 120, 144, 192] {
+            let size = ((240 * dpi + 48) / 96).min(65 * 4);
+            for x in [
+                monitor.left,
+                monitor.left + 1,
+                monitor.left + 20,
+                monitor.left + 960,
+                monitor.right - 21,
+                monitor.right - 2,
+                monitor.right - 1,
+            ] {
+                for y in [
+                    monitor.top,
+                    monitor.top + 1,
+                    monitor.top + 20,
+                    monitor.top + 540,
+                    monitor.bottom - 21,
+                    monitor.bottom - 2,
+                    monitor.bottom - 1,
+                ] {
+                    let point = ScreenPointPx { x, y };
+                    let left = (x - size / 2).clamp(monitor.left, monitor.right - size);
+                    let top = (y - size / 2).clamp(monitor.top, monitor.bottom - size);
+                    let viewport = ScreenRectPx {
+                        left,
+                        top,
+                        right: left + size,
+                        bottom: top + size,
+                    };
+                    let view = planned_view(point, monitor, viewport);
+                    assert_eq!(
+                        view.hit_test(point).unwrap().source,
+                        point,
+                        "{dpi} DPI: {point:?}"
+                    );
+                    assert_eq!((view.image().width, view.image().height), (65, 65));
+                    assert_eq!(view.hit_test(point).unwrap().cache, view.selected());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn capture_planning_matches_centered_cells_for_fractional_viewport_sizes() {
+    let monitor = ScreenRectPx {
+        left: -1000,
+        top: -1000,
+        right: 1000,
+        bottom: 1000,
+    };
+    for size in [239, 241, 242, 243, 259, 261, 300, 480] {
+        let viewport = ScreenRectPx {
+            left: -100,
+            top: -100,
+            right: -100 + size,
+            bottom: -100 + size,
+        };
+        let padding = (size - (size / 4).min(65) * 4) / 2;
+        for point in [
+            ScreenPointPx {
+                x: -100 + padding,
+                y: -100 + padding,
+            },
+            ScreenPointPx {
+                x: -100 + size / 2,
+                y: -100 + size / 2,
+            },
+            ScreenPointPx {
+                x: -100 + size - padding - 2,
+                y: -100 + size - padding - 2,
+            },
+        ] {
+            let view = planned_view(point, monitor, viewport);
+            assert_eq!(
+                view.hit_test(point).unwrap().source,
+                point,
+                "{size}: {point:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn anchored_initialization_clamps_small_caches_without_reselecting_focus() {
+    for (width, height) in [(1, 1), (7, 5), (33, 65), (65, 33), (65, 65)] {
+        for focus in [
+            CachePoint { x: 0, y: 0 },
+            CachePoint {
+                x: width - 1,
+                y: height - 1,
+            },
+        ] {
+            for anchor in [
+                ScreenPointPx { x: -800, y: -600 },
+                ScreenPointPx { x: -640, y: -440 },
+                ScreenPointPx {
+                    x: i32::MIN,
+                    y: i32::MAX,
+                },
+            ] {
+                let view = ZoomView::new_anchored(
+                    fixture(width, height),
+                    viewport(),
+                    ZoomScale::X4,
+                    focus,
+                    anchor,
+                )
+                .unwrap();
+                let source = view.source_view();
+                assert!(source.x + source.width <= width);
+                assert!(source.y + source.height <= height);
+                assert_eq!(view.selected(), focus);
+                assert_eq!(
+                    view.hit_test(view.cell_center(focus).unwrap())
+                        .unwrap()
+                        .cache,
+                    focus
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn anchored_initialization_outside_drawn_area_uses_centered_fallback() {
+    let focus = CachePoint { x: 20, y: 45 };
+    let centered = ZoomView::new(fixture(65, 65), viewport(), ZoomScale::X8, focus).unwrap();
+    let view = ZoomView::new_anchored(
+        fixture(65, 65),
+        viewport(),
+        ZoomScale::X8,
+        focus,
+        ScreenPointPx {
+            x: viewport().left - 1,
+            y: viewport().top,
+        },
+    )
+    .unwrap();
+    assert_eq!(view.source_view(), centered.source_view());
+    assert_eq!(view.drawn_rect(), centered.drawn_rect());
+    assert_eq!(view.selected(), focus);
+}
+
+#[test]
+fn planned_anchored_views_remain_valid_for_tiny_monitors_and_integer_limits() {
+    for monitor in [
+        ScreenRectPx {
+            left: -7,
+            top: -3,
+            right: 5,
+            bottom: 6,
+        },
+        ScreenRectPx {
+            left: i32::MIN,
+            top: i32::MIN,
+            right: i32::MIN + 240,
+            bottom: i32::MIN + 240,
+        },
+        ScreenRectPx {
+            left: i32::MAX - 240,
+            top: i32::MAX - 240,
+            right: i32::MAX,
+            bottom: i32::MAX,
+        },
+        ScreenRectPx {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        },
+    ] {
+        for point in [
+            ScreenPointPx {
+                x: monitor.left,
+                y: monitor.top,
+            },
+            ScreenPointPx {
+                x: monitor.right - 1,
+                y: monitor.bottom - 1,
+            },
+        ] {
+            let view = planned_view(point, monitor, monitor);
+            let source = view.source_view();
+            assert!(source.x + source.width <= view.image().width);
+            assert!(source.y + source.height <= view.image().height);
+            assert_eq!(view.image().validate(), Ok(()));
+            if let Some(hit) = view.hit_test(point) {
+                assert!(monitor.contains(hit.source));
+            }
+        }
+    }
 }

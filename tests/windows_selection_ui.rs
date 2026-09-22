@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-//! One opt-in construction smoke check. No input, hooks or clipboard actions.
+//! Opt-in construction smoke checks. No system input, hooks or clipboard actions.
 
 #[path = "support/pixel_fixture.rs"]
 mod pixel_fixture;
@@ -92,6 +92,7 @@ fn cached_selection_and_native_result_controls_smoke() {
     let picked = magnifier
         .hit_test(hover)
         .expect("the image center must be selectable");
+    assert_eq!(picked.source, focus);
     let x = (picked.source.x - origin.x) as u8;
     let y = (picked.source.y - origin.y) as u8;
     assert_eq!(picked.rgb, Rgb8::new(x, y, x ^ y));
@@ -720,6 +721,172 @@ fn cached_selection_and_native_result_controls_smoke() {
     let owner_hwnd = owner.0;
     drop(owner);
     assert!(!unsafe { IsWindow(Some(owner_hwnd)) }.as_bool());
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop; briefly displays synthetic magnifier windows without input or desktop sampling"]
+fn edge_freeze_preserves_initial_source_and_standard_window_size() {
+    let _dpi = ScopedPmv2::enter().unwrap();
+    let cursor = cursor_position().unwrap();
+    let monitors = Monitors::enumerate().unwrap();
+    let monitor = monitors.at(cursor).unwrap();
+    let work = monitor.work_area;
+    let center = ScreenPointPx {
+        x: (i64::from(work.left) + i64::from(work.width()) / 2) as i32,
+        y: (i64::from(work.top) + i64::from(work.height()) / 2) as i32,
+    };
+    // These edge positions are inside the pixel area, clear of the footer and
+    // right border. Those surfaces intentionally do not select a source pixel.
+    let edge_x = work.left + 20.min(work.width() / 2) as i32;
+    let edge_y = work.top + 20.min(work.height() / 2) as i32;
+    let mut standard_size = None;
+    for focus in [
+        center,
+        ScreenPointPx {
+            x: edge_x,
+            y: center.y,
+        },
+        ScreenPointPx {
+            x: center.x,
+            y: edge_y,
+        },
+        ScreenPointPx {
+            x: edge_x,
+            y: edge_y,
+        },
+    ] {
+        let mut captures = 0;
+        let appearance = color_picker::app::config::AppearanceConfig {
+            background_transparency_percent: 0,
+            ..Default::default()
+        };
+        let magnifier = MagnifierWindow::capture_with_appearance(
+            focus,
+            monitor.bounds,
+            work,
+            appearance,
+            |rect| {
+                captures += 1;
+                assert_eq!(rect.intersection(monitor.bounds), Some(rect));
+                assert!(rect.contains(focus));
+                assert_eq!(rect.width(), monitor.bounds.width().min(65));
+                assert_eq!(rect.height(), monitor.bounds.height().min(65));
+                let mut bgrx = Vec::with_capacity((rect.width() * rect.height() * 4) as usize);
+                for y in 0..rect.height() {
+                    for x in 0..rect.width() {
+                        let r = (rect.left + x as i32) as u8;
+                        let g = (rect.top + y as i32) as u8;
+                        bgrx.extend_from_slice(&[r ^ g, g, r, 0xff]);
+                    }
+                }
+                Ok(FrozenImage {
+                    origin: ScreenPointPx {
+                        x: rect.left,
+                        y: rect.top,
+                    },
+                    width: rect.width(),
+                    height: rect.height(),
+                    stride_bytes: rect.width() as usize * 4,
+                    bgrx,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(captures, 1, "freeze must use one immutable snapshot");
+        let bounds = magnifier.rect().unwrap();
+        assert_eq!(bounds.intersection(work), Some(bounds));
+        let size = (bounds.width(), bounds.height());
+        assert_eq!(size, *standard_size.get_or_insert(size));
+        let picked = magnifier
+            .hit_test(focus)
+            .expect("initial pixel is selectable");
+        assert_eq!(picked.source, focus);
+        let r = focus.x as u8;
+        let g = focus.y as u8;
+        assert_eq!(picked.rgb, Rgb8::new(r, g, r ^ g));
+        assert_eq!(picked.kind, SampleKind::Frozen);
+        assert_eq!(magnifier.scale_factor(), 4);
+        let hwnd = magnifier.hwnd();
+        let style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+        assert_eq!(
+            style & (WS_EX_TOPMOST | WS_EX_NOACTIVATE).0,
+            (WS_EX_TOPMOST | WS_EX_NOACTIVATE).0
+        );
+        drop(magnifier);
+        assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
+    }
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop; constructs only a hidden magnifier with a failed synthetic capture"]
+fn failed_capture_destroys_the_hidden_magnifier() {
+    use windows::{
+        Win32::{
+            Foundation::E_FAIL,
+            System::Threading::GetCurrentThreadId,
+            UI::WindowsAndMessaging::{EnumThreadWindows, GetClassNameW},
+        },
+        core::{BOOL, Error},
+    };
+
+    unsafe extern "system" fn collect(hwnd: HWND, context: LPARAM) -> BOOL {
+        let windows = unsafe { &mut *(context.0 as *mut Vec<HWND>) };
+        if windows.try_reserve(1).is_err() {
+            return false.into();
+        }
+        windows.push(hwnd);
+        true.into()
+    }
+
+    let magnifiers = || {
+        let mut windows = Vec::<HWND>::new();
+        assert!(
+            unsafe {
+                EnumThreadWindows(
+                    GetCurrentThreadId(),
+                    Some(collect),
+                    LPARAM((&raw mut windows) as isize),
+                )
+            }
+            .as_bool()
+        );
+        windows.retain(|hwnd| {
+            let mut class = [0_u16; 64];
+            let length = unsafe { GetClassNameW(*hwnd, &mut class) } as usize;
+            String::from_utf16_lossy(&class[..length]) == "ColorPicker.Magnifier.v1"
+        });
+        windows
+    };
+    let _dpi = ScopedPmv2::enter().unwrap();
+    let cursor = cursor_position().unwrap();
+    let monitors = Monitors::enumerate().unwrap();
+    let monitor = monitors.at(cursor).unwrap();
+    let before = magnifiers();
+    let mut hidden = None;
+    let outcome = MagnifierWindow::capture_with_appearance(
+        cursor,
+        monitor.bounds,
+        monitor.work_area,
+        Default::default(),
+        |_| {
+            let created: Vec<_> = magnifiers()
+                .into_iter()
+                .filter(|hwnd| !before.contains(hwnd))
+                .collect();
+            assert_eq!(created.len(), 1);
+            let hwnd = created[0];
+            assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
+            let mut rect = RECT::default();
+            unsafe { GetWindowRect(hwnd, &mut rect) }.unwrap();
+            assert_eq!((rect.right - rect.left, rect.bottom - rect.top), (1, 1));
+            hidden = Some(hwnd);
+            Err(Error::new(E_FAIL, "Synthetic capture failure"))
+        },
+    );
+    assert!(outcome.is_err());
+    let hidden = hidden.expect("the freeze operation must reach the capture callback");
+    assert!(!unsafe { IsWindow(Some(hidden)) }.as_bool());
+    assert_eq!(magnifiers(), before);
 }
 
 fn window_text(hwnd: HWND) -> String {

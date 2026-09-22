@@ -32,7 +32,7 @@ use crate::{
     core::{
         color::Rgb8,
         format::{ColorFormat, format_color},
-        geometry::{ScreenPointPx, ScreenRectPx},
+        geometry::{ScreenPointPx, ScreenRectPx, freeze_rect_for_view},
         state::{PickedColor, SampleKind},
         zoom::{CachePoint, FrozenImage, SourcePixel, ZoomScale, ZoomView},
     },
@@ -148,44 +148,82 @@ pub struct MagnifierWindow {
     _thread: PhantomData<Rc<()>>,
 }
 
+/// Holds the hidden window while its real monitor DPI determines capture layout.
+/// An unsuccessful capture drops this owner before any overlay is shown.
+struct PreparedMagnifier {
+    window: MagnifierWindow,
+    bounds: ScreenRectPx,
+    viewport: ScreenRectPx,
+    dpi: u32,
+    capture_excluded: bool,
+    appearance: AppearanceConfig,
+}
+
 impl MagnifierWindow {
     pub fn new(image: FrozenImage, focus: ScreenPointPx, work_area: ScreenRectPx) -> Result<Self> {
         Self::with_appearance(image, focus, work_area, AppearanceConfig::default())
     }
 
     pub fn with_appearance(
-        mut image: FrozenImage,
+        image: FrozenImage,
         focus: ScreenPointPx,
         work_area: ScreenRectPx,
         appearance: AppearanceConfig,
     ) -> Result<Self> {
+        Self::prepare(focus, work_area, appearance)?.show_image(image, focus)
+    }
+
+    /// Lay out the hidden window first, then capture the source pixels needed
+    /// to preserve the original focus under the cursor at the initial 4× scale.
+    pub fn capture_with_appearance(
+        focus: ScreenPointPx,
+        monitor_bounds: ScreenRectPx,
+        work_area: ScreenRectPx,
+        appearance: AppearanceConfig,
+        capture: impl FnOnce(ScreenRectPx) -> Result<FrozenImage>,
+    ) -> Result<Self> {
+        if !monitor_bounds.contains(focus) {
+            return Err(Error::new(
+                E_INVALIDARG,
+                "Freeze focus is outside the monitor",
+            ));
+        }
+        let prepared = Self::prepare(focus, work_area, appearance)?;
+        let rect = freeze_rect_for_view(
+            focus,
+            monitor_bounds,
+            prepared.viewport,
+            ZoomScale::X4.factor(),
+        )
+        .ok_or_else(|| Error::new(E_INVALIDARG, "Could not determine the area to freeze"))?;
+        let image = capture(rect)?;
+        if image.origin
+            != (ScreenPointPx {
+                x: rect.left,
+                y: rect.top,
+            })
+            || image.width != rect.width()
+            || image.height != rect.height()
+        {
+            return Err(Error::new(
+                E_INVALIDARG,
+                "Snapshot does not match the planned capture",
+            ));
+        }
+        prepared.show_image(image, focus)
+    }
+
+    fn prepare(
+        focus: ScreenPointPx,
+        work_area: ScreenRectPx,
+        appearance: AppearanceConfig,
+    ) -> Result<PreparedMagnifier> {
         appearance
             .validate()
             .map_err(|error| Error::new(E_INVALIDARG, error.to_string()))?;
-        image
-            .validate()
-            .map_err(|_| Error::new(E_INVALIDARG, "Invalid frozen image"))?;
-        if image.width > 65 || image.height > 65 || work_area.is_empty() {
-            return Err(Error::new(
-                E_INVALIDARG,
-                "Frozen image/work area is outside the local capture limits",
-            ));
+        if work_area.is_empty() {
+            return Err(Error::new(E_INVALIDARG, "Invalid magnifier work area"));
         }
-        let cache = CachePoint {
-            x: u32::try_from(i64::from(focus.x) - i64::from(image.origin.x))
-                .map_err(|_| Error::new(E_INVALIDARG, "Freeze focus is outside the snapshot"))?,
-            y: u32::try_from(i64::from(focus.y) - i64::from(image.origin.y))
-                .map_err(|_| Error::new(E_INVALIDARG, "Freeze focus is outside the snapshot"))?,
-        };
-        if cache.x >= image.width || cache.y >= image.height {
-            return Err(Error::new(
-                E_INVALIDARG,
-                "Freeze focus is outside the snapshot",
-            ));
-        }
-        // A 32-bit BI_RGB DIB uses width*4 bytes per row. Preserve RGB values
-        // while removing optional caller padding once, before owning the view.
-        compact_rows(&mut image)?;
         let instance = unsafe { GetModuleHandleW(None)? }.into();
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
@@ -250,49 +288,15 @@ impl MagnifierWindow {
                 }
             };
         let dpi = unsafe { GetDpiForWindow(hwnd) };
-        let (bounds, viewport) = window_layout(focus, work_area, dpi, image.width, image.height)?;
-        let view = ZoomView::new(image, viewport, ZoomScale::X4, cache)
-            .map_err(|_| Error::new(E_INVALIDARG, "Could not map the frozen viewport"))?;
-        let surface = Surface::new(
-            bounds.width() as i32,
-            bounds.height() as i32,
+        let (bounds, viewport) = window_layout(focus, work_area, dpi)?;
+        Ok(PreparedMagnifier {
+            window,
+            bounds,
+            viewport,
             dpi,
             capture_excluded,
             appearance,
-        )?;
-        {
-            let mut state = window.state.borrow_mut();
-            state.hover =
-                if inside_uncovered_window(focus, bounds, dpi, appearance.border_width_dip) {
-                    view.hit_test(focus)
-                } else {
-                    None
-                };
-            state.view = Some(view);
-            state.surface = Some(surface);
-            state.bounds = Some(bounds);
-            state.refresh_text();
-        }
-        unsafe {
-            SetWindowPos(
-                hwnd,
-                Some(HWND_TOPMOST),
-                bounds.left,
-                bounds.top,
-                bounds.width() as i32,
-                bounds.height() as i32,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            )?;
-        }
-        window.state.borrow_mut().visible = true;
-        window.invalidate()?;
-        // Frozen has no periodic timer to discover a failed initial paint. Draw
-        // this first frame synchronously, with no state borrow across reentry.
-        if !unsafe { UpdateWindow(hwnd) }.as_bool() {
-            return Err(failure("Could not present the initial frozen frame"));
-        }
-        window.state.borrow_mut().check()?;
-        Ok(window)
+        })
     }
 
     pub fn hwnd(&self) -> HWND {
@@ -404,6 +408,79 @@ impl MagnifierWindow {
     }
 }
 
+impl PreparedMagnifier {
+    fn show_image(self, mut image: FrozenImage, focus: ScreenPointPx) -> Result<MagnifierWindow> {
+        let Self {
+            window,
+            bounds,
+            viewport,
+            dpi,
+            capture_excluded,
+            appearance,
+        } = self;
+        image
+            .validate()
+            .map_err(|_| Error::new(E_INVALIDARG, "Invalid frozen image"))?;
+        if image.width > 65 || image.height > 65 {
+            return Err(Error::new(
+                E_INVALIDARG,
+                "Frozen image exceeds the local capture limits",
+            ));
+        }
+        let cache = CachePoint {
+            x: u32::try_from(i64::from(focus.x) - i64::from(image.origin.x))
+                .map_err(|_| Error::new(E_INVALIDARG, "Freeze focus is outside the snapshot"))?,
+            y: u32::try_from(i64::from(focus.y) - i64::from(image.origin.y))
+                .map_err(|_| Error::new(E_INVALIDARG, "Freeze focus is outside the snapshot"))?,
+        };
+        // A 32-bit BI_RGB DIB uses width*4 bytes per row. Remove caller padding
+        // once before the view owns the unchanged source colors.
+        compact_rows(&mut image)?;
+        let view = ZoomView::new_anchored(image, viewport, ZoomScale::X4, cache, focus)
+            .map_err(|_| Error::new(E_INVALIDARG, "Could not map the frozen viewport"))?;
+        let surface = Surface::new(
+            bounds.width() as i32,
+            bounds.height() as i32,
+            dpi,
+            capture_excluded,
+            appearance,
+        )?;
+        {
+            let mut state = window.state.borrow_mut();
+            state.hover =
+                if inside_uncovered_window(focus, bounds, dpi, appearance.border_width_dip) {
+                    view.hit_test(focus)
+                } else {
+                    None
+                };
+            state.view = Some(view);
+            state.surface = Some(surface);
+            state.bounds = Some(bounds);
+            state.refresh_text();
+        }
+        unsafe {
+            SetWindowPos(
+                window.hwnd,
+                Some(HWND_TOPMOST),
+                bounds.left,
+                bounds.top,
+                bounds.width() as i32,
+                bounds.height() as i32,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )?;
+        }
+        window.state.borrow_mut().visible = true;
+        window.invalidate()?;
+        // Frozen has no periodic timer to discover a failed initial paint.
+        // Present synchronously, without holding a state borrow across reentry.
+        if !unsafe { UpdateWindow(window.hwnd) }.as_bool() {
+            return Err(failure("Could not present the initial frozen frame"));
+        }
+        window.state.borrow_mut().check()?;
+        Ok(window)
+    }
+}
+
 impl Drop for MagnifierWindow {
     fn drop(&mut self) {
         if let Err(error) = unsafe { DestroyWindow(self.hwnd) } {
@@ -417,29 +494,21 @@ fn window_layout(
     focus: ScreenPointPx,
     work: ScreenRectPx,
     dpi: u32,
-    image_width: u32,
-    image_height: u32,
 ) -> Result<(ScreenRectPx, ScreenRectPx)> {
-    if dpi == 0 || dpi > 9600 || work.is_empty() || image_width == 0 || image_height == 0 {
+    if dpi == 0 || dpi > 9600 || work.is_empty() {
         return Err(failure("Invalid magnifier DPI/work area"));
     }
     let initial_scale = i64::from(ZoomScale::X4.factor());
     let cap = i64::from(dip(240, dpi));
-    // Source pixels, unlike the footer, are physical pixels. In particular a
-    // 65×65 image at 4× needs 260×260 px even on a high-DPI display. Keep only
-    // the 32 px minimum needed for a complete cell at the highest zoom when a
-    // caller supplies an unusually narrow image. Round down to whole 4× cells.
-    let axis = |source: u32, available: i64| {
-        (i64::from(source) * initial_scale)
-            .max(i64::from(ZoomScale::X32.factor()))
-            .min(cap)
-            .min(available)
-            / initial_scale
-            * initial_scale
+    // Use the same viewport at the screen center and edges. Only the available
+    // work area can shrink it. The 65 source pixels need at most 260 physical
+    // pixels at 4×, even at high DPI. Round down to complete initial cells.
+    let axis = |available: i64| {
+        (65 * initial_scale).min(cap).min(available) / initial_scale * initial_scale
     };
-    let width = axis(image_width, i64::from(work.width()));
+    let width = axis(i64::from(work.width()));
     let footer = i64::from(footer_height(dpi));
-    let viewport_height = axis(image_height, i64::from(work.height()) - footer);
+    let viewport_height = axis(i64::from(work.height()) - footer);
     if width < 32 || viewport_height < 32 {
         return Err(failure(tr(
             "工作区空间不足，无法显示完整像素格",
@@ -597,8 +666,8 @@ impl Surface {
         }
         let heading_font = OwnedFont::new(13, 600, dpi)?;
         let body_font = OwnedFont::new(10, 400, dpi)?;
-        // Edge-cropped images can be only 132 physical pixels wide even at
-        // high DPI. Compact fonts fit that image; the window never grows.
+        // Small work areas can limit the physical width even at high DPI.
+        // Compact fonts fit the available space without growing the window.
         let compact_font = OwnedFont::new(dip(8, dpi).min(12), 400, 96)?;
         let narrow_font = OwnedFont::new(8, 400, 96)?;
         let frost = if capture_excluded && appearance.background_transparency_percent != 0 {
@@ -856,7 +925,7 @@ impl Surface {
 
     fn footer_swatch_width(&self, footer: &Footer, border: i32) -> Result<i32> {
         // Fill the footer height flush to the left edge. Limit width on narrow
-        // snapshots without shrinking text below the existing smallest font.
+        // work areas without shrinking text below the existing smallest font.
         let hex: Vec<u16> = "#DDDDDD".encode_utf16().collect();
         let text_width = self.text_size(&self.narrow_font, &hex)?.cx
             + self
@@ -1052,11 +1121,16 @@ mod tests {
     use super::*;
 
     fn edge_state(focus: ScreenPointPx, monitor: ScreenRectPx) -> State {
+        edge_state_at_dpi(focus, monitor, 96)
+    }
+
+    fn edge_state_at_dpi(focus: ScreenPointPx, monitor: ScreenRectPx, dpi: u32) -> State {
         let work = ScreenRectPx {
             bottom: monitor.bottom - 40,
             ..monitor
         };
-        let capture = crate::core::geometry::freeze_rect(focus, monitor).unwrap();
+        let (bounds, viewport) = window_layout(focus, work, dpi).unwrap();
+        let capture = freeze_rect_for_view(focus, monitor, viewport, 4).unwrap();
         let mut snapshot = image(capture.width(), capture.height());
         snapshot.origin = ScreenPointPx {
             x: capture.left,
@@ -1073,9 +1147,7 @@ mod tests {
                 ]);
             }
         }
-        let (bounds, viewport) =
-            window_layout(focus, work, 96, snapshot.width, snapshot.height).unwrap();
-        let view = ZoomView::new(
+        let view = ZoomView::new_anchored(
             snapshot,
             viewport,
             ZoomScale::X4,
@@ -1083,12 +1155,13 @@ mod tests {
                 x: (focus.x - capture.left) as u32,
                 y: (focus.y - capture.top) as u32,
             },
+            focus,
         )
         .unwrap();
         let surface = Surface::new(
             bounds.width() as i32,
             bounds.height() as i32,
-            96,
+            dpi,
             false,
             AppearanceConfig {
                 border_width_dip: 2,
@@ -1158,7 +1231,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_highlight_uses_hover_instead_of_the_initial_zoom_anchor() {
+    fn edge_initial_hover_frame_and_footer_match_original_focus_across_dpi() {
         for monitor in [
             ScreenRectPx {
                 left: 0,
@@ -1173,25 +1246,26 @@ mod tests {
                 bottom: 0,
             },
         ] {
-            for (x, y) in [
-                (20, 500),
-                (500, 20),
-                (20, 20),
-                (1900, 20),
-                (20, 1000),
-                (1900, 1000),
-            ] {
-                let focus = ScreenPointPx {
-                    x: monitor.left + x,
-                    y: monitor.top + y,
-                };
-                let state = edge_state(focus, monitor);
-                let hover = state.hover.unwrap();
-                if x == 20 && y == 500 {
-                    assert_eq!(hover.cache.x, 5);
-                    assert_eq!(state.view.as_ref().unwrap().selected().x, 20);
+            for dpi in [96, 120, 144, 168, 192] {
+                let bottom = 1080 - 40 - footer_height(dpi) - 10;
+                for (x, y) in [
+                    (20, 500),
+                    (500, 20),
+                    (20, 20),
+                    (1900, 20),
+                    (20, bottom),
+                    (1900, bottom),
+                ] {
+                    let focus = ScreenPointPx {
+                        x: monitor.left + x,
+                        y: monitor.top + y,
+                    };
+                    let state = edge_state_at_dpi(focus, monitor, dpi);
+                    let hover = state.hover.unwrap();
+                    assert_eq!(hover.source, focus);
+                    assert_eq!(hover.cache, state.view.as_ref().unwrap().selected());
+                    assert_hover_frame(&state, focus);
                 }
-                assert_hover_frame(&state, focus);
             }
         }
     }
@@ -1484,7 +1558,7 @@ mod tests {
         };
         for dpi in [96, 120, 144, 168, 192] {
             let (window, viewport) =
-                window_layout(ScreenPointPx { x: -1199, y: -699 }, work, dpi, 65, 65).unwrap();
+                window_layout(ScreenPointPx { x: -1199, y: -699 }, work, dpi).unwrap();
             assert_eq!(window.intersection(work), Some(window));
             assert_eq!(viewport.width(), viewport.height());
             assert_eq!(viewport.width(), dip(240, dpi).min(260) as u32 / 4 * 4);
@@ -1509,34 +1583,34 @@ mod tests {
                     bottom: 16
                 },
                 96,
-                65,
-                65,
             )
             .is_err()
         );
     }
 
     #[test]
-    fn edge_crops_and_small_work_areas_use_rectangular_complete_cells() {
+    fn edges_keep_the_center_window_size_and_small_work_areas_keep_complete_cells() {
         let work = ScreenRectPx {
             left: -1000,
             top: -800,
             right: 0,
             bottom: 0,
         };
-        let (window, viewport) =
-            window_layout(ScreenPointPx { x: -1, y: -1 }, work, 168, 33, 65).unwrap();
-        assert_eq!(viewport.width(), 132);
+        let (window, viewport) = window_layout(ScreenPointPx { x: -1, y: -1 }, work, 168).unwrap();
+        let (center_window, _) =
+            window_layout(ScreenPointPx { x: -500, y: -400 }, work, 168).unwrap();
+        assert_eq!(viewport.width(), 260);
         assert_eq!(viewport.height(), 260);
         assert_eq!(window.height(), 309);
-        assert_eq!(window.width(), 132);
+        assert_eq!(window.width(), center_window.width());
+        assert_eq!(window.height(), center_window.height());
         assert!(viewport.left <= -1 && viewport.right > -1);
         assert_eq!(window.intersection(work), Some(window));
         let mut view = ZoomView::new(
-            image(33, 65),
+            image(65, 65),
             viewport,
             ZoomScale::X4,
-            CachePoint { x: 16, y: 32 },
+            CachePoint { x: 32, y: 32 },
         )
         .unwrap();
         assert_eq!(
@@ -1574,13 +1648,13 @@ mod tests {
             bottom: 0,
         };
         let (window, viewport) =
-            window_layout(ScreenPointPx { x: -1, y: -1 }, small_work, 96, 65, 65).unwrap();
+            window_layout(ScreenPointPx { x: -1, y: -1 }, small_work, 96).unwrap();
         assert_eq!((viewport.width(), viewport.height()), (116, 72));
         assert_eq!(window.intersection(small_work), Some(window));
     }
 
     #[test]
-    fn tiny_images_keep_one_complete_cell_at_the_highest_scale() {
+    fn tiny_images_keep_complete_cells_inside_the_standard_window() {
         let work = ScreenRectPx {
             left: 0,
             top: 0,
@@ -1588,9 +1662,8 @@ mod tests {
             bottom: 800,
         };
         for size in 1..=7 {
-            let (_, viewport) =
-                window_layout(ScreenPointPx { x: 50, y: 50 }, work, 168, size, 8 - size).unwrap();
-            assert_eq!((viewport.width(), viewport.height()), (32, 32));
+            let (_, viewport) = window_layout(ScreenPointPx { x: 50, y: 50 }, work, 168).unwrap();
+            assert_eq!((viewport.width(), viewport.height()), (260, 260));
             let mut view = ZoomView::new(
                 image(size, 8 - size),
                 viewport,
@@ -1600,9 +1673,16 @@ mod tests {
             .unwrap();
             let anchor = view.cell_center(CachePoint { x: 0, y: 0 }).unwrap();
             view.change_scale(ZoomScale::X32, anchor);
-            assert_eq!(view.drawn_rect(), viewport);
             assert_eq!(
-                view.hit_test(anchor).unwrap().cache,
+                view.drawn_rect().intersection(viewport),
+                Some(view.drawn_rect())
+            );
+            assert_eq!(view.drawn_rect().width(), size * 32);
+            assert_eq!(view.drawn_rect().height(), (8 - size) * 32);
+            assert_eq!(
+                view.hit_test(view.cell_center(CachePoint { x: 0, y: 0 }).unwrap())
+                    .unwrap()
+                    .cache,
                 CachePoint { x: 0, y: 0 }
             );
         }
