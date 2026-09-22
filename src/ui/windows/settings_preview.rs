@@ -17,7 +17,9 @@ use super::super::{
 };
 use crate::app::{config::AppearanceConfig, i18n::tr};
 
-pub(super) const WIDTH: i32 = 396;
+// Fill the widest settings content area (500 DIP minus two 40 DIP insets).
+// Narrower panes crop this generated background while keeping the overlay centered.
+pub(super) const WIDTH: i32 = 420;
 pub(super) const HEIGHT: i32 = 72;
 const OVERLAY_WIDTH: i32 = 168;
 

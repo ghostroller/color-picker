@@ -21,7 +21,7 @@ use windows::{
         },
         System::{
             LibraryLoader::GetModuleHandleW,
-            SystemServices::{SS_NOPREFIX, SS_OWNERDRAW},
+            SystemServices::{SS_CENTERIMAGE, SS_NOPREFIX, SS_OWNERDRAW},
         },
         UI::{
             Controls::{
@@ -51,7 +51,7 @@ use crate::{
             AppearanceConfig, Config, HotkeyConfig, MAX_BACKGROUND_TRANSPARENCY_PERCENT,
             MAX_BORDER_WIDTH_DIP,
         },
-        i18n::{Language, tr},
+        i18n::{Language, language, tr},
     },
     core::format::ColorFormat,
 };
@@ -91,6 +91,7 @@ const PREVIEW_HEADING: usize = 25;
 const APPEARANCE_PREVIEW: usize = 26;
 const PREVIEW_HINT: usize = 27;
 const STATUS: usize = 14;
+const STATUS_DETAILS: usize = 29;
 const CLIENT_WIDTH: i32 = 500;
 const CLIENT_HEIGHT: i32 = 750;
 const KEY_SUBCLASS: usize = 1;
@@ -237,10 +238,11 @@ struct Controls {
     apply: HWND,
     close: HWND,
     status: HWND,
+    status_details: HWND,
 }
 
 impl Controls {
-    fn handles(&self) -> [HWND; 31] {
+    fn handles(&self) -> [HWND; 32] {
         [
             self.title,
             self.subtitle,
@@ -273,6 +275,7 @@ impl Controls {
             self.apply,
             self.close,
             self.status,
+            self.status_details,
         ]
     }
 }
@@ -293,6 +296,7 @@ pub struct SettingsWindow {
     // Resetting its font can leave the native popup scrolled past the first
     // choice on the next opening. Rebuild this font only for DPI changes.
     language_font: RefCell<Option<(u32, Font)>>,
+    rendered_language: Cell<Option<Language>>,
     schema_version: u32,
     save_allowed: bool,
     _thread_affinity: PhantomData<Rc<()>>,
@@ -382,6 +386,7 @@ impl SettingsWindow {
             controls: Controls::default(),
             font: RefCell::new(FontState::default()),
             language_font: RefCell::new(None),
+            rendered_language: Cell::new(None),
             schema_version: config.schema_version,
             save_allowed,
             _thread_affinity: PhantomData,
@@ -452,7 +457,14 @@ impl SettingsWindow {
 
     /// Relabel the existing draft only after the host successfully applies it.
     /// Controls, selections and scroll position stay intact during the switch.
+    /// An unchanged language leaves fonts, preview and layout untouched.
     pub fn refresh_language(&self) -> Result<()> {
+        let current_language = language();
+        if self.rendered_language.get() == Some(current_language) {
+            return Ok(());
+        }
+        // A failed refresh must remain retryable, including after switching back.
+        self.rendered_language.set(None);
         for (hwnd, text) in [
             (
                 self.hwnd,
@@ -535,6 +547,7 @@ impl SettingsWindow {
         self.callback.preview.replace(None);
         self.layout()?;
         self.update_default_style();
+        self.rendered_language.set(Some(current_language));
         Ok(())
     }
 
@@ -577,6 +590,7 @@ impl SettingsWindow {
         let text = wide(text);
         unsafe {
             SetWindowTextW(self.controls.status, PCWSTR(text.as_ptr()))?;
+            SetWindowTextW(self.controls.status_details, PCWSTR(text.as_ptr()))?;
         }
         self.update_status_scrollbar()
     }
@@ -693,7 +707,12 @@ impl SettingsWindow {
         let slider = WS_TABSTOP | WINDOW_STYLE(TBS_NOTICKS);
         self.controls.title = self.control(w!("STATIC"), "", TITLE, label)?;
         self.controls.subtitle = self.control(w!("STATIC"), "", SUBTITLE, label)?;
-        self.controls.language_label = self.control(w!("STATIC"), "", LANGUAGE_LABEL, label)?;
+        self.controls.language_label = self.control(
+            w!("STATIC"),
+            "",
+            LANGUAGE_LABEL,
+            label | WINDOW_STYLE(SS_CENTERIMAGE.0),
+        )?;
         self.controls.language = self.control(w!("COMBOBOX"), "", LANGUAGE, combo)?;
         for language in ["简体中文", "English"] {
             append_choice(self.controls.language, language)?;
@@ -756,10 +775,13 @@ impl SettingsWindow {
         self.controls.preview_hint = self.control(w!("STATIC"), "", PREVIEW_HINT, label)?;
         self.controls.usage_heading = self.control(w!("STATIC"), "", USAGE_HEADING, label)?;
         self.controls.usage_hint = self.control(w!("STATIC"), "", USAGE_HINT, label)?;
-        self.controls.status = self.control(
+        self.controls.status = self.control(w!("STATIC"), "", STATUS, label)?;
+        // Ordinary hints are labels, without selection or a Tab stop. Retain a
+        // scrollable detail view only when a long diagnostic does not fit.
+        self.controls.status_details = self.control(
             w!("EDIT"),
             "",
-            STATUS,
+            STATUS_DETAILS,
             WS_TABSTOP | WINDOW_STYLE((ES_READONLY | ES_MULTILINE | ES_AUTOVSCROLL) as u32),
         )?;
         self.controls.close = self.control(w!("BUTTON"), "", CLOSE, button)?;
@@ -805,7 +827,7 @@ impl SettingsWindow {
 
     fn control(&self, class: PCWSTR, text: &str, id: usize, style: WINDOW_STYLE) -> Result<HWND> {
         let text = wide(text);
-        let footer = matches!(id, APPLY | CLOSE | STATUS);
+        let footer = matches!(id, APPLY | CLOSE | STATUS | STATUS_DETAILS);
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -1131,6 +1153,7 @@ impl SettingsWindow {
                 (self.controls.hint, small.0),
                 (self.controls.usage_hint, small.0),
                 (self.controls.status, small.0),
+                (self.controls.status_details, small.0),
                 (self.controls.preview_heading, small.0),
                 (self.controls.preview_hint, small.0),
             ] {
@@ -1164,8 +1187,17 @@ impl SettingsWindow {
         let viewport = self.callback.viewport.get();
         unsafe { MoveWindow(viewport, 0, 0, client.right, viewport_height, true)? };
         self.callback.viewport_height.set(viewport_height);
-        // Keep a stable scrollbar gutter while measuring responsive content.
-        let content_width = ((i64::from(client.right) * 96) / i64::from(dpi)) as i32 - 20;
+        // Start at the full width so a previously visible scrollbar cannot keep
+        // itself alive through the narrower responsive layout. Reserve space
+        // only when content actually needs scrolling, using the native client.
+        let full_width = ((i64::from(client.right) * 96) / i64::from(dpi)) as i32;
+        let needs_scroll = dip(settings_content_layout(full_width).height, dpi) > viewport_height;
+        let mut viewport_client = RECT::default();
+        unsafe {
+            ShowScrollBar(viewport, SB_VERT, needs_scroll)?;
+            GetClientRect(viewport, &mut viewport_client)?;
+        }
+        let content_width = ((i64::from(viewport_client.right) * 96) / i64::from(dpi)) as i32;
         self.callback.content_width_dip.set(content_width);
         let geometry = settings_content_layout(content_width);
         let content_height = dip(geometry.height, dpi);
@@ -1210,23 +1242,27 @@ impl SettingsWindow {
         let footer_top = panes.actions.top + dip(8, dpi);
         let button_width = dip(92, dpi);
         let gap = dip(12, dpi);
-        let margin = dip(16, dpi);
+        let margin = dip(if content_width >= 460 { 24 } else { 16 }, dpi);
         let apply_x = client.right - margin - button_width;
         let close_x = apply_x - gap - button_width;
         let button_y = footer_top + if narrow { dip(44, dpi) } else { 0 };
+        for status in [self.controls.status, self.controls.status_details] {
+            unsafe {
+                MoveWindow(
+                    status,
+                    margin,
+                    footer_top,
+                    if narrow {
+                        client.right - 2 * margin
+                    } else {
+                        close_x - gap - margin
+                    },
+                    dip(40, dpi),
+                    true,
+                )?;
+            }
+        }
         unsafe {
-            MoveWindow(
-                self.controls.status,
-                margin,
-                footer_top,
-                if narrow {
-                    client.right - 2 * margin
-                } else {
-                    close_x - gap - margin
-                },
-                dip(40, dpi),
-                true,
-            )?;
             MoveWindow(
                 self.controls.close,
                 close_x,
@@ -1258,6 +1294,33 @@ impl SettingsWindow {
                     Some(WPARAM(0)),
                     Some(LPARAM(dip(24, dpi) as isize)),
                 );
+            }
+        }
+        if content_width >= 460 {
+            // The collapsed height belongs to COMBOBOX (including its native
+            // border), not the dropdown height passed to MoveWindow.
+            let mut combo = RECT::default();
+            let mut label = RECT::default();
+            unsafe {
+                GetWindowRect(self.controls.language, &mut combo)?;
+                GetWindowRect(self.controls.language_label, &mut label)?;
+            }
+            let mut origin = POINT {
+                x: label.left,
+                y: combo.top,
+            };
+            unsafe {
+                if !ScreenToClient(viewport, &mut origin).as_bool() {
+                    return Err(Error::from_thread());
+                }
+                MoveWindow(
+                    self.controls.language_label,
+                    origin.x,
+                    origin.y,
+                    label.right - label.left,
+                    combo.bottom - combo.top,
+                    true,
+                )?;
             }
         }
         self.update_status_scrollbar()?;
@@ -1296,21 +1359,29 @@ impl SettingsWindow {
 
     fn update_status_scrollbar(&self) -> Result<()> {
         let line_height = self.font.borrow().small_line_height.max(1);
-        // Measure wrapping at the full width. Long errors can scroll, while the
-        // usual short hint remains a quiet, borderless line without a scrollbar.
+        // Measure wrapping in the hidden edit. Short statuses use a static label;
+        // long diagnostics keep the existing readable, scrollable detail view.
+        let details = self.controls.status_details;
         unsafe {
-            ShowScrollBar(self.controls.status, SB_VERT, false)?;
+            ShowScrollBar(details, SB_VERT, false)?;
         }
         let mut client = RECT::default();
         unsafe {
-            GetClientRect(self.controls.status, &mut client)?;
+            GetClientRect(details, &mut client)?;
         }
-        let lines = unsafe { SendMessageW(self.controls.status, EM_GETLINECOUNT, None, None) }.0;
+        let lines = unsafe { SendMessageW(details, EM_GETLINECOUNT, None, None) }.0;
         let visible_lines = ((client.bottom - client.top) / line_height).max(1);
-        if lines > visible_lines as isize {
-            unsafe {
-                ShowScrollBar(self.controls.status, SB_VERT, true)?;
+        let overflow = lines > visible_lines as isize;
+        unsafe {
+            if !overflow && GetFocus() == details {
+                let _ = SetFocus(Some(self.controls.close));
             }
+            ShowScrollBar(details, SB_VERT, overflow)?;
+            let _ = ShowWindow(details, if overflow { SW_SHOWNA } else { SW_HIDE });
+            let _ = ShowWindow(
+                self.controls.status,
+                if overflow { SW_HIDE } else { SW_SHOWNA },
+            );
         }
         Ok(())
     }
@@ -1364,40 +1435,40 @@ fn settings_content_layout(width: i32) -> SettingsContentLayout {
     };
     if width >= 460 {
         let rows = [
-            (TITLE, 24, 22, 220, 30),
-            (LANGUAGE_LABEL, 252, 29, 72, 24),
-            (LANGUAGE, 326, 22, 130, 28),
-            (SUBTITLE, 24, 58, 432, 20),
-            (10, 40, 100, 396, 24),
+            (TITLE, 24, 22, 220.min(width - 264), 30),
+            (LANGUAGE_LABEL, width - 228, 22, 72, 28),
+            (LANGUAGE, width - 154, 22, 130, 28),
+            (SUBTITLE, 24, 58, width - 48, 20),
+            (10, 40, 100, width - 80, 24),
             (CTRL, 40, 128, 88, 26),
             (ALT, 140, 128, 88, 26),
             (SHIFT, 240, 128, 100, 26),
             (11, 40, 171, 48, 24),
             (KEY, 88, 164, 132, 36),
             (12, 228, 164, 212, 40),
-            (COPY_HEADING, 40, 244, 396, 24),
+            (COPY_HEADING, 40, 244, width - 80, 24),
             (13, 40, 279, 108, 24),
             (FORMAT, 156, 272, 180, 28),
-            (QUICK_PICK, 40, 304, 396, 26),
-            (AUTO_COPY, 40, 334, 396, 26),
-            (APPEARANCE_HEADING, 40, 392, 396, 24),
+            (QUICK_PICK, 40, 304, width - 80, 26),
+            (AUTO_COPY, 40, 334, width - 80, 26),
+            (APPEARANCE_HEADING, 40, 392, width - 80, 24),
             (BORDER_LABEL, 40, 427, 112, 24),
-            (BORDER_WIDTH, 156, 420, 220, 30),
-            (BORDER_VALUE, 388, 427, 56, 24),
+            (BORDER_WIDTH, 156, 420, width - 260, 30),
+            (BORDER_VALUE, width - 92, 427, 56, 24),
             (TRANSPARENCY_LABEL, 40, 463, 112, 24),
-            (BACKGROUND_TRANSPARENCY, 156, 456, 220, 30),
-            (TRANSPARENCY_VALUE, 388, 463, 56, 24),
-            (PREVIEW_HEADING, 40, 494, 396, 20),
+            (BACKGROUND_TRANSPARENCY, 156, 456, width - 260, 30),
+            (TRANSPARENCY_VALUE, width - 92, 463, 56, 24),
+            (PREVIEW_HEADING, 40, 494, width - 80, 20),
             (
                 APPEARANCE_PREVIEW,
                 40,
                 518,
-                settings_preview::WIDTH,
+                width - 80,
                 settings_preview::HEIGHT,
             ),
-            (PREVIEW_HINT, 40, 594, 396, 20),
+            (PREVIEW_HINT, 40, 594, width - 80, 20),
             (USAGE_HEADING, 24, 640, 64, 20),
-            (USAGE_HINT, 96, 640, 360, 40),
+            (USAGE_HINT, 96, 640, width - 120, 40),
         ];
         SettingsContentLayout {
             controls: rows
@@ -1405,9 +1476,9 @@ fn settings_content_layout(width: i32) -> SettingsContentLayout {
                 .map(|(id, x, y, w, h)| (id, rect(x, y, w, h)))
                 .collect(),
             panels: [
-                rect(24, 88, 432, 132),
-                rect(24, 232, 432, 136),
-                rect(24, 380, 432, 248),
+                rect(24, 88, width - 48, 132),
+                rect(24, 232, width - 48, 136),
+                rect(24, 380, width - 48, 248),
             ],
             height: 686,
         }
@@ -1753,7 +1824,7 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                 TITLE => (false, Tone::Text),
                 SUBTITLE | LANGUAGE_LABEL => (false, Tone::Muted),
                 LANGUAGE => (false, Tone::Text),
-                STATUS => (false, state.status_tone.get()),
+                STATUS | STATUS_DETAILS => (false, state.status_tone.get()),
                 10 => (true, Tone::Accent),
                 12 => (
                     true,
@@ -1892,7 +1963,7 @@ mod responsive_layout_tests {
 
     #[test]
     fn settings_content_reflows_without_horizontal_clipping_or_hidden_focus() {
-        for width in [260, 300, 364, 430, 459, 460, 480] {
+        for width in [260, 300, 364, 430, 459, 460, 480, 500] {
             let geometry = settings_content_layout(width);
             assert_eq!(geometry.controls.len(), 28);
             for (id, r) in geometry.controls {
@@ -1922,6 +1993,7 @@ mod responsive_layout_tests {
             }
             for r in geometry.panels {
                 assert!(r.left >= 0 && r.right <= width && r.bottom <= geometry.height);
+                assert_eq!(r.left, width - r.right, "panel margins must be symmetric");
             }
         }
     }
