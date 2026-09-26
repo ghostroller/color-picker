@@ -3,7 +3,8 @@
 本报告对应 [实施计划](unsafe-refactoring-plan-2026-09-27.zh-CN.md) 的 R01—R07 / P0—P7。
 代码、安全边界说明与新增测试已落地；以下状态只覆盖实际记录的构建和执行。
 最终完整 Windows 验证已通过：168 项默认测试、全目标严格 Clippy、MSVC Release、实际 manifest 与应用/夹具 PMv2。
-**基线与完成版本的性能比较仍为 BLOCKED；代码与当前环境验证已交付，不能据此宣称第 14 节全部验收完成。**
+**逐项复核还确认：资源构造失败矩阵和未知通知默认分发链的动态覆盖未补齐，属于本机可继续完成的测试工作。
+基线与完成版本的性能比较仍为 BLOCKED；不能据此宣称第 14 节全部验收完成。**
 
 ## 1. 源码、工作区与环境
 
@@ -33,9 +34,9 @@
 |---|---|---|
 | P0 | 核对 HEAD、未提交修改、环境；运行基础验证，保存基线二进制并尝试原有资源探针；生成生产/测试/示例分开的清单 | 基础验证有实际日志；性能基线 BLOCKED，见第 6 节 |
 | P1 / R01 | `WindowLifetime` 统一跟踪根窗口；root/content 角色分离；稳定 Box 仅由 Rust owner 拥有；根结束后才释放 callback、字体、图标；构造失败走同一清理路径 | 原生树、部分构造、外部先销毁、content 单独结束、fatal 子进程与 BeginPaint 重入测试均已执行 |
-| P2 / R02 | 公共 `gdi.rs` 管理 DC、bitmap、font、brush、pen、paint session 和保存的 DC 状态；旧重复资源 Drop 收敛；`BitmapDc` 管理选择关系和失效 | 构造/选择/恢复失败、双重失败保留、结果/设置字体恢复失败后的换代与析构测试 PASS |
+| P2 / R02 | 公共 `gdi.rs` 管理 DC、bitmap、font、brush、pen、paint session 和保存的 DC 状态；旧重复资源 Drop 收敛；`BitmapDc` 管理选择关系和失效 | 已有 DC/bitmap 构造、选择/恢复失败、双重失败保留、字体恢复失败后的换代与析构测试 PASS；尚未覆盖每一种资源构造失败，见第 7 节 |
 | P3 / R03 | `Dib32Layout` 集中尺寸与长度检查；DIB 存储一次初始化，GdiFlush 成功后才开放短期像素视图；采样与磨砂缓存迁移；冻结临时选择必先恢复 | 无效布局、旧像素拒绝、捕获/同步/分配失败恢复、缓存重试及 DC 复用测试均已执行 |
-| P4 / R04 | 具名 unsafe 消息解码器集中解释 CREATESTRUCTW、DRAWITEMSTRUCT、NMCUSTOMDRAW、DPI RECT；绘图接收类型化引用；DPI 复制成值再排队 | 类型与发送方验证测试 PASS；实际发现并修复 result/settings 默认 `WM_NCCREATE` 链遗漏 |
+| P4 / R04 | 具名 unsafe 消息解码器集中解释 CREATESTRUCTW、DRAWITEMSTRUCT、NMCUSTOMDRAW、DPI RECT；绘图接收类型化引用；DPI 复制成值再排队 | 解码器类型与发送方验证 PASS；已修复默认 `WM_NCCREATE` 链遗漏；未知通知经过实际分发后调用默认过程的动态断言尚缺 |
 | P5 / R05 | 纯算法移至 `ui/pixel_effects.rs` 并禁止 unsafe；仅 `ui::windows` 保留平台 gate；保持整数舍入、BGR 与 X 字节规则 | Windows 上纯算法字节一致性和非法输入测试 PASS；非 Windows 构建 NOT TESTED |
 | P6 / R06 | `ControlSignal` 唯一持有 `OwnedHandle`；线程通过 `JoinHandle::as_handle` 借用；controller 转发 `BorrowedHandle`；host/probe 仅在等待期间转换原始 HANDLE | 4 项事件/线程句柄测试 PASS；controller 保持 `forbid(unsafe_code)`，输入队列和配对协议不变 |
 | P7 / R07 | Cargo 全目标启用 `unsafe_op_in_unsafe_fn` 与 `undocumented_unsafe_blocks` deny；补调用点契约；安全边界文档、统计脚本、资源回归与报告 | 最终完整标准验证 PASS；首次失败与修复后桌面结果分开保留；性能对比仍 BLOCKED |
@@ -269,6 +270,10 @@ cargo test --locked --lib ui::windows::resource_regression::four_hidden_windows_
 
 | 状态 | 场景 | 原因 / 后续所需证据 |
 |---|---|---|
+| NOT TESTED | 第 13.2 节“每个资源构造阶段失败”的完整矩阵 | 现有故障注入覆盖 DesktopDc、bitmap、MemoryDc、SelectObject、SaveDC，但尚无 font/brush/pen、WindowDc 获取、BeginPaint 失败的对应执行断言；需验证部分构造时先前资源的清理与匹配结束调用 |
+| NOT TESTED | DIB 原生分配后 NullStorage 失败的释放次数 | 当前测试验证返回错误，未独立断言该已分配 bitmap 恰好释放一次；需补原生释放事件证据 |
+| NOT TESTED | SaveDC 失败的调用方回退与提前返回恢复顺序 | 当前测试验证保存失败返回 Err；尚缺调用方不改变 DC 状态，以及保存成功后提前返回时按序恢复的定向动态断言 |
+| NOT TESTED | 第 13.2 节未知通知经过实际窗口分发后继续默认处理 | 现有测试直接调用 decoder 并验证 None；result/settings 生产 fallback 已存在，但缺少真实 dispatch/default-chain 的动态断言 |
 | BLOCKED | baseline/final 空闲、Live、Frozen、结果、设置性能比较 | 已有用户实例与未开启 diagnostics；保留基线二进制，需在可安全独立测量的桌面补齐 |
 | NOT TESTED | 非 Windows 的纯算法构建/运行 | 当前只有 Windows 原生执行；源码 gate 已拆分，但未执行非 Windows 工具链；没有启动 Docker |
 | NOT TESTED | 干净 Windows 10、其他干净 Windows 11 环境 | 本轮仅当前 Windows 11；不能外推系统版本兼容性 |
@@ -280,3 +285,9 @@ cargo test --locked --lib ui::windows::resource_regression::four_hidden_windows_
 机器可读的[证据摘要](measurements/unsafe-refactoring-20260927-summary.json)随报告提交，包含完整命令、退出码、日志 SHA256、源码指纹与统计明细。
 本机已执行的最终检查没有剩余 FAIL；历史失败仍保留记录。性能比较和上表环境项继续保留 BLOCKED / NOT TESTED。
 未执行的 ignored 项还包括 onboarding guide、全局热键事务及两项 windows_shell；既有应用与未知热键占用状态使其不适合在本轮直接批量运行。
+
+2026-09-27 二次逐项核对：以上新增测试缺口来自将计划条目与实际测试体逐项对照，
+不是新执行失败或已确认的生产缺陷，也不能归为环境阻塞。特别需要补充 Surface 第二个字体、
+Theme 第二个 brush 等部分构造失败后的清理，以及 SavedDc 调用方回退/提前返回断言。原有 168 / 19 项 PASS 仍对应其实际覆盖范围，
+不能扩展为“第 13.2 节矩阵全部覆盖”。本次只修订核对记录，没有修改生产/测试代码或重跑桌面测试；
+重新核对了实现提交源码指纹、24 份证据文件指纹和交付链接，均匹配。

@@ -765,6 +765,10 @@
     }
   },
   "not_tested": [
+    "Complete resource-construction fault matrix: WindowDc acquisition, font/brush/pen creation and BeginPaint failure cleanup",
+    "Exactly-once bitmap release assertion after DIB NullStorage construction failure",
+    "SaveDC caller fallback without mutation and restoration order on early return after successful save",
+    "Unknown-notification fallback through the actual result/settings message dispatch and default procedure",
     "Windows 10",
     "Non-Windows execution",
     "Actual mixed-DPI/display-change scenarios",
