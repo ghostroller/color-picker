@@ -1,0 +1,776 @@
+{
+  "schema": 1,
+  "start_sha": "1a302eecd4d9954205cabff39186955e1bd6dcd3",
+  "implementation_end_sha": "f5e4eccd81a80f8c8a4896f22e1bd6515361fd2d",
+  "source_sha256_lf_normalized": "e544465a5a4a1b457696a19bbd406581f9f0f9d70d3db4480546d020599c65ba",
+  "environment": {
+    "os": "Windows 11 x64 build 26200.9457, 25H2",
+    "interactive_desktop": true,
+    "rustc": "1.95.0 (59807616e 2026-04-14)",
+    "cargo": "1.95.0 (f2d3ce0bd 2026-03-21)",
+    "target": "x86_64-pc-windows-msvc",
+    "windows_sdk": "10.0.22621.0",
+    "native_execution": true
+  },
+  "baseline_verification": {
+    "status": "PASS",
+    "command": "& ./scripts/verify-windows.ps1",
+    "exit_code": 0,
+    "evidence": {
+      "path": "logs/unsafe-refactoring/baseline-verify.log",
+      "sha256": "7ffb8b326e7b6e4bf52330f3618efcf1a129fac6d81bfb4ac8e86b95d909167f"
+    },
+    "limit": "Baseline log does not preserve detailed test stdout; no baseline test count is claimed."
+  },
+  "final_verification": {
+    "status": "PASS",
+    "command": "& ./scripts/verify-windows.ps1",
+    "exit_code": 0,
+    "default_tests_passed": 168,
+    "default_tests_ignored": 23,
+    "evidence": {
+      "path": "logs/unsafe-refactoring/retest-verify.log",
+      "sha256": "80eb18e48e4b421a59527723ab7d643c5338d98d85a7364991a9c73d94a2a678"
+    }
+  },
+  "desktop_regressions": [
+    {
+      "target": "windows_capture",
+      "filter": "screen_sampler_matches_known_pixels_and_releases_gdi_objects",
+      "command": "cargo test --locked --test windows_capture screen_sampler_matches_known_pixels_and_releases_gdi_objects -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-windows_capture-screen_sampler_matches_known_pixels_and_releases_gdi_objects.log",
+        "sha256": "5d38717b5ec5f357585b7f901bc72714e34f708cae052ad3648beeee4f186d3e"
+      }
+    },
+    {
+      "target": "windows_preview",
+      "filter": "preview_nonactivating_updates_and_resource_lifecycle",
+      "command": "cargo test --locked --test windows_preview preview_nonactivating_updates_and_resource_lifecycle -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-windows_preview-preview_nonactivating_updates_and_resource_lifecycle.log",
+        "sha256": "ff32fce9bd7746e5674385661ffad513ef3f1a56f9a4188fcaf9ac8e24eaa0be"
+      }
+    },
+    {
+      "target": "windows_preview",
+      "filter": "hiding_an_intersecting_preview_restores_exact_underlying_sampling",
+      "command": "cargo test --locked --test windows_preview hiding_an_intersecting_preview_restores_exact_underlying_sampling -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-windows_preview-hiding_an_intersecting_preview_restores_exact_underlying_sampling.log",
+        "sha256": "6fb007520fa067ea8b8d6908669fd2d1e119b821977ba9c92e949367b16b8d2d"
+      }
+    },
+    {
+      "target": "windows_selection_ui",
+      "filter": "cached_selection_and_native_result_controls_smoke",
+      "command": "cargo test --locked --test windows_selection_ui cached_selection_and_native_result_controls_smoke -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-windows_selection_ui-cached_selection_and_native_result_controls_smoke.log",
+        "sha256": "ccb9db5e601dee0f5dbe4c3b2ec051fe03b26a6b4a5e231a2fedfa293e43f921"
+      }
+    },
+    {
+      "target": "windows_selection_ui",
+      "filter": "edge_freeze_preserves_initial_source_and_standard_window_size",
+      "command": "cargo test --locked --test windows_selection_ui edge_freeze_preserves_initial_source_and_standard_window_size -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-windows_selection_ui-edge_freeze_preserves_initial_source_and_standard_window_size.log",
+        "sha256": "373f1d62ddaec89264eca306ac3fb25900697c68c70a04fa3f5a5dc4d14d496e"
+      }
+    },
+    {
+      "target": "windows_selection_ui",
+      "filter": "failed_capture_destroys_the_hidden_magnifier",
+      "command": "cargo test --locked --test windows_selection_ui failed_capture_destroys_the_hidden_magnifier -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-windows_selection_ui-failed_capture_destroys_the_hidden_magnifier.log",
+        "sha256": "63205c4a4f1357abd06afc64d5e3aac95d475ed5fb1b6b9f1ce87944a190589e"
+      }
+    },
+    {
+      "target": "windows_settings_refresh",
+      "filter": "unchanged_language_refresh_preserves_fonts_and_leaves_content_untouched",
+      "command": "cargo test --locked --test windows_settings_refresh unchanged_language_refresh_preserves_fonts_and_leaves_content_untouched -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-windows_settings_refresh-unchanged_language_refresh_preserves_fonts_and_leaves_content_untouched.log",
+        "sha256": "9d0f47472d95c5bebd643d2544331e86d8dc81022ea5d460761152cb83c3a43c"
+      }
+    },
+    {
+      "target": "windows_settings_layout",
+      "filter": "settings_header_and_content_recover_after_scrollbar_reflow",
+      "command": "cargo test --locked --test windows_settings_layout settings_header_and_content_recover_after_scrollbar_reflow -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-windows_settings_layout-settings_header_and_content_recover_after_scrollbar_reflow.log",
+        "sha256": "1c035a1b931e664be20b512fcd7f4b9885e0e7331c4105e633df36d6e25fa5f8"
+      }
+    },
+    {
+      "target": "windows_language_dropdown",
+      "filter": "language_choices_are_visible_on_the_first_open_after_applying",
+      "command": "cargo test --locked --test windows_language_dropdown language_choices_are_visible_on_the_first_open_after_applying -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-windows_language_dropdown-language_choices_are_visible_on_the_first_open_after_applying.log",
+        "sha256": "21df5100eea690e55236da6901b39b95cb158a1c14b4aedcb5b2dc29078bac30"
+      }
+    },
+    {
+      "target": "lib",
+      "filter": "ui::windows::result::tests::small_result_viewport_keeps_actions_visible_and_reveals_focused_rows",
+      "command": "cargo test --locked --lib ui::windows::result::tests::small_result_viewport_keeps_actions_visible_and_reveals_focused_rows -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-result-small_result_viewport_keeps_actions_visible_and_reveals_focused_rows.log",
+        "sha256": "26a88607e6bb45888ff55a04ad5f34babc1043ae05b26aeffe5ba8228c470fd1"
+      }
+    },
+    {
+      "target": "lib",
+      "filter": "ui::windows::result::tests::feedback_reveals_footer_and_keeps_it_inside_the_work_area",
+      "command": "cargo test --locked --lib ui::windows::result::tests::feedback_reveals_footer_and_keeps_it_inside_the_work_area -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-result-feedback_reveals_footer_and_keeps_it_inside_the_work_area.log",
+        "sha256": "00646b7955c64dad69a885606ea5c85722e04ba6251c022f743995c58464998d"
+      }
+    },
+    {
+      "target": "lib",
+      "filter": "ui::windows::result::tests::failed_host_copy_opens_manual_result_and_later_success_keeps_it_open",
+      "command": "cargo test --locked --lib ui::windows::result::tests::failed_host_copy_opens_manual_result_and_later_success_keeps_it_open -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-result-failed_host_copy_opens_manual_result_and_later_success_keeps_it_open.log",
+        "sha256": "b4c933ee3f02231b174d18e1262095e1d73ae6972d1ae5379f922990a22f8d2c"
+      }
+    },
+    {
+      "target": "lib",
+      "filter": "ui::windows::result::tests::quick_copy_success_keeps_focus_and_queues_cleanup_without_showing",
+      "command": "cargo test --locked --lib ui::windows::result::tests::quick_copy_success_keeps_focus_and_queues_cleanup_without_showing -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-result-quick_copy_success_keeps_focus_and_queues_cleanup_without_showing.log",
+        "sha256": "2bc98d69708e71500608917135f461de0c91a69e7e8877fdbd2f53012dece892"
+      }
+    },
+    {
+      "target": "lib",
+      "filter": "ui::windows::result::tests::quick_copy_retries_hidden_then_reveals_failure_for_manual_recovery",
+      "command": "cargo test --locked --lib ui::windows::result::tests::quick_copy_retries_hidden_then_reveals_failure_for_manual_recovery -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-result-quick_copy_retries_hidden_then_reveals_failure_for_manual_recovery.log",
+        "sha256": "13a6cb1900aa2dffcbcb57de3fb69367532af1f362e8bb5afc2ee0b215b2b9cd"
+      }
+    },
+    {
+      "target": "lib",
+      "filter": "ui::windows::result::tests::quick_copy_non_busy_failure_reveals_result_immediately",
+      "command": "cargo test --locked --lib ui::windows::result::tests::quick_copy_non_busy_failure_reveals_result_immediately -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-result-quick_copy_non_busy_failure_reveals_result_immediately.log",
+        "sha256": "b3bec47bec3cd05f17814497b80c35c38606376ee41b1387e6887888d65ac4c6"
+      }
+    },
+    {
+      "target": "lib",
+      "filter": "ui::windows::result::tests::copy_feedback_preserves_layout_and_rejects_old_reset_timers",
+      "command": "cargo test --locked --lib ui::windows::result::tests::copy_feedback_preserves_layout_and_rejects_old_reset_timers -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-result-copy_feedback_preserves_layout_and_rejects_old_reset_timers.log",
+        "sha256": "8a07345bab2b2274efe4028658481236c542e7728046a77a7dc5c2b656281fd9"
+      }
+    },
+    {
+      "target": "lib",
+      "filter": "ui::windows::result::tests::english_result_labels_and_copy_feedback_fit_without_resizing",
+      "command": "cargo test --locked --lib ui::windows::result::tests::english_result_labels_and_copy_feedback_fit_without_resizing -- --ignored --exact --test-threads=1 --nocapture",
+      "exit": 0,
+      "status": "PASS",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-desktop-result-english_result_labels_and_copy_feedback_fit_without_resizing.log",
+        "sha256": "7a78dae70a3656f6e131ec679eebf495c6b61bb23e6ce643668d54f44e5cd551"
+      }
+    }
+  ],
+  "additional_desktop_checks": [
+    {
+      "name": "host-settings",
+      "status": "PASS",
+      "exit_code": 0,
+      "command": "cargo test --locked --lib platform::windows::host::tests::blocked_pick_restores_settings_and_explains_without_applying -- --ignored --exact --test-threads=1 --nocapture",
+      "evidence": {
+        "path": "logs/unsafe-refactoring/retest-host-settings.log",
+        "sha256": "3321d9a9491e76263640aa3a064324b316ce09c623babcc5a25e3bf3ce227206"
+      }
+    }
+  ],
+  "native_resource_regression": {
+    "status": "PASS",
+    "command": "cargo test --locked --lib ui::windows::resource_regression::four_hidden_windows_and_surfaces_plateau_after_warmup -- --ignored --exact --test-threads=1 --nocapture",
+    "exit_code": 0,
+    "measurement": "RESOURCE_REGRESSION warmup10=Counts { handles: 207, gdi: 15, user: 4 } group25=Counts { handles: 207, gdi: 15, user: 4 } group50=Counts { handles: 207, gdi: 15, user: 4 }",
+    "evidence": {
+      "path": "logs/unsafe-refactoring/retest-resource-regression.log",
+      "sha256": "289aae4530b2d7e9b49c9e1f21c1207d4612d35e2e69918a24212960701c1809"
+    },
+    "limit": "Current test process; hidden fixtures; not a baseline-versus-final application performance result."
+  },
+  "performance_comparison": {
+    "status": "BLOCKED",
+    "baseline": {
+      "scope": "Baseline native measurements attempted before runtime migration. New GDI/lifetime modules compiled but unused by probe. Existing user application preserved.",
+      "source_sha": "1a302eecd4d9954205cabff39186955e1bd6dcd3",
+      "build_command": "cargo build --release --locked --target x86_64-pc-windows-msvc --example resource-probe",
+      "baseline_app_sha256": "C2ACF805C143EF59778A9B146C07229FA461CF63ECAB2D14C9481C4DFD44BFA6",
+      "baseline_probe_sha256": "5B8DD0B384AD1D82D28935D353EB06F1E1C0D73941E8139708238F0EFF5043FC",
+      "probe_command": "resource-probe.exe --cycles 100 --idle-seconds 10 --output NEW_FILE.json",
+      "passive_command": "scripts/measure-passive-app.ps1 -ProcessId EXISTING_PID -Label baseline-existing-idle -ExpectedState 0 -Seconds 10 -OutputPath NEW_FILE.json",
+      "attempts": [
+        {
+          "file": "baseline-probe-attempt-1.json",
+          "sha256": "A26F12D497E563DB1607B894AD64F035E46E258D7C8F96D9F93F56EE2C2B901C",
+          "exit_code": 1,
+          "status": "NOT_COMPLETED",
+          "error": "拒绝访问。 (0x80070005)"
+        },
+        {
+          "file": "baseline-probe-attempt-2.json",
+          "sha256": "2BF35629A5DC5DE7B0BB62D2AC927E649DB379DC2F7CE842A194B2799D19AE8B",
+          "exit_code": 1,
+          "status": "NOT_COMPLETED",
+          "error": "An existing color-picker instance is running. Exit it through its tray menu before this probe."
+        },
+        {
+          "file": "baseline-existing-passive-attempt.json",
+          "sha256": "CF6F1E2932ECBD13A3E316E3E6CDDFDD4A3C04EB8B19AB617F4EA97E15E24105",
+          "exit_code": 1,
+          "status": "NOT_COMPLETED",
+          "error": "Exception calling \"OpenQueryHandle\" with \"1\" argument(s): \"拒绝访问。\""
+        },
+        {
+          "file": "baseline-existing-passive-attempt-2.json",
+          "sha256": "62E8B2EF420808AA759B635AB454265C7D50EFEC3B08B5F549846BA2E48409A5",
+          "exit_code": 1,
+          "status": "NOT_COMPLETED",
+          "error": "Diagnostics are disabled or the application is not ready."
+        }
+      ],
+      "result": "BLOCKED",
+      "reason": "Sandbox cannot access the interactive desktop; native execution is blocked by an existing user-owned single instance, whose diagnostics are disabled. No user process was terminated or configuration changed.",
+      "baseline_probe_1_cold_idle": {
+        "before": {
+          "working_set_bytes": 10694656,
+          "private_commit_bytes": 1642496,
+          "thread_count": 4,
+          "handle_count": 129,
+          "gdi_objects": 0,
+          "user_objects": 3,
+          "process_kernel_100ns": 1250000,
+          "process_user_100ns": 156250,
+          "controller_idle": true,
+          "active_timer_id": 0,
+          "input_worker_attached": false
+        },
+        "after": {
+          "working_set_bytes": 10698752,
+          "private_commit_bytes": 1642496,
+          "thread_count": 4,
+          "handle_count": 129,
+          "gdi_objects": 0,
+          "user_objects": 3,
+          "process_kernel_100ns": 1875000,
+          "process_user_100ns": 781250,
+          "controller_idle": true,
+          "active_timer_id": 0,
+          "input_worker_attached": false
+        },
+        "wall_ms": 10003.8996,
+        "cpu_kernel_ms": 0.0,
+        "cpu_user_ms": 0.0,
+        "cpu_percent_of_one_core": 0.0
+      },
+      "not_tested": [
+        "Repeated Live startup/cancel groups",
+        "Frozen/Result/Settings stationary resource and CPU measurements",
+        "Baseline-versus-final latency/resource regression comparison"
+      ]
+    },
+    "final_command": "resource-probe.exe --cycles 100 --idle-seconds 10 --output logs/measurements/unsafe-refactor-20260927/final-probe-attempt.json",
+    "final_exit_code": 1,
+    "final_probe_sha256": "90C669BC6B22776FE4DC97B87AE74FC6FCDBBFD77FE7A6C3622F274ABF1902CA",
+    "final": {
+      "schema_version": 1,
+      "status": "NOT_COMPLETED",
+      "error": "An existing color-picker instance is running. Exit it through its tray menu before this probe.",
+      "cleanup_error": null,
+      "cleanup_completed": true,
+      "package_version": "0.2.5",
+      "pinned_toolchain": "[toolchain]\nchannel = \"1.95.0\"\nprofile = \"minimal\"\ncomponents = [\"rustfmt\", \"clippy\"]",
+      "executable": "D:\\Workspace\\color-picker\\target\\x86_64-pc-windows-msvc\\release\\examples\\resource-probe.exe",
+      "architecture": "x86_64",
+      "debug_assertions": false,
+      "started_unix_ms": 1790443462019,
+      "elapsed_ms": 0.1228,
+      "parameters": {
+        "cycles": 100,
+        "warmup_cycles": 20,
+        "idle_seconds": 10
+      },
+      "scope": "This-process, this-machine controlled start -> one Live preview frame -> cancel -> joined Idle. Includes measurement-harness overhead; no tray or registered hotkey.",
+      "not_measured": [
+        "physical input gesture correctness or hotkey event delivery",
+        "frozen magnifier idle resources or freeze latency",
+        "result/settings windows and clipboard copy flows",
+        "actual on-screen presentation latency or universal performance guarantees",
+        "complete 1000-use workflow or clean-machine deployment acceptance"
+      ],
+      "warmup_completed": 0,
+      "cycles_completed": 0,
+      "cold_idle": null,
+      "after_warmup": null,
+      "checkpoints": [],
+      "used_idle": null,
+      "activation": {
+        "definition": "Elapsed from PreviewController::start to its first successful Live sample and synchronous preview UpdateWindow submission; nearest-rank percentiles, excluding warmup. Not input-to-visible-screen latency.",
+        "sample_count": 0,
+        "p50_ms": null,
+        "p95_ms": null,
+        "samples_ms": []
+      }
+    },
+    "final_evidence": {
+      "path": "logs/measurements/unsafe-refactor-20260927/final-probe-attempt.json",
+      "sha256": "f74260846894d939f35ff77d9c75db112a796acef25d6627f950dea1fd235baf"
+    },
+    "limit": "Existing user application was preserved. No completed baseline/final Live, Frozen, Result, Settings comparison."
+  },
+  "metrics": {
+    "method": "Reproducible lexical unsafe-boundary inventory; this is NOT a Rust AST audit.\n\nCompare a local Git revision with the working tree without checking out files.\nComments/strings count in the rg-compatible lexical figures. A small tokenizer\nmasks comments and Rust string/character literals only for structural ranges and\nthe separate code-token figure. Exact #[cfg(test)]/#[test] items and statements\nare classified as source tests; #[cfg(test)] external modules inherit that class.\nNo macro expansion, general cfg evaluation, type resolution, or safety scoring.\n",
+    "owner_method": "Explicit type-name roles: {'ScreenDc': 'desktop_dc', 'DesktopDc': 'desktop_dc', 'WindowDc': 'window_dc', 'MemoryDc': 'memory_dc', 'OwnedBitmap': 'bitmap', 'OwnedFont': 'font', 'Font': 'font', 'FrostedPanel': 'combined_backdrop_dc_bitmap'}; excludes selection/composition guards, paint sessions, brushes/pens and non-GDI owners.",
+    "message_method": "LPARAM variable lparam/payload .0 cast to named UI or hook payload types; excludes scalar HWND/HDC casts, userdata retrieval, and second-level WindowInit casts.",
+    "tool": "scripts/unsafe-audit.py 1.0",
+    "evidence": {
+      "path": "logs/unsafe-refactoring/unsafe-audit-final.json",
+      "sha256": "789bc9fc40b6c983b81c4aee5dbfa061e10b24bd80d717b9dc98b54ebb49a78c"
+    },
+    "baseline": {
+      "totals": {
+        "src_production": {
+          "lexical_unsafe_lines": 476,
+          "lexical_unsafe_occurrences": 477,
+          "code_unsafe_tokens": 477
+        },
+        "src_test": {
+          "lexical_unsafe_lines": 63,
+          "lexical_unsafe_occurrences": 63,
+          "code_unsafe_tokens": 63
+        },
+        "integration_tests": {
+          "lexical_unsafe_lines": 246,
+          "lexical_unsafe_occurrences": 246,
+          "code_unsafe_tokens": 246
+        },
+        "examples": {
+          "lexical_unsafe_lines": 53,
+          "lexical_unsafe_occurrences": 53,
+          "code_unsafe_tokens": 53
+        },
+        "build_script": {
+          "lexical_unsafe_lines": 0,
+          "lexical_unsafe_occurrences": 0,
+          "code_unsafe_tokens": 0
+        }
+      },
+      "production_owner_drop_count": 12,
+      "production_duplicate_owner_drops_beyond_first_per_role": 7,
+      "owner_drop_sites": [
+        {
+          "file": "src/platform/windows/capture.rs",
+          "line": 334,
+          "group": "src_production",
+          "type": "ScreenDc",
+          "role": "desktop_dc"
+        },
+        {
+          "file": "src/platform/windows/capture.rs",
+          "line": 356,
+          "group": "src_production",
+          "type": "MemoryDc",
+          "role": "memory_dc"
+        },
+        {
+          "file": "src/platform/windows/capture.rs",
+          "line": 364,
+          "group": "src_production",
+          "type": "OwnedBitmap",
+          "role": "bitmap"
+        },
+        {
+          "file": "src/ui/windows/drawing.rs",
+          "line": 49,
+          "group": "src_production",
+          "type": "MemoryDc",
+          "role": "memory_dc"
+        },
+        {
+          "file": "src/ui/windows/drawing.rs",
+          "line": 57,
+          "group": "src_production",
+          "type": "OwnedBitmap",
+          "role": "bitmap"
+        },
+        {
+          "file": "src/ui/windows/drawing.rs",
+          "line": 114,
+          "group": "src_production",
+          "type": "OwnedFont",
+          "role": "font"
+        },
+        {
+          "file": "src/ui/windows/drawing.rs",
+          "line": 122,
+          "group": "src_production",
+          "type": "ScreenDc",
+          "role": "desktop_dc"
+        },
+        {
+          "file": "src/ui/windows/frost.rs",
+          "line": 170,
+          "group": "src_production",
+          "type": "FrostedPanel",
+          "role": "combined_backdrop_dc_bitmap"
+        },
+        {
+          "file": "src/ui/windows/magnifier.rs",
+          "line": 618,
+          "group": "src_production",
+          "type": "MemoryDc",
+          "role": "memory_dc"
+        },
+        {
+          "file": "src/ui/windows/magnifier.rs",
+          "line": 624,
+          "group": "src_production",
+          "type": "OwnedBitmap",
+          "role": "bitmap"
+        },
+        {
+          "file": "src/ui/windows/magnifier.rs",
+          "line": 630,
+          "group": "src_production",
+          "type": "ScreenDc",
+          "role": "desktop_dc"
+        },
+        {
+          "file": "src/ui/windows/theme.rs",
+          "line": 201,
+          "group": "src_production",
+          "type": "Font",
+          "role": "font"
+        }
+      ],
+      "native_message_decode_sites": [
+        {
+          "file": "src/ui/windows/magnifier.rs",
+          "line": 577,
+          "group": "src_production",
+          "type": "CREATESTRUCTW"
+        },
+        {
+          "file": "src/ui/windows/preview.rs",
+          "line": 330,
+          "group": "src_production",
+          "type": "CREATESTRUCTW"
+        },
+        {
+          "file": "src/ui/windows/result.rs",
+          "line": 1389,
+          "group": "src_production",
+          "type": "NMHDR"
+        },
+        {
+          "file": "src/ui/windows/result.rs",
+          "line": 1393,
+          "group": "src_production",
+          "type": "NMCUSTOMDRAW"
+        },
+        {
+          "file": "src/ui/windows/result.rs",
+          "line": 1476,
+          "group": "src_production",
+          "type": "DRAWITEMSTRUCT"
+        },
+        {
+          "file": "src/ui/windows/result.rs",
+          "line": 1525,
+          "group": "src_production",
+          "type": "CREATESTRUCTW"
+        },
+        {
+          "file": "src/ui/windows/result.rs",
+          "line": 1613,
+          "group": "src_production",
+          "type": "RECT"
+        },
+        {
+          "file": "src/ui/windows/settings.rs",
+          "line": 1800,
+          "group": "src_production",
+          "type": "CREATESTRUCTW"
+        },
+        {
+          "file": "src/ui/windows/settings.rs",
+          "line": 1850,
+          "group": "src_production",
+          "type": "DRAWITEMSTRUCT"
+        },
+        {
+          "file": "src/ui/windows/settings.rs",
+          "line": 1929,
+          "group": "src_production",
+          "type": "RECT"
+        },
+        {
+          "file": "src/ui/windows/theme.rs",
+          "line": 221,
+          "group": "src_production",
+          "type": "NMHDR"
+        },
+        {
+          "file": "src/ui/windows/theme.rs",
+          "line": 234,
+          "group": "src_production",
+          "type": "NMCUSTOMDRAW"
+        },
+        {
+          "file": "tests/support/pixel_fixture.rs",
+          "line": 282,
+          "group": "integration_tests",
+          "type": "CREATESTRUCTW"
+        }
+      ],
+      "hook_payload_decode_sites": [
+        {
+          "file": "src/platform/windows/input.rs",
+          "line": 710,
+          "group": "src_production",
+          "type": "MSLLHOOKSTRUCT"
+        },
+        {
+          "file": "src/platform/windows/input.rs",
+          "line": 797,
+          "group": "src_production",
+          "type": "KBDLLHOOKSTRUCT"
+        }
+      ],
+      "raw_slice_sites": [
+        {
+          "file": "examples/ui-preview.rs",
+          "line": 414,
+          "group": "examples",
+          "function": "from_raw_parts"
+        },
+        {
+          "file": "src/platform/windows/capture.rs",
+          "line": 281,
+          "group": "src_production",
+          "function": "from_raw_parts"
+        },
+        {
+          "file": "src/ui/windows/frost.rs",
+          "line": 141,
+          "group": "src_production",
+          "function": "from_raw_parts_mut"
+        }
+      ]
+    },
+    "current": {
+      "totals": {
+        "src_production": {
+          "lexical_unsafe_lines": 484,
+          "lexical_unsafe_occurrences": 485,
+          "code_unsafe_tokens": 485
+        },
+        "src_test": {
+          "lexical_unsafe_lines": 143,
+          "lexical_unsafe_occurrences": 143,
+          "code_unsafe_tokens": 143
+        },
+        "integration_tests": {
+          "lexical_unsafe_lines": 250,
+          "lexical_unsafe_occurrences": 250,
+          "code_unsafe_tokens": 250
+        },
+        "examples": {
+          "lexical_unsafe_lines": 54,
+          "lexical_unsafe_occurrences": 54,
+          "code_unsafe_tokens": 54
+        },
+        "build_script": {
+          "lexical_unsafe_lines": 0,
+          "lexical_unsafe_occurrences": 0,
+          "code_unsafe_tokens": 0
+        }
+      },
+      "production_owner_drop_count": 5,
+      "production_duplicate_owner_drops_beyond_first_per_role": 0,
+      "owner_drop_sites": [
+        {
+          "file": "src/platform/windows/gdi.rs",
+          "line": 147,
+          "group": "src_production",
+          "type": "DesktopDc",
+          "role": "desktop_dc"
+        },
+        {
+          "file": "src/platform/windows/gdi.rs",
+          "line": 184,
+          "group": "src_production",
+          "type": "WindowDc",
+          "role": "window_dc"
+        },
+        {
+          "file": "src/platform/windows/gdi.rs",
+          "line": 230,
+          "group": "src_production",
+          "type": "MemoryDc",
+          "role": "memory_dc"
+        },
+        {
+          "file": "src/platform/windows/gdi.rs",
+          "line": 269,
+          "group": "src_production",
+          "type": "OwnedBitmap",
+          "role": "bitmap"
+        },
+        {
+          "file": "src/platform/windows/gdi.rs",
+          "line": 310,
+          "group": "src_production",
+          "type": "OwnedFont",
+          "role": "font"
+        }
+      ],
+      "native_message_decode_sites": [
+        {
+          "file": "src/ui/windows/messages.rs",
+          "line": 23,
+          "group": "src_production",
+          "type": "CREATESTRUCTW"
+        },
+        {
+          "file": "src/ui/windows/messages.rs",
+          "line": 37,
+          "group": "src_production",
+          "type": "RECT"
+        },
+        {
+          "file": "src/ui/windows/messages.rs",
+          "line": 50,
+          "group": "src_production",
+          "type": "DRAWITEMSTRUCT"
+        },
+        {
+          "file": "src/ui/windows/messages.rs",
+          "line": 71,
+          "group": "src_production",
+          "type": "NMHDR"
+        },
+        {
+          "file": "src/ui/windows/messages.rs",
+          "line": 91,
+          "group": "src_production",
+          "type": "NMCUSTOMDRAW"
+        },
+        {
+          "file": "tests/support/pixel_fixture.rs",
+          "line": 324,
+          "group": "integration_tests",
+          "type": "CREATESTRUCTW"
+        }
+      ],
+      "hook_payload_decode_sites": [
+        {
+          "file": "src/platform/windows/input.rs",
+          "line": 861,
+          "group": "src_production",
+          "type": "MSLLHOOKSTRUCT"
+        },
+        {
+          "file": "src/platform/windows/input.rs",
+          "line": 962,
+          "group": "src_production",
+          "type": "KBDLLHOOKSTRUCT"
+        }
+      ],
+      "raw_slice_sites": [
+        {
+          "file": "examples/ui-preview.rs",
+          "line": 460,
+          "group": "examples",
+          "function": "from_raw_parts"
+        },
+        {
+          "file": "src/platform/windows/dib.rs",
+          "line": 150,
+          "group": "src_production",
+          "function": "from_raw_parts"
+        },
+        {
+          "file": "src/platform/windows/dib.rs",
+          "line": 162,
+          "group": "src_production",
+          "function": "from_raw_parts_mut"
+        }
+      ]
+    }
+  },
+  "historical_failure": {
+    "status": "FAIL",
+    "later_fixed": true,
+    "scenario": "English result title empty because WM_NCCREATE default chain was omitted.",
+    "evidence": {
+      "path": "logs/unsafe-refactoring/desktop-result-english_result_labels_and_copy_feedback_fit_without_resizing.log",
+      "sha256": "d2f4bf6e1b20fa3f69e7d8a232ee646abaa015580c82bbec61d6216929fa0eba"
+    }
+  },
+  "not_tested": [
+    "Windows 10",
+    "Non-Windows execution",
+    "Actual mixed-DPI/display-change scenarios",
+    "Live clipboard transfer and physical mouse/keyboard gestures",
+    "Onboarding guide desktop smoke",
+    "Global hotkey transaction desktop test",
+    "Existing-instance shell tests"
+  ]
+}
