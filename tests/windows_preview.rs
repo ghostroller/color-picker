@@ -55,10 +55,14 @@ fn preview_nonactivating_updates_and_resource_lifecycle() {
         .at(point)
         .expect("cursor must be on an actual monitor")
         .work_area;
+    // SAFETY: Read the foreground HWND by value for comparison only; the test never takes
+    // ownership of it.
     let foreground = unsafe { GetForegroundWindow() };
 
     {
         let preview = PreviewWindow::new().expect("create nonactivating preview");
+        // SAFETY: Query visibility on the fixture HWND without dereferencing or
+        // retaining any native pointer.
         assert!(!unsafe { IsWindowVisible(preview.hwnd()) }.as_bool());
         assert!(preview.update(point, Some(FIRST_COLOR), work_area).unwrap());
         paint(&preview);
@@ -66,16 +70,22 @@ fn preview_nonactivating_updates_and_resource_lifecycle() {
         assert_foreground(foreground);
 
         let required = WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW;
+        // SAFETY: Query scalar window style bits for the test-owned live HWND; no
+        // callback pointer is interpreted.
         let extended_style = unsafe { GetWindowLongW(preview.hwnd(), GWL_EXSTYLE) } as u32;
         assert_eq!(extended_style & required.0, required.0);
         assert_ne!(extended_style & WS_EX_TOPMOST.0, 0);
         assert_ne!(
+            // SAFETY: Query scalar window style bits for the test-owned live HWND;
+            // no callback pointer is interpreted.
             unsafe { GetWindowLongW(preview.hwnd(), GWL_STYLE) } as u32 & WS_POPUP.0,
             0
         );
 
         assert!(!preview.update(point, Some(FIRST_COLOR), work_area).unwrap());
         assert!(
+            // SAFETY: Inspect the live preview update region with no output pointer;
+            // the window owner remains in scope.
             !unsafe { GetUpdateRect(preview.hwnd(), None, false) }.as_bool(),
             "an unchanged sample must not schedule another paint"
         );
@@ -96,6 +106,8 @@ fn preview_nonactivating_updates_and_resource_lifecycle() {
 
         preview.hide();
         assert_eq!(preview.rect(), None);
+        // SAFETY: Query visibility on the fixture HWND without dereferencing or
+        // retaining any native pointer.
         assert!(!unsafe { IsWindowVisible(preview.hwnd()) }.as_bool());
         assert!(preview.update(point, Some(FIRST_COLOR), work_area).unwrap());
         paint(&preview);
@@ -113,6 +125,8 @@ fn preview_nonactivating_updates_and_resource_lifecycle() {
             "a session without room for visible feedback must report failure"
         );
         assert_eq!(preview.rect(), None);
+        // SAFETY: Query visibility on the fixture HWND without dereferencing or
+        // retaining any native pointer.
         assert!(!unsafe { IsWindowVisible(preview.hwnd()) }.as_bool());
     }
 
@@ -169,8 +183,12 @@ fn hiding_an_intersecting_preview_restores_exact_underlying_sampling() {
     let preview = PreviewWindow::new().unwrap();
     // Prove hide + composition synchronization works without the auxiliary
     // capture exclusion masking any remaining preview content.
+    // SAFETY: The live preview belongs to this process; only this fixture capture policy is
+    // changed on its owning thread.
     unsafe { SetWindowDisplayAffinity(preview.hwnd(), WDA_NONE) }.unwrap();
     let mut affinity = u32::MAX;
+    // SAFETY: This test owns the live preview HWND and the affinity output is a writable
+    // local value.
     unsafe { GetWindowDisplayAffinity(preview.hwnd(), &mut affinity) }.unwrap();
     assert_eq!(affinity, WDA_NONE.0);
     assert!(
@@ -226,6 +244,8 @@ fn hiding_an_intersecting_preview_restores_exact_underlying_sampling() {
         preview.hide();
         flush_composition().unwrap();
     }
+    // SAFETY: Query visibility on the fixture HWND without dereferencing or retaining any
+    // native pointer.
     assert!(!unsafe { IsWindowVisible(preview.hwnd()) }.as_bool());
     let mut sampler = GdiSampler::new().unwrap();
     let sampled = sampler.sample_pixel(covered_point).unwrap();
@@ -258,20 +278,27 @@ fn preview_cycle(point: ScreenPointPx, work_area: ScreenRectPx) {
 
 fn paint(preview: &PreviewWindow) {
     assert!(
+        // SAFETY: Synchronously paint only the live fixture window; no callback-state
+        // borrow spans this reentrant operation.
         unsafe { UpdateWindow(preview.hwnd()) }.as_bool(),
         "UpdateWindow failed"
     );
     assert!(
+        // SAFETY: Inspect the live preview update region with no output pointer; the
+        // window owner remains in scope.
         !unsafe { GetUpdateRect(preview.hwnd(), None, false) }.as_bool(),
         "BeginPaint/EndPaint must consume the update region"
     );
 }
 
 fn assert_visible_beside(preview: &PreviewWindow, point: ScreenPointPx, work_area: ScreenRectPx) {
+    // SAFETY: Query visibility on the fixture HWND without dereferencing or retaining any
+    // native pointer.
     assert!(unsafe { IsWindowVisible(preview.hwnd()) }.as_bool());
     let rect = preview
         .rect()
         .expect("the work area must have room for a preview beside this point");
+    // SAFETY: Query only the live fixture HWND while its window owner remains in scope.
     let dpi = unsafe { GetDpiForWindow(preview.hwnd()) };
     assert!(dpi > 0);
     assert_eq!(
@@ -290,6 +317,8 @@ fn assert_visible_beside(preview: &PreviewWindow, point: ScreenPointPx, work_are
     );
     assert_eq!(rect.intersection(work_area), Some(rect));
     let mut actual = RECT::default();
+    // SAFETY: The fixture window remains alive on this thread and each RECT output is valid
+    // writable stack storage.
     unsafe { GetWindowRect(preview.hwnd(), &mut actual) }.unwrap();
     assert_eq!(
         rect,
@@ -304,6 +333,8 @@ fn assert_visible_beside(preview: &PreviewWindow, point: ScreenPointPx, work_are
 
 fn assert_foreground(expected: HWND) {
     assert_eq!(
+        // SAFETY: Read the foreground HWND by value for comparison only; the test never
+        // takes ownership of it.
         unsafe { GetForegroundWindow() },
         expected,
         "foreground changed; this is a failure or an inconclusive run if the user switched apps concurrently"
@@ -317,10 +348,18 @@ struct GuiCounts {
 }
 
 fn gui_counts() -> GuiCounts {
+    // SAFETY: This obtains the current process pseudo-handle for a synchronous resource
+    // query; it is never treated as owned.
     let process = unsafe { GetCurrentProcess() };
     let read = |kind| {
+        // SAFETY: Clear only this thread last-error slot before distinguishing a valid
+        // zero resource count from failure.
         unsafe { SetLastError(ERROR_SUCCESS) };
+        // SAFETY: The process handle is this process pseudo-handle; the query borrows it
+        // and never closes or retains it.
         let count = unsafe { GetGuiResources(process, kind) };
+        // SAFETY: Read only this thread last-error slot immediately after the query
+        // being diagnosed.
         let error = unsafe { GetLastError() };
         assert!(
             count != 0 || error == ERROR_SUCCESS,

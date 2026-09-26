@@ -172,6 +172,7 @@ mod tests {
     struct TestWindow(HWND);
     impl TestWindow {
         fn new() -> Self {
+            // SAFETY: The test creates a hidden message-only STATIC window without userdata; this guard uniquely owns it.
             Self(unsafe {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
@@ -193,6 +194,7 @@ mod tests {
     }
     impl Drop for TestWindow {
         fn drop(&mut self) {
+            // SAFETY: The guard destroys its own message-only window on its creation thread, after hotkey guards drop.
             let _ = unsafe { DestroyWindow(self.0) };
         }
     }

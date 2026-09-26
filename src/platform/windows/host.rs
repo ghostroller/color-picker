@@ -5,7 +5,7 @@
 use std::{
     cell::Cell,
     ffi::OsString,
-    os::windows::ffi::OsStringExt,
+    os::windows::{ffi::OsStringExt, io::AsRawHandle},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -142,6 +142,8 @@ pub fn run_with_launch_options(
         }
     };
     DIAGNOSTICS.set(diagnostics);
+    // SAFETY: The static, NUL-terminated registered-message name lives for the
+    // process lifetime; registration retains no Rust allocation.
     let taskbar_message = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     if taskbar_message == 0 {
         return Err(Error::from_thread());
@@ -150,6 +152,8 @@ pub fn run_with_launch_options(
 
     let class = RegisteredClass::new()?;
     let title = wide(&instance_key()?);
+    // SAFETY: The registered class and terminated title remain live through
+    // synchronous creation. The static callback stores no userdata pointers.
     let window = OwnedWindow(unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -535,6 +539,8 @@ fn message_loop(
                     }
                     Some(TrayCommand::Settings) => {
                         if let Some(window) = settings_window.as_ref() {
+                            // SAFETY: The owner retains this UI-thread HWND; no
+                            // callback-state RefCell borrow spans these calls.
                             unsafe {
                                 let _ = ShowWindow(window.hwnd(), SW_RESTORE);
                                 let _ = SetForegroundWindow(window.hwnd());
@@ -615,9 +621,12 @@ fn message_loop(
         // closes the gap between its final notification and JoinHandle completion,
         // including Frozen/Finishing where no application timer is running.
         let status = if let Some(worker) = controller.input_wait_handle() {
+            let handles = [HANDLE(worker.as_raw_handle())];
+            // SAFETY: The controller immutably lends the JoinHandle until this
+            // wait returns. This local native array never outlives that borrow.
             let wait = unsafe {
                 MsgWaitForMultipleObjectsEx(
-                    Some(&[worker]),
+                    Some(&handles),
                     INFINITE,
                     QS_ALLINPUT,
                     MWMO_INPUTAVAILABLE,
@@ -629,11 +638,15 @@ fn message_loop(
             if wait == WAIT_FAILED {
                 return Err(Error::from_thread());
             }
+            // SAFETY: MSG is local initialized storage; no window-state borrow
+            // spans USER32's possible synchronous message dispatch.
             if !unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
                 continue;
             }
             if message.message == WM_QUIT { 0 } else { 1 }
         } else {
+            // SAFETY: MSG is valid output storage for this thread's queue. The
+            // host callback only queues intentions, without borrowing owners.
             unsafe { GetMessageW(&mut message, None, 0, 0) }.0
         };
         if status == -1 {
@@ -647,17 +660,27 @@ fn message_loop(
             controller.stop("quit_message");
             continue;
         }
+        // SAFETY: The ResultWindow owner retains its dialog/control tree, and
+        // this queue-produced MSG is live throughout synchronous dispatch.
         if let Some(window) = result_window.as_ref()
+            // SAFETY: The result owner retains the dialog tree while this
+            // queue-produced local MSG is synchronously routed to its controls.
             && unsafe { IsDialogMessageW(window.hwnd(), &message) }.as_bool()
         {
             continue;
         }
+        // SAFETY: SettingsWindow owns its dialog/control tree; no mutable state
+        // borrow is held while the local message is offered to dialog routing.
         if let Some(window) = settings_window.as_ref()
             && (window.filter_key_message(&message)
+                // SAFETY: This settings owner retains its control tree, and the
+                // local MSG remains valid throughout native dialog routing.
                 || unsafe { IsDialogMessageW(window.hwnd(), &message) }.as_bool())
         {
             continue;
         }
+        // SAFETY: The local MSG was read from this thread's queue, and all
+        // application/window-state borrows end before dispatch may reenter.
         unsafe {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -679,6 +702,8 @@ fn explain_settings_block(window: Option<&SettingsWindow>) -> bool {
             "settings.activation_notice_failed error={error}"
         ));
     }
+    // SAFETY: The borrowed owner retains this settings HWND on the UI thread;
+    // show_status has returned and released all callback-state borrows.
     unsafe {
         let _ = ShowWindow(window.hwnd(), SW_RESTORE);
         let _ = SetForegroundWindow(window.hwnd());
@@ -864,10 +889,14 @@ pub fn quit_current_installation() -> Result<()> {
         return Ok(());
     };
     let mut pid = 0;
+    // SAFETY: The API validates the discovered HWND and writes only the local
+    // PID slot; a disappeared window is handled by the zero result.
     if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) } == 0 {
         // The host can disappear between FindWindow and this lookup.
         return Ok(());
     }
+    // SAFETY: This opens a query/synchronize handle for the discovered process;
+    // the successful handle is adopted once and retained for identity checks.
     let process = match unsafe {
         OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
@@ -881,11 +910,14 @@ pub fn quit_current_installation() -> Result<()> {
         }
         Err(error) => return Err(error),
     };
+    // SAFETY: OwnedHandle keeps this process handle open for the bounded query.
     if unsafe { WaitForSingleObject(process.0, 0) } == WAIT_OBJECT_0 {
         return Ok(());
     }
     let mut path = vec![0_u16; 32768];
     let mut length = path.len() as u32;
+    // SAFETY: path provides length writable UTF-16 elements, and process owns a
+    // query-capable handle. Neither output pointer escapes this call.
     if let Err(error) = unsafe {
         QueryFullProcessImageNameW(
             process.0,
@@ -894,6 +926,8 @@ pub fn quit_current_installation() -> Result<()> {
             &mut length,
         )
     } {
+        // SAFETY: The process handle is still owned here; a zero timeout only
+        // checks whether the previously identified process has exited.
         return if unsafe { WaitForSingleObject(process.0, 0) } == WAIT_OBJECT_0 {
             Ok(())
         } else {
@@ -925,6 +959,8 @@ pub fn quit_current_installation() -> Result<()> {
     // Keep the process HANDLE open while rechecking HWND ownership, so a stale
     // lookup cannot turn a reused process ID into a request to another process.
     let mut current_pid = 0;
+    // SAFETY: The local output slot remains valid, and the retained process
+    // handle prevents its PID being recycled during this identity recheck.
     if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut current_pid)) } != 0 {
         if current_pid != pid {
             return Err(Error::new(
@@ -935,7 +971,11 @@ pub fn quit_current_installation() -> Result<()> {
                 ),
             ));
         }
+        // SAFETY: The HWND's PID and installation path were rechecked above;
+        // WM_CLOSE carries no pointers, and the process handle remains owned.
         if let Err(error) = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }
+            // SAFETY: The retained process handle remains live through this
+            // nonblocking exit query; no borrowed handle escapes the call.
             && unsafe { WaitForSingleObject(process.0, 0) } != WAIT_OBJECT_0
         {
             return Err(error);
@@ -944,6 +984,8 @@ pub fn quit_current_installation() -> Result<()> {
     let remaining_ms = deadline
         .saturating_duration_since(Instant::now())
         .as_millis() as u32;
+    // SAFETY: The retained process handle is waitable and lives through this
+    // bounded wait; no native function takes ownership of it.
     match unsafe { WaitForSingleObject(process.0, remaining_ms) } {
         WAIT_OBJECT_0 => Ok(()),
         WAIT_TIMEOUT => Err(Error::new(
@@ -966,6 +1008,8 @@ fn wait_for_existing_host(
         if !instance_marker_exists(marker)? {
             return Ok(None);
         }
+        // SAFETY: All callers supply wide()'s NUL-terminated title. The class
+        // name is static; this query does not retain either string.
         if let Ok(hwnd) = unsafe { FindWindowW(HOST_CLASS, PCWSTR(title.as_ptr())) } {
             return Ok(Some(hwnd));
         }
@@ -986,6 +1030,8 @@ fn wait_for_existing_host(
 }
 
 fn instance_marker_exists(name: &[u16]) -> Result<bool> {
+    // SAFETY: All callers supply a live wide() NUL-terminated mutex name; the
+    // fresh handle is adopted locally and closed without acquiring the mutex.
     match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) } {
         Ok(handle) => {
             // Close on every probe: retaining this handle could itself keep an
@@ -1009,7 +1055,11 @@ fn activate_existing(allow_onboarding: bool) -> Result<()> {
     // A second launch can race the first process's window creation. This is a
     // bounded startup retry, never a resident timer or a background worker.
     for _ in 0..20 {
+        // SAFETY: Both names are live NUL-terminated strings; the forwarded
+        // private message contains scalar values only, never borrowed memory.
         if let Ok(hwnd) = unsafe { FindWindowW(HOST_CLASS, PCWSTR(title.as_ptr())) }
+            // SAFETY: The discovered host receives a private scalar-only wake
+            // message; no Rust pointer is queued or ownership transferred.
             && unsafe {
                 PostMessageW(
                     Some(hwnd),
@@ -1041,8 +1091,12 @@ fn enqueue(hwnd: HWND, action: u32) {
     }
     // GetMessage dispatches sent broadcasts internally; wake it so it can
     // return to the outer loop even if no other posted messages are waiting.
+    // SAFETY: WM_NULL carries no pointers; hwnd comes from the current host
+    // callback, which only queues scalar intentions while the host is alive.
     if unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) }.is_err() {
         CALLBACK_FAILED.set(true);
+        // SAFETY: This posts an exit code to the current thread with no borrowed
+        // payload, allowing the owner loop to perform cleanup.
         unsafe { PostQuitMessage(1) };
     }
 }
@@ -1077,6 +1131,9 @@ fn after_guide_intentions(pending: u32, received_during_guide: u32) -> u32 {
     }
 }
 
+/// # Safety
+/// Called by USER32 for the registered host class with native message payloads
+/// valid for synchronous processing and the default procedure chain.
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -1084,10 +1141,15 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     // A Rust panic must never unwind through Win32. Normal API errors use Result.
+    // SAFETY: USER32 supplies the current host message; the inner dispatcher
+    // preserves its payload and the panic boundary contains Rust unwinding.
     std::panic::catch_unwind(|| unsafe { window_proc_inner(hwnd, message, wparam, lparam) })
         .unwrap_or_else(|_| std::process::abort())
 }
 
+/// # Safety
+/// hwnd/message/parameters must form a native host callback, or a test message
+/// with scalar-only payload whose documented default handling allows the HWND.
 unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if message == TASKBAR_MESSAGE.get() && message != 0 {
         enqueue(hwnd, RESTORE_TRAY);
@@ -1152,12 +1214,16 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             super::onboarding::dismiss_pending();
             // Return from TrackPopupMenu's nested loop so the owner can drain
             // input and release resources even while the tray menu is open.
+            // SAFETY: EndMenu operates on this UI thread's active menu only;
+            // there is no borrowed callback state or Rust payload to retain.
             let _ = unsafe { EndMenu() };
         }
         WM_QUERYENDSESSION => return LRESULT(1),
         WM_ENDSESSION if wparam.0 != 0 => {
             enqueue(hwnd, EXIT);
             super::onboarding::dismiss_pending();
+            // SAFETY: Exit the current UI thread's menu loop with no Rust state
+            // borrow crossing the call; owner cleanup runs in the outer loop.
             let _ = unsafe { EndMenu() };
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_WTSSESSION_CHANGE => {
@@ -1169,7 +1235,10 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             super::onboarding::dismiss_pending();
             return LRESULT(1);
         }
+        // SAFETY: This posts a scalar quit code to the current UI thread only.
         WM_DESTROY => unsafe { PostQuitMessage(0) },
+        // SAFETY: Forward the original native message while its payload is live;
+        // this host never stores callback references in userdata.
         _ => return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
     LRESULT(0)
@@ -1177,6 +1246,8 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
 
 pub fn show_error(message: &str) {
     let text = wide(message);
+    // SAFETY: The terminated text allocation and static title live through this
+    // synchronous dialog call; no owner/state borrow is retained across reentry.
     unsafe {
         MessageBoxW(
             None,
@@ -1197,6 +1268,8 @@ struct RegisteredClass {
 
 impl RegisteredClass {
     fn new() -> Result<Self> {
+        // SAFETY: None borrows the current process module, which is not freed by
+        // this owner and contains the static class callback for its full life.
         let instance = HINSTANCE(unsafe { GetModuleHandleW(None)? }.0);
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
@@ -1204,6 +1277,8 @@ impl RegisteredClass {
             lpszClassName: HOST_CLASS,
             ..Default::default()
         };
+        // SAFETY: The initialized descriptor references a static name/callback;
+        // Windows copies it before return and RegisteredClass tracks release.
         if unsafe { RegisterClassW(&class) } == 0 {
             return Err(Error::from_thread());
         }
@@ -1213,6 +1288,8 @@ impl RegisteredClass {
 
 impl Drop for RegisteredClass {
     fn drop(&mut self) {
+        // SAFETY: This guard owns registration; declaration order destroys the
+        // host first. The borrowed module and static class name still exist.
         let _ = unsafe { UnregisterClassW(HOST_CLASS, Some(self.instance)) };
     }
 }
@@ -1221,6 +1298,8 @@ struct OwnedWindow(HWND);
 
 impl Drop for OwnedWindow {
     fn drop(&mut self) {
+        // SAFETY: This is the creating UI thread's hidden host HWND; its callback
+        // uses only static/TLS state, never Rust fields released by this Drop.
         let _ = unsafe { DestroyWindow(self.0) };
     }
 }
@@ -1229,6 +1308,8 @@ struct OwnedHandle(HANDLE);
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
+        // SAFETY: This private owner adopts one successful OpenProcess/OpenMutex
+        // handle and closes it once; no pseudo/borrowed handles are adopted.
         let _ = unsafe { CloseHandle(self.0) };
     }
 }
@@ -1237,6 +1318,8 @@ struct SessionNotifications(HWND);
 
 impl SessionNotifications {
     fn new(hwnd: HWND) -> Result<Self> {
+        // SAFETY: The host owner retains hwnd and outlives this registration;
+        // notifications carry no Rust pointers and run on its UI thread.
         unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)? };
         Ok(Self(hwnd))
     }
@@ -1244,6 +1327,8 @@ impl SessionNotifications {
 
 impl Drop for SessionNotifications {
     fn drop(&mut self) {
+        // SAFETY: The registered host owner still lives by declaration order;
+        // unregister this guard's subscription before destroying that window.
         let _ = unsafe { WTSUnRegisterSessionNotification(self.0) };
     }
 }
@@ -1323,6 +1408,8 @@ mod tests {
         PENDING.set(0);
         // DefWindowProc does not operate on any real window here. In particular,
         // the old timer must not enqueue host work or create a retry request.
+        // SAFETY: This scalar WM_TIMER has no pointer payload and inactive token;
+        // its default processing accepts the null test HWND without dereference.
         unsafe { window_proc_inner(hwnd, WM_TIMER, WPARAM(timer.id), LPARAM(0)) };
         assert!(PENDING_COPY_TIMER.get().is_none());
         assert_eq!(PENDING.get() & COPY_TICK, 0);
@@ -1350,13 +1437,21 @@ mod tests {
         crate::app::i18n::set_language(crate::app::i18n::Language::SimplifiedChinese);
         let config = crate::app::config::Config::default();
         let window = SettingsWindow::new(&config, HWND::default(), None, true).unwrap();
+        // SAFETY: The test owns the settings window on this UI thread and keeps
+        // it alive; no state borrow spans ShowWindow's synchronous callbacks.
         let _ = unsafe { ShowWindow(window.hwnd(), SW_MINIMIZE) };
+        // SAFETY: The live window owner retains the queried HWND.
         assert!(unsafe { IsIconic(window.hwnd()) }.as_bool());
         assert!(explain_settings_block(Some(&window)));
+        // SAFETY: The same owner retains the restored window during the query.
         assert!(!unsafe { IsIconic(window.hwnd()) }.as_bool());
         assert_eq!(window.process_pending().unwrap(), None);
+        // SAFETY: Control 14 belongs to this live settings tree; the query borrows
+        // its HWND and does not transfer ownership.
         let status = unsafe { GetDlgItem(Some(window.hwnd()), 14) }.unwrap();
         let mut text = [0_u16; 256];
+        // SAFETY: The live control is queried into the bounded local UTF-16
+        // array; the windows binding passes its actual element count.
         let length = unsafe { GetWindowTextW(status, &mut text) };
         assert!(String::from_utf16_lossy(&text[..length as usize]).contains("暂停取色"));
         assert!(!explain_settings_block(None));
@@ -1384,6 +1479,8 @@ mod tests {
                 .is_none()
         );
         assert!(!instance_marker_exists(&marker).unwrap());
+        // SAFETY: The unique NUL-terminated test name lives through creation; the
+        // returned kernel handle is adopted once by the local test guard.
         let running =
             OwnedHandle(unsafe { CreateMutexW(None, false, PCWSTR(marker.as_ptr())).unwrap() });
         assert!(instance_marker_exists(&marker).unwrap());

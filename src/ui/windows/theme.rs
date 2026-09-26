@@ -3,22 +3,26 @@
 //! Controls keep their native keyboard, selection and accessibility behavior.
 //! Brushes/fonts are owned by the window; paint uses stock pens and brushes.
 
-use std::{cell::RefCell, mem::size_of};
+use std::{
+    cell::{Cell, RefCell},
+    mem::size_of,
+};
 
 use windows::{
     Win32::{
-        Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT},
+        Foundation::{COLORREF, HWND, LRESULT, RECT},
         Graphics::{Dwm::*, Gdi::*},
         UI::{
             Controls::*, HiDpi::GetDpiForWindow, Input::KeyboardAndMouse::IsWindowEnabled,
             WindowsAndMessaging::*,
         },
     },
-    core::{Error, Result, w},
+    core::{Result, w},
 };
 
 use super::drawing::dip;
 use crate::app::i18n::{Language, language, tr};
+use crate::platform::windows::gdi::{OwnedBrush, OwnedFont, PaintSession, SavedDc};
 use crate::platform::windows::icon::WindowIcons;
 
 const CANVAS: COLORREF = rgb(0xf5f7fa);
@@ -54,28 +58,29 @@ impl Tone {
 }
 
 pub(super) struct Theme {
-    canvas: HBRUSH,
-    panel: HBRUSH,
+    canvas: OwnedBrush,
+    panel: OwnedBrush,
     // The window owner calls DestroyWindow before dropping its Theme.
     icons: RefCell<Option<WindowIcons>>,
+    // A borrowed control DC may retain a WM_GETFONT font after RestoreDC fails.
+    // Its window owner checks this sticky flag before every font release.
+    font_restore_failed: Cell<bool>,
 }
 
 impl Theme {
     pub(super) fn new() -> Result<Self> {
-        let canvas = unsafe { CreateSolidBrush(CANVAS) };
-        if canvas.is_invalid() {
-            return Err(Error::from_thread());
-        }
-        let panel = unsafe { CreateSolidBrush(PANEL) };
-        if panel.is_invalid() {
-            let _ = unsafe { DeleteObject(HGDIOBJ(canvas.0)) };
-            return Err(Error::from_thread());
-        }
+        let canvas = OwnedBrush::solid(CANVAS)?;
+        let panel = OwnedBrush::solid(PANEL)?;
         Ok(Self {
             canvas,
             panel,
             icons: RefCell::new(None),
+            font_restore_failed: Cell::new(false),
         })
+    }
+
+    pub(super) fn fonts_must_be_retained(&self) -> bool {
+        self.font_restore_failed.get()
     }
 
     pub(super) fn update_window_icons(&self, hwnd: HWND) {
@@ -97,24 +102,33 @@ impl Theme {
     }
 
     pub(super) fn control_color(&self, hdc: HDC, panel: bool, tone: Tone) -> LRESULT {
+        // SAFETY: The native control-color callback supplies this live borrowed DC; scalar colors retain no pointers.
         unsafe {
             SetTextColor(hdc, tone.color());
             SetBkColor(hdc, if panel { PANEL } else { CANVAS });
             SetBkMode(hdc, TRANSPARENT);
         }
-        LRESULT(if panel { self.panel.0 } else { self.canvas.0 } as isize)
+        LRESULT(if panel {
+            self.panel.raw().0
+        } else {
+            self.canvas.raw().0
+        } as isize)
     }
 
     pub(super) fn paint(&self, hwnd: HWND, panels: &[RECT]) -> LRESULT {
-        let mut paint = PAINTSTRUCT::default();
-        let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
-        if !hdc.is_invalid() {
+        // SAFETY: invoked only by this live window's native WM_PAINT.
+        if let Ok(paint) = unsafe { PaintSession::begin(hwnd) } {
+            let hdc = paint.dc;
             let mut client = RECT::default();
+            // SAFETY: The live paint window and writable RECT slot outlive the native query.
             let _ = unsafe { GetClientRect(hwnd, &mut client) };
-            unsafe { FillRect(hdc, &client, self.canvas) };
-            let saved = unsafe { SaveDC(hdc) };
-            if saved != 0 {
+            // SAFETY: The DC, rectangle and borrowed/owned brush remain valid for this synchronous fill.
+            unsafe { FillRect(hdc, &client, self.canvas.raw()) };
+            // SAFETY: the paint session outlives this guard; only stock objects are selected.
+            if let Ok(saved) = unsafe { SavedDc::new(hdc) } {
+                // SAFETY: Query the live window/control handle during its owner or callback lifetime.
                 let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+                // SAFETY: SavedDc scopes stock-object and live control-font selections; buffers remain valid throughout drawing.
                 unsafe {
                     SelectObject(hdc, GetStockObject(DC_BRUSH));
                     SelectObject(hdc, GetStockObject(DC_PEN));
@@ -122,6 +136,7 @@ impl Theme {
                     SetDCPenColor(hdc, BORDER);
                 }
                 for panel in panels {
+                    // SAFETY: The active paint DC is live and its selected stock objects are restored by SavedDc.
                     let _ = unsafe {
                         RoundRect(
                             hdc,
@@ -134,26 +149,27 @@ impl Theme {
                         )
                     };
                 }
-                let _ = unsafe { RestoreDC(hdc, saved) };
+                if let Err(error) = saved.restore() {
+                    crate::app::diagnostics::event(format_args!(
+                        "theme.paint_restore_failed {error}"
+                    ));
+                }
             }
         }
-        let _ = unsafe { EndPaint(hwnd, &paint) };
         LRESULT(0)
     }
 }
 
-impl Drop for Theme {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(self.canvas.0));
-            let _ = DeleteObject(HGDIOBJ(self.panel.0));
-        }
-    }
-}
-
-pub(super) struct Font(pub HFONT);
+pub(super) struct Font(OwnedFont);
 
 impl Font {
+    pub(super) fn raw(&self) -> HFONT {
+        self.0.raw()
+    }
+    pub(super) fn retain(&self) {
+        self.0.retain();
+    }
+
     pub(super) fn new(size_dip: i32, dpi: u32, weight: i32, mono: bool) -> Result<Self> {
         Self::for_language(size_dip, dpi, weight, mono, language())
     }
@@ -165,6 +181,7 @@ impl Font {
         mono: bool,
         language: Language,
     ) -> Result<Self> {
+        // SAFETY: Create a fresh unselected font with a static face name; transfer it immediately to its unique owner.
         let font = unsafe {
             CreateFontW(
                 -dip(size_dip, dpi),
@@ -190,58 +207,47 @@ impl Font {
                 },
             )
         };
-        if font.is_invalid() {
-            Err(Error::from_thread())
-        } else {
-            Ok(Self(font))
-        }
-    }
-}
-
-impl Drop for Font {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteObject(HGDIOBJ(self.0.0)) };
+        // SAFETY: CreateFontW produces a fresh font; its window owner keeps
+        // the font alive until controls release it or the root tree terminates.
+        unsafe { OwnedFont::from_raw(font) }.map(Self)
     }
 }
 
 /// Draw only native push buttons. Checkboxes keep Windows' themed rendering.
-pub(super) fn custom_draw(lparam: LPARAM, primary_id: usize) -> Option<LRESULT> {
-    draw_button(lparam, primary_id, false)
+pub(super) fn custom_draw(
+    theme: &Theme,
+    draw: &NMCUSTOMDRAW,
+    primary_id: usize,
+) -> Option<LRESULT> {
+    draw_button(theme, draw, primary_id, false)
 }
 
 /// Borderless neutral buttons for the result's plain white value list.
-pub(super) fn custom_draw_minimal(lparam: LPARAM, primary_id: usize) -> Option<LRESULT> {
-    draw_button(lparam, primary_id, true)
+pub(super) fn custom_draw_minimal(
+    theme: &Theme,
+    draw: &NMCUSTOMDRAW,
+    primary_id: usize,
+) -> Option<LRESULT> {
+    draw_button(theme, draw, primary_id, true)
 }
 
-fn draw_button(lparam: LPARAM, primary_id: usize, minimal: bool) -> Option<LRESULT> {
-    if lparam.0 == 0 {
-        return None;
-    }
-    let header = unsafe { &*(lparam.0 as *const NMHDR) };
-    if header.code != NM_CUSTOMDRAW {
-        return None;
-    }
-    let mut class = [0_u16; 32];
-    let length = unsafe { GetClassNameW(header.hwndFrom, &mut class) } as usize;
-    if !String::from_utf16_lossy(&class[..length]).eq_ignore_ascii_case("button") {
-        return None;
-    }
-    let kind = unsafe { GetWindowLongW(header.hwndFrom, GWL_STYLE) } & BS_TYPEMASK;
-    if kind != BS_PUSHBUTTON && kind != BS_DEFPUSHBUTTON {
-        return None;
-    }
-    let draw = unsafe { &*(lparam.0 as *const NMCUSTOMDRAW) };
+fn draw_button(
+    theme: &Theme,
+    draw: &NMCUSTOMDRAW,
+    primary_id: usize,
+    minimal: bool,
+) -> Option<LRESULT> {
+    let header = &draw.hdr;
     if draw.dwDrawStage != CDDS_PREPAINT {
         return None;
     }
     let hdc = draw.hdc;
-    let saved = unsafe { SaveDC(hdc) };
-    if saved == 0 {
-        return None;
-    }
+    // SAFETY: the native draw callback keeps this DC and its control font alive.
+    let saved = unsafe { SavedDc::new(hdc) }.ok()?;
+    // SAFETY: Query the live window/control handle during its owner or callback lifetime.
     let dpi = unsafe { GetDpiForWindow(header.hwndFrom) }.max(96);
     let disabled = (draw.uItemState.0 & (CDIS_DISABLED.0 | CDIS_GRAYED.0)) != 0
+        // SAFETY: The verified custom-draw sender remains live during this synchronous notification.
         || !unsafe { IsWindowEnabled(header.hwndFrom) }.as_bool();
     let pressed = draw.uItemState.contains(CDIS_SELECTED);
     let hot = draw.uItemState.contains(CDIS_HOT);
@@ -295,6 +301,7 @@ fn draw_button(lparam: LPARAM, primary_id: usize, minimal: bool) -> Option<LRESU
         };
         (fill, if hot { rgb(0x93b4f3) } else { rgb(0xd6dee9) }, INK)
     };
+    // SAFETY: SavedDc scopes stock-object and live control-font selections; buffers remain valid throughout drawing.
     unsafe {
         SelectObject(hdc, GetStockObject(DC_BRUSH));
         SelectObject(hdc, GetStockObject(DC_PEN));
@@ -325,45 +332,52 @@ fn draw_button(lparam: LPARAM, primary_id: usize, minimal: bool) -> Option<LRESU
         }
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, text);
-        let mut label = [0_u16; 128];
-        let mut length = GetWindowTextW(header.hwndFrom, &mut label) as usize;
-        let copied_label = tr("已复制", "Copied");
-        let copied_length = copied_label.encode_utf16().count();
-        if minimal
-            && (primary || (100..104).contains(&header.idFrom))
-            && label[..length]
-                .iter()
-                .copied()
-                .take(copied_length)
-                .eq(copied_label.encode_utf16())
-        {
-            // The accessible native name still includes the copied format.
-            length = copied_length;
-        } else if (100..104).contains(&header.idFrom) {
-            // Keep the full native name (e.g. "复制 CSS RGB") for screen readers,
-            // while the visible row already identifies the target format.
-            let copy_label = tr("复制", "Copy");
-            for (slot, character) in label.iter_mut().zip(copy_label.encode_utf16()) {
-                *slot = character;
-            }
-            length = copy_label.encode_utf16().count();
+    }
+    let mut label = [0_u16; 128];
+    // SAFETY: the verified live control fills this bounded UTF-16 output buffer.
+    let mut length = unsafe { GetWindowTextW(header.hwndFrom, &mut label) } as usize;
+    let copied_label = tr("已复制", "Copied");
+    let copied_length = copied_label.encode_utf16().count();
+    if minimal
+        && (primary || (100..104).contains(&header.idFrom))
+        && label[..length]
+            .iter()
+            .copied()
+            .take(copied_length)
+            .eq(copied_label.encode_utf16())
+    {
+        // The accessible native name still includes the copied format.
+        length = copied_length;
+    } else if (100..104).contains(&header.idFrom) {
+        // Keep the full native name (e.g. "复制 CSS RGB") for screen readers,
+        // while the visible row already identifies the target format.
+        let copy_label = tr("复制", "Copy");
+        for (slot, character) in label.iter_mut().zip(copy_label.encode_utf16()) {
+            *slot = character;
         }
-        let mut rect = draw.rc;
-        let flags = DT_CENTER
-            | DT_VCENTER
-            | DT_SINGLELINE
-            | if draw.uItemState.contains(CDIS_SHOWKEYBOARDCUES) {
-                DRAW_TEXT_FORMAT(0)
-            } else {
-                DT_HIDEPREFIX
-            };
+        length = copy_label.encode_utf16().count();
+    }
+    let mut rect = draw.rc;
+    let flags = DT_CENTER
+        | DT_VCENTER
+        | DT_SINGLELINE
+        | if draw.uItemState.contains(CDIS_SHOWKEYBOARDCUES) {
+            DRAW_TEXT_FORMAT(0)
+        } else {
+            DT_HIDEPREFIX
+        };
+    // SAFETY: label is an in-bounds UTF-16 slice and the draw DC remains live.
+    unsafe {
         DrawTextW(hdc, &mut label[..length], &mut rect, flags);
-        if draw.uItemState.contains(CDIS_FOCUS) && !disabled {
-            let inset = dip(4, dpi);
-            rect.left += inset;
-            rect.right -= inset;
-            rect.top += inset;
-            rect.bottom -= inset;
+    }
+    if draw.uItemState.contains(CDIS_FOCUS) && !disabled {
+        let inset = dip(4, dpi);
+        rect.left += inset;
+        rect.right -= inset;
+        rect.top += inset;
+        rect.bottom -= inset;
+        // SAFETY: focus decoration uses borrowed stock objects in SavedDc's scope.
+        unsafe {
             SelectObject(hdc, GetStockObject(NULL_BRUSH));
             SetDCPenColor(hdc, if primary { PANEL } else { ACCENT });
             let _ = RoundRect(
@@ -376,7 +390,16 @@ fn draw_button(lparam: LPARAM, primary_id: usize, minimal: bool) -> Option<LRESU
                 dip(6, dpi),
             );
         }
-        let _ = RestoreDC(hdc, saved);
+    }
+    if let Err(error) = saved.restore() {
+        // The borrowed paint/control DC cannot be destroyed here. Its selected
+        // WM_GETFONT handle may outlive the current font set or root window.
+        // Mark all window font owners for retention before any later release.
+        theme.font_restore_failed.set(true);
+        crate::app::diagnostics::event(format_args!(
+            "theme.button_restore_failed font_owners_retained {error}"
+        ));
+        return None;
     }
     Some(LRESULT(CDRF_SKIPDEFAULT as isize))
 }
@@ -384,6 +407,7 @@ fn draw_button(lparam: LPARAM, primary_id: usize, minimal: bool) -> Option<LRESU
 /// Optional caption polish; unsupported attributes are harmless on Windows 10.
 pub(super) fn configure_window(hwnd: HWND, theme: &Theme) {
     theme.update_window_icons(hwnd);
+    // SAFETY: This owned live window and the correctly sized attribute value outlive the synchronous call.
     unsafe {
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -404,5 +428,94 @@ pub(super) fn configure_window(hwnd: HWND, theme: &Theme) {
             (&corners as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
             size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
         );
+    }
+}
+
+#[cfg(test)]
+pub(super) mod restore_tests {
+    use super::*;
+    use crate::platform::windows::gdi::{
+        BitmapDc, DesktopDc,
+        test_support::{self, Failure},
+    };
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+
+    /// Exercise the native WM_NOTIFY boundary with a real owned button and
+    /// private bitmap DC. Recover the injected native state before dropping font
+    /// owners, so failed DeleteObject on a selected font cannot fake retention.
+    pub fn draw_button(parent: HWND, button: HWND, id: usize, theme: &Theme, fail_restore: bool) {
+        let desktop = DesktopDc::new().unwrap();
+        let surface = BitmapDc::compatible(desktop.raw(), 160, 40).unwrap();
+        // SAFETY: the private surface has no CPU views and stays live throughout this test.
+        let dc = unsafe { surface.raw() }.unwrap();
+        // SAFETY: query the private live DC's currently selected stock font.
+        let previous = unsafe { GetCurrentObject(dc, OBJ_FONT) };
+        let draw = NMCUSTOMDRAW {
+            hdr: NMHDR {
+                hwndFrom: button,
+                idFrom: id,
+                code: NM_CUSTOMDRAW,
+            },
+            dwDrawStage: CDDS_PREPAINT,
+            hdc: dc,
+            rc: RECT {
+                left: 0,
+                top: 0,
+                right: 160,
+                bottom: 40,
+            },
+            ..Default::default()
+        };
+        if fail_restore {
+            test_support::fail_next(Failure::RestoreDc);
+        }
+        // SAFETY: this initialized notification fixture, parent, button and DC
+        // stay live for SendMessage's synchronous decoder and drawing callback.
+        unsafe {
+            SendMessageW(
+                parent,
+                WM_NOTIFY,
+                Some(WPARAM(id)),
+                Some(LPARAM(&draw as *const NMCUSTOMDRAW as isize)),
+            );
+        }
+        assert_eq!(theme.fonts_must_be_retained(), fail_restore);
+        if fail_restore {
+            // SAFETY: this test owns the isolated DC; the one-shot injected
+            // failure skipped native RestoreDC, leaving exactly the latest save.
+            assert!(unsafe { RestoreDC(dc, -1) }.as_bool());
+        }
+        // SAFETY: restored live DC state must no longer select a window-owned font.
+        assert_eq!(unsafe { GetCurrentObject(dc, OBJ_FONT) }, previous);
+    }
+
+    pub fn begin_font_delete_tracking() {
+        test_support::start_recording();
+    }
+
+    pub fn assert_font_delete_attempts(fonts: &[HFONT], deleted: bool) {
+        let events = test_support::finish_recording();
+        for font in fonts {
+            let attempts = events
+                .iter()
+                .filter(|(event, handle)| {
+                    *event == "font-delete-attempt" && *handle == font.0 as usize
+                })
+                .count();
+            assert_eq!(
+                attempts,
+                usize::from(deleted),
+                "font {:?}: deletion must be exactly once normally, never after uncertain restoration",
+                font
+            );
+        }
+    }
+
+    pub fn cleanup_retained_fonts(fonts: &[HFONT]) {
+        for font in fonts {
+            // SAFETY: test callers destroyed both the native window tree and
+            // private drawing DC, and each retained owner has already dropped.
+            assert!(unsafe { DeleteObject((*font).into()) }.as_bool());
+        }
     }
 }

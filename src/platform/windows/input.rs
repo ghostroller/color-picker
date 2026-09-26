@@ -7,7 +7,7 @@ mod protocol;
 use std::{
     cell::RefCell,
     marker::PhantomData,
-    os::windows::io::AsRawHandle,
+    os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle},
     rc::Rc,
     sync::{
         Arc,
@@ -21,8 +21,7 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{
-            CloseHandle, E_FAIL, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WAIT_FAILED,
-            WAIT_TIMEOUT, WPARAM,
+            E_FAIL, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WAIT_FAILED, WAIT_TIMEOUT, WPARAM,
         },
         System::{
             LibraryLoader::GetModuleHandleW,
@@ -236,13 +235,10 @@ impl InputSession {
     pub fn is_finished(&self) -> bool {
         self.worker.as_ref().is_none_or(JoinHandle::is_finished)
     }
-    /// Borrow the worker's native waitable thread handle. The caller must not
-    /// close it, transfer ownership, or retain it across try_join/this owner's
-    /// destruction. Waiting alongside the UI queue requires no polling timer.
-    pub fn wait_handle(&self) -> Option<HANDLE> {
-        self.worker
-            .as_ref()
-            .map(|worker| HANDLE(worker.as_raw_handle()))
+    /// Borrow the worker's waitable handle until the next mutable session use.
+    /// Waiting alongside the UI queue requires no polling timer or duplication.
+    pub fn wait_handle(&self) -> Option<BorrowedHandle<'_>> {
+        self.worker.as_ref().map(AsHandle::as_handle)
     }
     pub fn try_join(&mut self) -> Option<std::result::Result<(), InputFailure>> {
         if !self.is_finished() {
@@ -271,25 +267,147 @@ impl Drop for InputSession {
     }
 }
 
-// Kernel event handles are explicitly designed for cross-thread signaling.
-// Store the opaque value rather than assigning Send/Sync to any Win32 type.
-struct ControlSignal(usize);
+// OwnedHandle carries the unique CloseHandle responsibility and the standard
+// library's cross-thread kernel-handle contract; HWND/GDI types stay thread bound.
+struct ControlSignal(OwnedHandle);
 impl ControlSignal {
     fn new() -> Result<Self> {
-        Ok(Self(
-            unsafe { CreateEventW(None, false, false, None)? }.0 as usize,
-        ))
+        let handle = create_control_event()?;
+        // SAFETY: CreateEventW returned one new, valid event handle. No other
+        // owner adopts it, and OwnedHandle uses its required CloseHandle release.
+        Ok(Self(unsafe { OwnedHandle::from_raw_handle(handle.0) }))
     }
-    fn handle(&self) -> HANDLE {
-        HANDLE(self.0 as *mut _)
+    fn handle(&self) -> BorrowedHandle<'_> {
+        self.0.as_handle()
     }
     fn set(&self) -> Result<()> {
-        unsafe { SetEvent(self.handle()) }
+        // SAFETY: The event borrow remains live through this non-retaining call;
+        // SetEvent supports signaling this kernel object from another thread.
+        unsafe { SetEvent(HANDLE(self.handle().as_raw_handle())) }
     }
 }
-impl Drop for ControlSignal {
-    fn drop(&mut self) {
-        let _ = unsafe { CloseHandle(self.handle()) };
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_EVENT_CREATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn create_control_event() -> Result<HANDLE> {
+    #[cfg(test)]
+    if FAIL_EVENT_CREATION.replace(false) {
+        return Err(Error::new(
+            E_FAIL,
+            "injected control-event creation failure",
+        ));
+    }
+    // SAFETY: This unnamed auto-reset event has no borrowed security descriptor
+    // or name. A successful call returns a fresh uniquely owned kernel handle.
+    unsafe { CreateEventW(None, false, false, None) }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+    use windows::Win32::{Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject};
+
+    #[test]
+    fn control_event_creation_failure_does_not_install_an_owner() {
+        FAIL_EVENT_CREATION.set(true);
+        assert!(ControlSignal::new().is_err());
+        assert!(!FAIL_EVENT_CREATION.get());
+        let event = ControlSignal::new().expect("failure injection must be local and one-shot");
+        event.set().unwrap();
+        let borrowed = event.handle();
+        // SAFETY: This live borrow denotes the newly signaled event; the bounded
+        // wait neither closes nor retains it beyond its owner.
+        assert_eq!(
+            // SAFETY: event owns this borrowed, signaled handle for the wait.
+            unsafe { WaitForSingleObject(HANDLE(borrowed.as_raw_handle()), 1000) },
+            WAIT_OBJECT_0
+        );
+    }
+
+    #[test]
+    fn control_event_can_be_signaled_across_threads_with_one_owner() {
+        let signal = Arc::new(ControlSignal::new().unwrap());
+        let released = Arc::downgrade(&signal);
+        let producer = signal.clone();
+        let worker = thread::spawn(move || producer.set().unwrap());
+        {
+            let borrowed = signal.handle();
+            // SAFETY: The Arc retains the event throughout this bounded wait,
+            // including while the other thread signals its own shared borrow.
+            assert_eq!(
+                // SAFETY: signal's Arc retains the event while this thread waits.
+                unsafe { WaitForSingleObject(HANDLE(borrowed.as_raw_handle()), 5000) },
+                WAIT_OBJECT_0
+            );
+        }
+        worker.join().unwrap();
+        assert_eq!(Arc::strong_count(&signal), 1);
+        drop(signal);
+        assert!(
+            released.upgrade().is_none(),
+            "the unique event owner must be released"
+        );
+    }
+
+    fn session(worker: JoinHandle<std::result::Result<(), InputFailure>>) -> InputSession {
+        let (_, receiver) = sync_channel(64);
+        InputSession {
+            shared: Arc::new(Shared {
+                session: SessionId(1),
+                notify: 0,
+                control: ControlSignal::new().unwrap(),
+                finish: AtomicBool::new(false),
+                reject: AtomicBool::new(false),
+                failure: AtomicU64::new(0),
+                movement: MovementMailbox::default(),
+                record_movement: false,
+                movement_events: AtomicU64::new(0),
+                movement_wakes: AtomicU64::new(0),
+            }),
+            receiver,
+            worker: Some(worker),
+            _ui_thread: PhantomData,
+        }
+    }
+
+    fn wait_for_worker(session: &InputSession) {
+        let borrowed = session.wait_handle().expect("worker is owned until join");
+        // SAFETY: The immutable session borrow retains the JoinHandle during
+        // this bounded kernel wait. No hook or desktop input is involved.
+        assert_eq!(
+            // SAFETY: The immutable session borrow keeps its thread handle live.
+            unsafe { WaitForSingleObject(HANDLE(borrowed.as_raw_handle()), 5000) },
+            WAIT_OBJECT_0
+        );
+    }
+
+    #[test]
+    fn borrowed_worker_handle_ends_before_successful_join() {
+        let mut session = session(thread::spawn(|| Ok(())));
+        wait_for_worker(&session);
+        assert!(session.try_join().unwrap().is_ok());
+        assert!(session.wait_handle().is_none());
+        assert!(session.try_join().is_none());
+    }
+
+    #[test]
+    fn borrowed_worker_handle_ends_before_panicked_worker_join() {
+        let mut session = session(thread::spawn(|| {
+            panic!("test worker failure without hooks")
+        }));
+        wait_for_worker(&session);
+        assert_eq!(
+            session.try_join().unwrap().unwrap_err().kind,
+            InputFailureKind::ThreadPanicked
+        );
+        assert!(session.wait_handle().is_none());
+        assert_eq!(
+            session.failure().unwrap().kind,
+            InputFailureKind::ThreadPanicked
+        );
     }
 }
 
@@ -344,6 +462,8 @@ impl Shared {
         Ok(())
     }
     fn notify(&self) {
+        // SAFETY: The UI host owns this HWND while the session drains; this
+        // queued private message carries values only, never borrowed pointers.
         if let Err(error) = unsafe {
             PostMessageW(
                 Some(HWND(self.notify as *mut _)),
@@ -544,13 +664,19 @@ fn run_input(
     });
     let _context_guard = ContextGuard;
     let mut hooks = HookGuards::default();
+    // SAFETY: None requests the process module; this borrowed module is never
+    // freed and contains both static hook callbacks for the process lifetime.
     let module = unsafe { GetModuleHandleW(None) }
         .map_err(|error| failure(InputFailureKind::HookInstall, error.code().0))?;
     hooks.mouse = Some(
+        // SAFETY: The callback has the low-level mouse ABI, lives in this module,
+        // and reads thread-local context retained until both hooks are removed.
         unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), Some(HINSTANCE(module.0)), 0) }
             .map_err(|error| failure(InputFailureKind::HookInstall, error.code().0))?,
     );
     hooks.keyboard = Some(
+        // SAFETY: The static low-level keyboard callback and module remain live;
+        // HookGuards removes this hook before ContextGuard clears its context.
         unsafe {
             SetWindowsHookExW(
                 WH_KEYBOARD_LL,
@@ -611,7 +737,10 @@ fn run_input(
         } else {
             INFINITE
         };
-        let handles = [shared.control.handle()];
+        let signal = shared.control.handle();
+        let handles = [HANDLE(signal.as_raw_handle())];
+        // SAFETY: Shared owns the borrowed event through this wait; the array is
+        // local and neither the wait nor the message queue takes its ownership.
         let waited = unsafe {
             MsgWaitForMultipleObjectsEx(Some(&handles), timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
         };
@@ -630,6 +759,8 @@ fn run_input(
         // Limit posted-message work so control/drain checks cannot be starved.
         for _ in 0..64 {
             let mut message = MSG::default();
+            // SAFETY: The output MSG is initialized and local. No RefCell borrow
+            // is held while USER32 may synchronously invoke our hook callbacks.
             if !unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
                 break;
             }
@@ -637,6 +768,8 @@ fn run_input(
                 shared.finish.store(true, Ordering::Release);
                 break;
             }
+            // SAFETY: The message came from this thread's queue and is retained
+            // for both synchronous calls; no hook-context borrow crosses them.
             unsafe {
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
@@ -665,6 +798,8 @@ impl HookGuards {
             .into_iter()
             .flatten()
         {
+            // SAFETY: Each handle came from this thread's successful hook install
+            // and is taken once; context remains alive during removal.
             if let Err(error) = unsafe { UnhookWindowsHookEx(hook) } {
                 shared.fail(failure(InputFailureKind::HookUninstall, error.code().0));
             }
@@ -677,6 +812,8 @@ impl Drop for HookGuards {
             .into_iter()
             .flatten()
         {
+            // SAFETY: Remaining installed hooks are owned here and taken once;
+            // this fallback executes before the thread-local context is cleared.
             let _ = unsafe { UnhookWindowsHookEx(hook) };
         }
     }
@@ -692,21 +829,35 @@ fn held_gesture() -> bool {
         VK_ESCAPE,
     ]
     .into_iter()
+    // SAFETY: These are documented virtual-key constants; the query retains no
+    // pointers and does not generate or consume any input.
     .any(|key| unsafe { GetAsyncKeyState(i32::from(key.0)) } < 0)
 }
 const fn failure(kind: InputFailureKind, code: i32) -> InputFailure {
     InputFailure { kind, code }
 }
 
+/// # Safety
+/// USER32 must invoke this with the WH_MOUSE_LL callback contract. For a
+/// nonnegative code, lparam borrows a live MSLLHOOKSTRUCT for this call only.
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
+        // SAFETY: Forward the native hook parameters unchanged without decoding
+        // the payload when the hook contract requires immediate propagation.
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
+    // SAFETY: This nonnegative callback code guarantees the mouse payload's
+    // layout/lifetime. The panic boundary prevents unwinding across system ABI.
     std::panic::catch_unwind(|| unsafe { mouse_hook_inner(code, wparam, lparam) })
         .unwrap_or_else(|_| std::process::abort())
 }
 
+/// # Safety
+/// Called only from WH_MOUSE_LL with nonnegative code and a valid, aligned
+/// MSLLHOOKSTRUCT that USER32 retains until this synchronous callback returns.
 unsafe fn mouse_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: The callback contract establishes a live, aligned mouse record;
+    // only scalar values are copied into the bounded queue, never this reference.
     let input = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
     let point = ScreenPointPx {
         x: input.pt.x,
@@ -781,27 +932,44 @@ unsafe fn mouse_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT
     if swallow {
         LRESULT(1)
     } else {
+        // SAFETY: Propagate the original native callback parameters after all
+        // thread-local borrows end; the payload remains valid until return.
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
     }
 }
 
+/// # Safety
+/// USER32 must invoke this with the WH_KEYBOARD_LL callback contract. A
+/// nonnegative code supplies a live KBDLLHOOKSTRUCT for the callback duration.
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
+        // SAFETY: The hook contract requires propagation of unchanged parameters
+        // without dereferencing the payload for a negative code.
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
+    // SAFETY: USER32 supplies the valid keyboard payload for this code; catch
+    // any panic here so it cannot unwind through the Windows callback ABI.
     std::panic::catch_unwind(|| unsafe { keyboard_hook_inner(code, wparam, lparam) })
         .unwrap_or_else(|_| std::process::abort())
 }
 
+/// # Safety
+/// Called only for a nonnegative WH_KEYBOARD_LL callback; lparam points to an
+/// aligned KBDLLHOOKSTRUCT that remains live until this callback returns.
 unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: The callback establishes this record's layout and lifetime. The
+    // reference is never queued; only the Escape press/release decision escapes.
     let input = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
     // No key text, modifier state, or other keyboard input is recorded.
     if input.vkCode != u32::from(VK_ESCAPE.0) {
+        // SAFETY: Unhandled keys retain the original native hook parameters.
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
     let down = match wparam.0 as u32 {
         WM_KEYDOWN | WM_SYSKEYDOWN => true,
         WM_KEYUP | WM_SYSKEYUP => false,
+        // SAFETY: Unrecognized notifications are forwarded unchanged while the
+        // original native payload is still live.
         _ => return unsafe { CallNextHookEx(None, code, wparam, lparam) },
     };
     let swallow = CONTEXT.with(|slot| {
@@ -826,6 +994,8 @@ unsafe fn keyboard_hook_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     if swallow {
         LRESULT(1)
     } else {
+        // SAFETY: Forward unchanged parameters only after releasing thread-local
+        // borrows; USER32 retains the keyboard payload for the entire callback.
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
     }
 }

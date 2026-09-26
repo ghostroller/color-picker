@@ -15,9 +15,12 @@ use crate::{
     },
     ui::windows::{magnifier::MagnifierWindow, preview::PreviewWindow},
 };
-use std::time::{Duration, Instant};
+use std::{
+    os::windows::io::BorrowedHandle,
+    time::{Duration, Instant},
+};
 use windows::{
-    Win32::Foundation::{E_FAIL, HANDLE, HWND},
+    Win32::Foundation::{E_FAIL, HWND},
     core::{Error, Result},
 };
 
@@ -125,7 +128,7 @@ impl PreviewController {
     pub fn activation_allowed(&self) -> bool {
         matches!(self.state(), AppState::Idle | AppState::Result(_))
     }
-    pub fn input_wait_handle(&self) -> Option<HANDLE> {
+    pub fn input_wait_handle(&self) -> Option<BorrowedHandle<'_>> {
         self.session
             .as_ref()
             .and_then(|resources| resources.input.wait_handle())

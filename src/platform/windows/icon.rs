@@ -25,7 +25,9 @@ pub(crate) struct AppIcon(HICON);
 
 impl AppIcon {
     fn load(width: i32, height: i32) -> Result<Self> {
+        // SAFETY: Borrow the current module; the executable resource remains loaded for process lifetime.
         let instance = unsafe { GetModuleHandleW(None)? }.into();
+        // SAFETY: APP_ICON is a MAKEINTRESOURCE identifier; LR_SHARED is absent, so the result is uniquely owned.
         let image = unsafe {
             LoadImageW(
                 Some(instance),
@@ -42,9 +44,12 @@ impl AppIcon {
     }
 
     pub(crate) fn small_for_window(hwnd: HWND) -> Result<Self> {
+        // SAFETY: Query only the caller's live window; no Rust memory is passed or retained.
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
         Self::load(
+            // SAFETY: This scalar DPI/metric query does not borrow application storage.
             unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi) },
+            // SAFETY: This scalar DPI/metric query does not borrow application storage.
             unsafe { GetSystemMetricsForDpi(SM_CYSMICON, dpi) },
         )
     }
@@ -56,6 +61,7 @@ impl AppIcon {
 
 impl Drop for AppIcon {
     fn drop(&mut self) {
+        // SAFETY: This uniquely owned LoadImageW icon is released only after window/tray borrowers are gone.
         let _ = unsafe { DestroyIcon(self.0) };
     }
 }
@@ -68,9 +74,11 @@ pub(crate) struct WindowIcons {
 
 impl WindowIcons {
     pub(crate) fn for_window(hwnd: HWND) -> Result<Self> {
+        // SAFETY: The caller keeps this window alive during the DPI query.
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
         Ok(Self {
             small: AppIcon::small_for_window(hwnd)?,
+            // SAFETY: Both metric calls take scalar dimensions only; load immediately owns the resulting new icon.
             large: AppIcon::load(unsafe { GetSystemMetricsForDpi(SM_CXICON, dpi) }, unsafe {
                 GetSystemMetricsForDpi(SM_CYICON, dpi)
             })?,
@@ -79,6 +87,7 @@ impl WindowIcons {
     }
 
     pub(crate) fn matches_window_dpi(&self, hwnd: HWND) -> bool {
+        // SAFETY: The window is borrowed only for this synchronous DPI query.
         self.dpi == unsafe { GetDpiForWindow(hwnd) }.max(96)
     }
 
@@ -86,6 +95,8 @@ impl WindowIcons {
     /// until another live WindowIcons has replaced both borrowed handles.
     pub(crate) fn apply(&self, hwnd: HWND) {
         for (kind, icon) in [(ICON_SMALL, &self.small), (ICON_BIG, &self.large)] {
+            // SAFETY: The owner retains both icons until replaced or the window tree terminates; WM_SETICON
+            // receives native handles only and no RefCell borrow crosses the synchronous callback.
             unsafe {
                 SendMessageW(
                     hwnd,

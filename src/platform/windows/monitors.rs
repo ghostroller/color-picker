@@ -33,6 +33,8 @@ impl Monitors {
         let mut enumeration = Enumeration::default();
         // Enumeration is synchronous. Only a raw pointer, not a live Rust borrow,
         // crosses the API call that invokes our callback on this thread.
+        // SAFETY: Enumeration is synchronous on this thread; the stack Enumeration is alive and not otherwise borrowed
+        // while callbacks mutate it, and Windows does not retain its pointer.
         let (completed, error) = unsafe {
             SetLastError(ERROR_SUCCESS);
             let completed = EnumDisplayMonitors(
@@ -90,6 +92,8 @@ impl EnumerationFailure {
     }
 }
 
+/// # Safety
+/// Invoked synchronously by enumerate with exclusive access to its stack Enumeration context.
 unsafe extern "system" fn collect_monitor(
     monitor: HMONITOR,
     _dc: HDC,
@@ -97,6 +101,7 @@ unsafe extern "system" fn collect_monitor(
     context: LPARAM,
 ) -> BOOL {
     // This pointer is supplied by enumerate and is valid for the synchronous call.
+    // SAFETY: context is the live Enumeration passed exclusively by enumerate to this synchronous callback.
     let Some(enumeration) = (unsafe { (context.0 as *mut Enumeration).as_mut() }) else {
         return false.into();
     };
@@ -106,6 +111,7 @@ unsafe extern "system" fn collect_monitor(
             cbSize: size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
+        // SAFETY: monitor comes from the active enumeration; MONITORINFO is initialized with its exact size.
         let (success, error) = unsafe {
             SetLastError(ERROR_SUCCESS);
             let success = GetMonitorInfoW(monitor, &mut information).as_bool();

@@ -64,6 +64,8 @@ impl CopyPlatform for NativeCopyPlatform {
     }
 
     fn arm(&mut self, owner: HWND, timer: usize, delay_ms: u32) -> Result<()> {
+        // SAFETY: The host keeps owner alive through this UI-thread request; unique timer/token pairing
+        // rejects obsolete messages and no TIMERPROC or application pointer is supplied.
         if unsafe { SetTimer(Some(owner), timer, delay_ms, None) } == 0 {
             return Err(Error::from_thread());
         }
@@ -71,6 +73,7 @@ impl CopyPlatform for NativeCopyPlatform {
     }
 
     fn disarm(&mut self, owner: HWND, timer: usize) {
+        // SAFETY: Cancel only this job's timer while its host remains live; queued stale tokens are ignored.
         let _ = unsafe { KillTimer(Some(owner), timer) };
     }
 }

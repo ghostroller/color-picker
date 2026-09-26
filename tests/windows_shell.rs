@@ -65,12 +65,18 @@ fn resident_shell_smoke() {
     let mut primary = AppChild::spawn();
     let hwnd = primary.wait_ready(&title);
 
+    // SAFETY: Query visibility on the fixture HWND without dereferencing or retaining any
+    // native pointer.
     assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
     assert!(
+        // SAFETY: query the identified test child HWND; the parent handle is used only
+        // for this assertion.
         unsafe { GetParent(hwnd) }.is_err(),
         "host must have no parent"
     );
     assert_eq!(
+        // SAFETY: Query scalar style bits of the identified child HWND; no userdata
+        // pointer is decoded.
         unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32 & WS_CHILD.0,
         0
     );
@@ -160,6 +166,8 @@ fn resident_shell_smoke() {
     // The posted TaskbarCreated message also provides an observable barrier:
     // reaching its restoration counter means the preceding stale timer was dequeued.
     let restorations = diagnostic(hwnd, 4);
+    // SAFETY: The registered message name is a static terminated UTF-16 string; registration
+    // retains no Rust allocation.
     let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     assert_ne!(taskbar_created, 0, "could not register TaskbarCreated");
     primary.post(hwnd, WM_TIMER, WPARAM(first_timer), LPARAM(0));
@@ -296,6 +304,8 @@ fn matching_hosts(title: &[u16]) -> Vec<HWND> {
     let mut result = Vec::new();
     let mut previous = None;
     while let Ok(hwnd) =
+        // SAFETY: The class and title are live terminated strings; enumeration borrows
+        // HWND values without accessing callback pointers.
         unsafe { FindWindowExW(None, previous, HOST_CLASS, PCWSTR(title.as_ptr())) }
     {
         result.push(hwnd);
@@ -307,12 +317,15 @@ fn matching_hosts(title: &[u16]) -> Vec<HWND> {
 
 fn window_process(hwnd: HWND) -> u32 {
     let mut process = 0;
+    // SAFETY: The HWND is only queried and the process-ID output points to a writable local u32.
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process)) };
     process
 }
 
 fn try_diagnostic(hwnd: HWND, field: usize) -> Option<usize> {
     let mut result = 0;
+    // SAFETY: The identified test child receives scalar diagnostics; the writable result
+    // slot stays alive through this bounded synchronous call.
     let sent = unsafe {
         SendMessageTimeoutW(
             hwnd,
@@ -463,6 +476,8 @@ impl AppChild {
                 self.child.try_wait().unwrap().is_none(),
                 "test child exited before becoming ready"
             );
+            // SAFETY: The class and title are live terminated strings; ownership is
+            // checked before sending any message to the returned HWND.
             if let Ok(hwnd) = unsafe { FindWindowW(HOST_CLASS, PCWSTR(title.as_ptr())) } {
                 self.assert_owns(hwnd);
                 self.hwnd = Some(hwnd);
@@ -488,6 +503,8 @@ impl AppChild {
 
     fn post(&self, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
         self.assert_owns(hwnd);
+        // SAFETY: The HWND was checked against this test child process; the posted
+        // message contains only scalar values and no borrowed pointers.
         unsafe { PostMessageW(Some(hwnd), message, wparam, lparam) }.unwrap();
     }
 
@@ -524,6 +541,8 @@ impl Drop for AppChild {
         if let Some(hwnd) = self.hwnd
             && window_process(hwnd) == self.child.id()
         {
+            // SAFETY: The HWND was checked against this test child process; the
+            // posted message contains only scalar values and no borrowed pointers.
             let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
             let deadline = Instant::now() + Duration::from_millis(500);
             while Instant::now() < deadline {
@@ -594,6 +613,8 @@ struct HotkeyReservation;
 
 impl HotkeyReservation {
     fn new() -> Self {
+        // SAFETY: Register only this test thread hotkey ID; its reservation guard
+        // unregisters the same ID on this thread.
         unsafe {
             RegisterHotKey(None, CONFLICT_HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, u32::from(VK_C.0))
         }
@@ -604,6 +625,8 @@ impl HotkeyReservation {
 
 impl Drop for HotkeyReservation {
     fn drop(&mut self) {
+        // SAFETY: Release the hotkey ID successfully registered by this guard on the
+        // same test thread.
         let _ = unsafe { UnregisterHotKey(None, CONFLICT_HOTKEY_ID) };
     }
 }

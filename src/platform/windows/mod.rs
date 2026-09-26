@@ -7,6 +7,8 @@ pub mod capture;
 pub mod clipboard;
 pub mod config_path;
 pub(crate) mod copy_job;
+pub(crate) mod dib;
+pub(crate) mod gdi;
 pub mod host;
 pub mod hotkey;
 pub(crate) mod icon;
@@ -20,6 +22,7 @@ pub mod tray;
 
 pub fn check_environment() -> windows::core::Result<()> {
     // No DPI override: this checks the context supplied by the embedded manifest.
+    // SAFETY: these APIs query the current thread context and compare opaque handles only.
     let is_pmv2 = unsafe {
         AreDpiAwarenessContextsEqual(
             GetThreadDpiAwarenessContext(),

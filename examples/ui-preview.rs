@@ -95,7 +95,11 @@ mod fixture {
     struct Owner(HWND);
     impl Drop for Owner {
         fn drop(&mut self) {
+            // SAFETY: This fixture owner cancels its own scalar timer ID on the
+            // creating thread before destroying the HWND.
             let _ = unsafe { KillTimer(Some(self.0), 1) };
+            // SAFETY: This thread owns the fixture HWND; synchronous teardown
+            // finishes before its surrounding fixture resources are released.
             let _ = unsafe { DestroyWindow(self.0) };
         }
     }
@@ -166,6 +170,8 @@ mod fixture {
         } else {
             None
         };
+        // SAFETY: The class/title strings remain live and terminated during creation;
+        // this thread owns the returned fixture window and any callback data.
         let owner = Owner(unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -257,6 +263,8 @@ mod fixture {
             }
         };
         scene.process()?;
+        // SAFETY: Only this live fixture HWND is synchronously rendered into its owned
+        // DIB; GdiFlush completes GDI access before CPU reads.
         unsafe {
             // Cache the material while this overlay is still excluded from
             // capture. PrintWindow can then use it without sampling itself.
@@ -276,6 +284,8 @@ mod fixture {
             println!("Exported {mode} fixture to {}", output.display());
             return Ok(());
         }
+        // SAFETY: The fixture HWND remains owned until timer cancellation; no callback
+        // pointer or borrowed payload is registered.
         unsafe {
             if SetTimer(Some(owner.0), 1, seconds * 1000, None) == 0 {
                 return Err(Error::from_thread());
@@ -284,10 +294,13 @@ mod fixture {
         println!(
             "mode={mode} hwnd={} dpi={} timeout={seconds}s",
             scene.hwnd().0 as usize,
+            // SAFETY: Query only the live fixture HWND while its window owner remains in scope.
             unsafe { GetDpiForWindow(scene.hwnd()) }
         );
         let mut message = MSG::default();
         loop {
+            // SAFETY: The local MSG is a writable output buffer; no callback state
+            // borrow is held while this thread pumps messages.
             let received = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
             if received == -1 {
                 return Err(Error::from_thread());
@@ -301,8 +314,12 @@ mod fixture {
                 _ => false,
             };
             if !recorded_key
+                // SAFETY: The fixture dialog and stack MSG remain live for
+                // synchronous dispatch; no RefCell state borrow spans this call.
                 && (!dialog || !unsafe { IsDialogMessageW(scene.hwnd(), &message) }.as_bool())
             {
+                // SAFETY: The MSG came from this thread message loop and remains
+                // live for synchronous translation/dispatch.
                 unsafe {
                     let _ = TranslateMessage(&message);
                     DispatchMessageW(&message);
@@ -330,14 +347,27 @@ mod fixture {
 
     impl Drop for ExportSurface {
         fn drop(&mut self) {
+            // SAFETY: this fixture owns both handles. A failed restoration is
+            // followed by private DC destruction before any bitmap deletion.
             unsafe {
                 if !self.previous.is_invalid() {
-                    SelectObject(self.dc, self.previous);
+                    let restored = SelectObject(self.dc, self.previous);
+                    if restored.is_invalid() || restored.0 as isize == -1 {
+                        if !DeleteDC(self.dc).as_bool() {
+                            // Neither object can be safely released while their
+                            // selection relation remains uncertain; retain both.
+                            eprintln!("fixture export DC restoration failed; retaining resources");
+                            return;
+                        }
+                        self.dc = HDC::default();
+                    }
                 }
                 if !self.bitmap.is_invalid() {
                     let _ = DeleteObject(self.bitmap.into());
                 }
-                let _ = DeleteDC(self.dc);
+                if !self.dc.is_invalid() {
+                    let _ = DeleteDC(self.dc);
+                }
             }
         }
     }
@@ -346,6 +376,8 @@ mod fixture {
         use std::io::Write;
 
         let mut client = RECT::default();
+        // SAFETY: The fixture window remains alive and the RECT/POINT outputs are
+        // writable local values used only for these synchronous queries.
         unsafe { GetClientRect(hwnd, &mut client)? };
         let width = client.right - client.left;
         let height = client.bottom - client.top;
@@ -356,6 +388,8 @@ mod fixture {
             .ok_or_else(|| Error::new(E_FAIL, "Invalid fixture export dimensions"))?
             as u32;
         let mut surface = ExportSurface {
+            // SAFETY: Create a private offscreen DC for this fixture; ExportSurface
+            // pairs it with DeleteDC on this thread.
             dc: unsafe { CreateCompatibleDC(None) },
             bitmap: HBITMAP::default(),
             previous: HGDIOBJ::default(),
@@ -377,6 +411,8 @@ mod fixture {
             ..Default::default()
         };
         let mut pixels = std::ptr::null_mut();
+        // SAFETY: BITMAPINFO describes the checked top-down BGRX allocation; the output
+        // pointer slot is valid and the surface owns the returned bitmap.
         surface.bitmap = unsafe {
             CreateDIBSection(
                 Some(surface.dc),
@@ -390,10 +426,18 @@ mod fixture {
         if pixels.is_null() {
             return Err(Error::new(E_FAIL, "Fixture bitmap has no pixel storage"));
         }
+        // SAFETY: the fresh unselected DIB owns the validated writable byte span.
+        // Initialize all bytes, including X, before PrintWindow or CPU slice access.
+        unsafe { pixels.cast::<u8>().write_bytes(0, pixel_bytes as usize) };
+        // SAFETY: the fresh bitmap is uniquely owned by surface and unselected;
+        // the previous stock bitmap is borrowed and restored before deletion.
         surface.previous = unsafe { SelectObject(surface.dc, surface.bitmap.into()) };
-        if surface.previous.is_invalid() {
+        if surface.previous.is_invalid() || surface.previous.0 as isize == -1 {
+            surface.previous = HGDIOBJ::default();
             return Err(Error::new(E_FAIL, "Could not select fixture bitmap"));
         }
+        // SAFETY: Only this live fixture HWND is synchronously rendered into its owned
+        // DIB; GdiFlush completes GDI access before CPU reads.
         unsafe {
             let _ = RedrawWindow(
                 Some(hwnd),
@@ -411,6 +455,8 @@ mod fixture {
             }
         }
         let pixels =
+            // SAFETY: The checked DIB allocation was initialized in full, GdiFlush
+            // succeeded, and ExportSurface owns it throughout this borrowed slice.
             unsafe { std::slice::from_raw_parts(pixels.cast::<u8>(), pixel_bytes as usize) };
         // Write the 14-byte file and 40-byte DIB headers explicitly, avoiding
         // Rust struct padding and any dependency on an image encoding crate.
@@ -436,6 +482,8 @@ mod fixture {
     }
 
     fn backdrop(focus: ScreenPointPx) -> Result<Owner> {
+        // SAFETY: The current executable module remains loaded throughout this fixture;
+        // its borrowed handle is not released.
         let instance = unsafe { GetModuleHandleW(None)? }.into();
         let class = WNDCLASSW {
             lpfnWndProc: Some(backdrop_proc),
@@ -443,7 +491,11 @@ mod fixture {
             lpszClassName: w!("ColorPicker.MaterialFixture"),
             ..Default::default()
         };
+        // SAFETY: The class definition and terminated name are valid for registration;
+        // its system callback remains present for every fixture window.
         unsafe { RegisterClassW(&class) };
+        // SAFETY: The class/title strings remain live and terminated during creation;
+        // this thread owns the returned fixture window and any callback data.
         let window = Owner(unsafe {
             CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -460,6 +512,8 @@ mod fixture {
                 None,
             )?
         });
+        // SAFETY: Synchronously paint only the live fixture window; no callback-state
+        // borrow spans this reentrant operation.
         unsafe {
             let _ = ShowWindow(window.0, SW_SHOWNOACTIVATE);
             let _ = UpdateWindow(window.0);
@@ -468,6 +522,9 @@ mod fixture {
         Ok(window)
     }
 
+    /// # Safety
+    /// Invoked by Win32 for the registered fixture class, with its unchanged
+    /// message parameters; WM_PAINT permits a paired BeginPaint/EndPaint session.
     unsafe extern "system" fn backdrop_proc(
         hwnd: HWND,
         message: u32,
@@ -476,7 +533,10 @@ mod fixture {
     ) -> LRESULT {
         if message == WM_PAINT {
             let mut paint = PAINTSTRUCT::default();
+            // SAFETY: This is the fixture WM_PAINT callback with a live HWND and
+            // writable PAINTSTRUCT; EndPaint pairs the returned session.
             let dc = unsafe { BeginPaint(hwnd, &mut paint) };
+            // SAFETY: This stock brush is borrowed, never deleted by the fixture.
             let brush = HBRUSH(unsafe { GetStockObject(DC_BRUSH) }.0);
             for row in 0..7 {
                 for col in 0..10 {
@@ -491,15 +551,22 @@ mod fixture {
                         right: (col + 1) * 60,
                         bottom: (row + 1) * 60,
                     };
+                    // SAFETY: The active paint DC is live and the stock
+                    // brush is borrowed; each rectangle is a valid local
+                    // value for the synchronous fill.
                     unsafe {
                         SetDCBrushColor(dc, color);
                         FillRect(dc, &rect, brush);
                     }
                 }
             }
+            // SAFETY: This HWND and PAINTSTRUCT pair matches the BeginPaint call
+            // earlier in the same callback.
             let _ = unsafe { EndPaint(hwnd, &paint) };
             return LRESULT(0);
         }
+        // SAFETY: Forward the original Win32 callback parameters synchronously to the
+        // default procedure; no payload is retained.
         unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
     }
 }

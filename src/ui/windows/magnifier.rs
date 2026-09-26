@@ -1,5 +1,9 @@
 //! Fixed-window, event-driven magnification of one immutable screen snapshot.
 
+use super::messages;
+use super::window_lifetime::{WindowInit, WindowLifetime, WindowRole};
+use crate::platform::windows::gdi::{BitmapDc, DesktopDc, PaintSession};
+
 use std::{
     cell::RefCell,
     marker::PhantomData,
@@ -11,7 +15,7 @@ use windows::{
     Win32::{
         Foundation::{
             COLORREF, E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, ERROR_CLASS_ALREADY_EXISTS,
-            ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, RECT, SIZE, SetLastError, WPARAM,
+            GetLastError, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM,
         },
         Graphics::{
             Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute},
@@ -24,7 +28,7 @@ use windows::{
 };
 
 use super::drawing::{
-    OwnedFont, PaintSession, border_thickness, dip, draw_bottom_right_border, draw_text, palette,
+    OwnedFont, border_thickness, dip, draw_bottom_right_border, draw_text, palette,
 };
 use super::frost::FrostedPanel;
 use crate::{
@@ -140,11 +144,17 @@ impl State {
     }
 }
 
+#[derive(Default)]
+struct CallbackData {
+    lifetime: WindowLifetime,
+    state: RefCell<State>,
+}
+
 /// All handles and the borrowed callback allocation belong to the UI thread.
 /// No sampling or timers are performed by this window.
 pub struct MagnifierWindow {
     hwnd: HWND,
-    state: Box<RefCell<State>>,
+    state: Box<CallbackData>,
     _thread: PhantomData<Rc<()>>,
 }
 
@@ -224,6 +234,7 @@ impl MagnifierWindow {
         if work_area.is_empty() {
             return Err(Error::new(E_INVALIDARG, "Invalid magnifier work area"));
         }
+        // SAFETY: The process module is borrowed for class/window creation; no handle ownership transfers.
         let instance = unsafe { GetModuleHandleW(None)? }.into();
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
@@ -231,46 +242,58 @@ impl MagnifierWindow {
             lpszClassName: CLASS_NAME,
             ..Default::default()
         };
+        // SAFETY: The class uses a static callback/name and the process module remains live.
         if unsafe { RegisterClassW(&class) } == 0
+            // SAFETY: Read the error from the immediately preceding native class registration.
             && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS
         {
             return Err(Error::from_thread());
         }
-        let state = Box::new(RefCell::new(State::default()));
-        let pointer = state.as_ref() as *const RefCell<State>;
+        let state = Box::new(CallbackData::default());
+        let pointer = state.as_ref() as *const CallbackData;
+        let init = WindowInit {
+            state: pointer.cast(),
+            role: WindowRole::Root,
+        };
         let title: Vec<u16> = tr("缩放取色 — Color Picker", "Zoom picker — Color Picker")
             .encode_utf16()
             .chain(Some(0))
             .collect();
         // Creating the hidden one-pixel window on the target monitor establishes
         // its actual DPI before any DIP-sized layout is tested against work area.
+        // SAFETY: The stack WindowInit lives through synchronous creation; only its stable Box pointer is retained.
         let hwnd = unsafe {
-            CreateWindowExW(
-                WS_EX_TOPMOST
-                    | WS_EX_TOOLWINDOW
-                    | WS_EX_NOACTIVATE
-                    | WS_EX_LAYERED
-                    | WS_EX_TRANSPARENT,
-                CLASS_NAME,
-                PCWSTR(title.as_ptr()),
-                WS_POPUP,
-                focus.x.clamp(work_area.left, work_area.right - 1),
-                focus.y.clamp(work_area.top, work_area.bottom - 1),
-                1,
-                1,
-                None,
-                None,
-                Some(instance),
-                Some(pointer.cast()),
-            )?
+            super::window_lifetime::create_window(|| {
+                CreateWindowExW(
+                    WS_EX_TOPMOST
+                        | WS_EX_TOOLWINDOW
+                        | WS_EX_NOACTIVATE
+                        | WS_EX_LAYERED
+                        | WS_EX_TRANSPARENT,
+                    CLASS_NAME,
+                    PCWSTR(title.as_ptr()),
+                    WS_POPUP,
+                    focus.x.clamp(work_area.left, work_area.right - 1),
+                    focus.y.clamp(work_area.top, work_area.bottom - 1),
+                    1,
+                    1,
+                    None,
+                    None,
+                    Some(instance),
+                    Some((&init as *const WindowInit).cast()),
+                )
+            })
         };
+        let hwnd = state.lifetime.creation_result("magnifier", hwnd)?;
         let window = Self {
             hwnd,
             state,
             _thread: PhantomData,
         };
+        // SAFETY: This owned live window and the correctly sized attribute value outlive the synchronous call.
         unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)? };
         let disabled = BOOL::from(true);
+        // SAFETY: This owned live window and the correctly sized attribute value outlive the synchronous call.
         unsafe {
             DwmSetWindowAttribute(
                 hwnd,
@@ -280,6 +303,7 @@ impl MagnifierWindow {
             )?;
         }
         let capture_excluded =
+            // SAFETY: Apply the capture policy to our live same-process overlay window.
             match unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
                 Ok(()) => true,
                 Err(error) => {
@@ -287,6 +311,7 @@ impl MagnifierWindow {
                     false
                 }
             };
+        // SAFETY: Query the live window/control handle during its owner or callback lifetime.
         let dpi = unsafe { GetDpiForWindow(hwnd) };
         let (bounds, viewport) = window_layout(focus, work_area, dpi)?;
         Ok(PreparedMagnifier {
@@ -304,22 +329,24 @@ impl MagnifierWindow {
     }
 
     pub fn rect(&self) -> Option<ScreenRectPx> {
-        let state = self.state.borrow();
+        let state = self.state.state.borrow();
         if state.visible { state.bounds } else { None }
     }
 
     pub fn hide(&self) {
         let visible = {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.state.state.borrow_mut();
             std::mem::replace(&mut state.visible, false)
         };
         if visible {
+            // SAFETY: The window owner retains the native window and no RefCell borrow spans this reentrant call.
             let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
         }
     }
 
     pub fn scale_factor(&self) -> u32 {
         self.state
+            .state
             .borrow()
             .view
             .as_ref()
@@ -327,7 +354,7 @@ impl MagnifierWindow {
     }
 
     pub fn hit_test(&self, point: ScreenPointPx) -> Option<PickedColor> {
-        let state = self.state.borrow();
+        let state = self.state.state.borrow();
         // Confirm from the event coordinate, even if hover painting is delayed.
         let pixel = state.hit_test(point)?;
         Some(PickedColor {
@@ -339,7 +366,7 @@ impl MagnifierWindow {
 
     pub fn update_hover(&self, point: ScreenPointPx) -> Result<bool> {
         let changed = {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.state.state.borrow_mut();
             state.check()?;
             let hover = if state.accepts_pointer(point) {
                 state.view.as_mut().and_then(|view| view.select_at(point))
@@ -364,7 +391,7 @@ impl MagnifierWindow {
     /// snapshot and resume Live with fresh sampling resources.
     pub fn change_scale(&self, up: bool, point: ScreenPointPx) -> Result<bool> {
         let changed = {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.state.state.borrow_mut();
             state.check()?;
             let accepts_pointer = state.accepts_pointer(point);
             let view = state
@@ -400,6 +427,7 @@ impl MagnifierWindow {
     }
 
     fn invalidate(&self) -> Result<()> {
+        // SAFETY: Queue painting only for the still-owned overlay; no payload pointer is retained.
         if unsafe { InvalidateRect(Some(self.hwnd), None, false) }.as_bool() {
             Ok(())
         } else {
@@ -446,7 +474,7 @@ impl PreparedMagnifier {
             appearance,
         )?;
         {
-            let mut state = window.state.borrow_mut();
+            let mut state = window.state.state.borrow_mut();
             state.hover =
                 if inside_uncovered_window(focus, bounds, dpi, appearance.border_width_dip) {
                     view.hit_test(focus)
@@ -458,6 +486,7 @@ impl PreparedMagnifier {
             state.bounds = Some(bounds);
             state.refresh_text();
         }
+        // SAFETY: The owned window is live; all mutable state borrows have ended before possible reentry.
         unsafe {
             SetWindowPos(
                 window.hwnd,
@@ -466,27 +495,30 @@ impl PreparedMagnifier {
                 bounds.top,
                 bounds.width() as i32,
                 bounds.height() as i32,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOACTIVATE
+                    | if super::window_lifetime::show_native_windows() {
+                        SWP_SHOWWINDOW
+                    } else {
+                        SET_WINDOW_POS_FLAGS(0)
+                    },
             )?;
         }
-        window.state.borrow_mut().visible = true;
+        window.state.state.borrow_mut().visible = true;
         window.invalidate()?;
         // Frozen has no periodic timer to discover a failed initial paint.
         // Present synchronously, without holding a state borrow across reentry.
+        // SAFETY: The owned window is live and state borrows ended before synchronous WM_PAINT dispatch.
         if !unsafe { UpdateWindow(window.hwnd) }.as_bool() {
             return Err(failure("Could not present the initial frozen frame"));
         }
-        window.state.borrow_mut().check()?;
+        window.state.state.borrow_mut().check()?;
         Ok(window)
     }
 }
 
 impl Drop for MagnifierWindow {
     fn drop(&mut self) {
-        if let Err(error) = unsafe { DestroyWindow(self.hwnd) } {
-            unsafe { SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0) };
-            diagnostics::event(format_args!("magnifier.destroy_failed {error}"));
-        }
+        self.state.lifetime.destroy("magnifier");
     }
 }
 
@@ -566,32 +598,56 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    catch_unwind(AssertUnwindSafe(|| {
+    // SAFETY: The registered native procedure supplies the matching message payload and stable userdata.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
         window_message(hwnd, message, wparam, lparam)
     }))
     .unwrap_or_else(|_| std::process::abort())
 }
 
-fn window_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+/// # Safety
+/// Called only by this registered Win32 procedure with the native payload for
+/// `message`; callback userdata is a stable Box retained until root termination.
+unsafe fn window_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if message == WM_NCCREATE {
-        let creation = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
-        unsafe { SetLastError(ERROR_SUCCESS) };
-        let previous =
-            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, creation.lpCreateParams as isize) };
-        return LRESULT(
-            i32::from(previous != 0 || unsafe { GetLastError() } == ERROR_SUCCESS) as isize,
-        );
+        // SAFETY: native creation supplies the stack init for this synchronous
+        // call; the stable callback allocation is retained by its Rust owner.
+        return unsafe {
+            messages::with_window_init(lparam, |init| {
+                let callback = &*(init.state as *const CallbackData);
+                LRESULT(isize::from(callback.lifetime.attach(hwnd, init)))
+            })
+        }
+        .unwrap_or(LRESULT(0));
     }
-    if message == WM_NCDESTROY {
-        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
-        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
-    }
-    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const RefCell<State>;
-    if !pointer.is_null() {
-        let state = unsafe { &*pointer };
+    // SAFETY: userdata comes from the stable CallbackData allocation and its
+    // owner waits for this root's WM_NCDESTROY before releasing it.
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const CallbackData;
+    // SAFETY: null means no attachment; otherwise the allocation outlives this call.
+    if let Some(callback) = unsafe { pointer.as_ref() } {
+        if message == WM_NCDESTROY {
+            // SAFETY: finish the native procedure before marking the root terminal.
+            let result = unsafe {
+                let result = DefWindowProcW(hwnd, message, wparam, lparam);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                result
+            };
+            callback.lifetime.terminated(hwnd);
+            return result;
+        }
+        let state = &callback.state;
         match message {
             WM_PAINT => {
-                let paint = PaintSession::begin(hwnd);
+                // SAFETY: establish WM_PAINT before borrowing mutable callback state.
+                let paint = match unsafe { PaintSession::begin(hwnd) } {
+                    Ok(paint) => paint,
+                    Err(error) => {
+                        if let Ok(mut state) = state.try_borrow_mut() {
+                            state.paint_error = Some(error);
+                        }
+                        return LRESULT(0);
+                    }
+                };
                 if let Ok(mut state) = state.try_borrow_mut()
                     && let Err(error) = state.draw(paint.dc)
                 {
@@ -611,44 +667,30 @@ fn window_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> L
             _ => {}
         }
     }
+    // SAFETY: Forward the original native callback arguments without retaining message storage.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
-struct MemoryDc(HDC);
-impl Drop for MemoryDc {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteDC(self.0) };
-    }
-}
-struct OwnedBitmap(HBITMAP);
-impl Drop for OwnedBitmap {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteObject(self.0.into()) };
-    }
-}
-struct ScreenDc(HDC);
-impl Drop for ScreenDc {
-    fn drop(&mut self) {
-        let _ = unsafe { ReleaseDC(None, self.0) };
-    }
-}
-
 struct Surface {
-    dc: MemoryDc,
-    _bitmap: OwnedBitmap,
+    buffer: BitmapDc,
     heading_font: OwnedFont,
     body_font: OwnedFont,
     compact_font: OwnedFont,
     narrow_font: OwnedFont,
     frost: Option<FrostedPanel>,
     appearance: AppearanceConfig,
-    old_bitmap: HGDIOBJ,
     width: i32,
     height: i32,
     dpi: u32,
 }
 
 impl Surface {
+    fn dc(&self) -> Result<HDC> {
+        // SAFETY: this private compatible buffer exposes no CPU view and no
+        // drawing operation replaces its bitmap or retains its DC handle.
+        unsafe { self.buffer.raw() }
+    }
+
     fn new(
         width: i32,
         height: i32,
@@ -656,18 +698,8 @@ impl Surface {
         capture_excluded: bool,
         appearance: AppearanceConfig,
     ) -> Result<Self> {
-        let screen = ScreenDc(unsafe { GetDC(None) });
-        if screen.0.is_invalid() {
-            return Err(failure("Could not obtain drawing DC"));
-        }
-        let dc = MemoryDc(unsafe { CreateCompatibleDC(Some(screen.0)) });
-        if dc.0.is_invalid() {
-            return Err(failure("Could not create magnifier DC"));
-        }
-        let bitmap = OwnedBitmap(unsafe { CreateCompatibleBitmap(screen.0, width, height) });
-        if bitmap.0.is_invalid() {
-            return Err(failure("Could not create magnifier buffer"));
-        }
+        let screen = DesktopDc::new()?;
+        let buffer = BitmapDc::compatible(screen.raw(), width, height)?;
         let heading_font = OwnedFont::new(13, 600, dpi)?;
         let body_font = OwnedFont::new(10, 400, dpi)?;
         // Small work areas can limit the physical width even at high DPI.
@@ -690,20 +722,14 @@ impl Surface {
         } else {
             None
         };
-        let old_bitmap = unsafe { SelectObject(dc.0, bitmap.0.into()) };
-        if old_bitmap.is_invalid() {
-            return Err(failure("Could not select magnifier bitmap"));
-        }
         Ok(Self {
-            dc,
-            _bitmap: bitmap,
+            buffer,
             heading_font,
             body_font,
             compact_font,
             narrow_font,
             frost,
             appearance,
-            old_bitmap,
             width,
             height,
             dpi,
@@ -751,14 +777,16 @@ impl Surface {
             },
             ..Default::default()
         };
-        if unsafe { SetStretchBltMode(self.dc.0, COLORONCOLOR) } == 0 {
+        // SAFETY: The private bitmap DC is valid and no CPU pixel view or bitmap replacement is active.
+        if unsafe { SetStretchBltMode(self.dc()?, COLORONCOLOR) } == 0 {
             return Err(failure(
                 "Could not select nearest-neighbor magnifier drawing",
             ));
         }
+        // SAFETY: Validated FrozenImage rows cover the top-down BGRX dimensions; GDI reads them only during this call.
         if unsafe {
             StretchDIBits(
-                self.dc.0,
+                self.dc()?,
                 drawn.left,
                 drawn.top,
                 drawn.right - drawn.left,
@@ -829,12 +857,13 @@ impl Surface {
         }
         self.draw_footer(viewport.bottom, footer, bounds)?;
         draw_bottom_right_border(
-            self.dc.0,
+            self.dc()?,
             self.width,
             self.height,
             self.dpi,
             self.appearance.border_width_dip,
         )?;
+        // SAFETY: The private selected bitmap and borrowed paint target remain live for this synchronous copy.
         unsafe {
             BitBlt(
                 target,
@@ -842,7 +871,7 @@ impl Surface {
                 0,
                 self.width,
                 self.height,
-                Some(self.dc.0),
+                Some(self.dc()?),
                 0,
                 0,
                 SRCCOPY,
@@ -869,7 +898,7 @@ impl Surface {
             };
             if frost
                 .paint(
-                    self.dc.0,
+                    self.dc()?,
                     panel,
                     ScreenPointPx {
                         x: bounds.left,
@@ -911,7 +940,7 @@ impl Surface {
         } in self.footer_labels(footer, border)?
         {
             draw_text(
-                self.dc.0,
+                self.dc()?,
                 font,
                 RECT {
                     top: top + rect.top,
@@ -926,7 +955,7 @@ impl Surface {
     }
 
     fn text_size(&self, font: &OwnedFont, text: &[u16]) -> Result<SIZE> {
-        font.measure(self.dc.0, text)
+        font.measure(self.dc()?, text)
     }
 
     fn footer_swatch_width(&self, footer: &Footer, border: i32) -> Result<i32> {
@@ -1027,8 +1056,10 @@ impl Surface {
     }
 
     fn brush(&self, color: COLORREF) -> Result<HBRUSH> {
+        // SAFETY: DC_BRUSH is borrowed stock storage and never becomes an owned/deleted object.
         let brush = HBRUSH(unsafe { GetStockObject(DC_BRUSH) }.0);
-        if brush.is_invalid() || unsafe { SetDCBrushColor(self.dc.0, color) }.0 == CLR_INVALID {
+        // SAFETY: Only the live private DC's stock-brush color changes; no object ownership transfers.
+        if brush.is_invalid() || unsafe { SetDCBrushColor(self.dc()?, color) }.0 == CLR_INVALID {
             return Err(failure("Could not configure magnifier drawing brush"));
         }
         Ok(brush)
@@ -1039,7 +1070,8 @@ impl Surface {
         if rect.right <= rect.left || rect.bottom <= rect.top {
             return Ok(());
         }
-        if unsafe { FillRect(self.dc.0, &rect, self.brush(color)?) } == 0 {
+        // SAFETY: The DC, rectangle and borrowed/owned brush remain valid for this synchronous fill.
+        if unsafe { FillRect(self.dc()?, &rect, self.brush(color)?) } == 0 {
             Err(failure("Could not fill magnifier buffer"))
         } else {
             Ok(())
@@ -1060,14 +1092,6 @@ struct FooterLabel<'a> {
     font: &'a OwnedFont,
     color: COLORREF,
     text: &'a [u16],
-}
-
-impl Drop for Surface {
-    fn drop(&mut self) {
-        unsafe {
-            SelectObject(self.dc.0, self.old_bitmap);
-        }
-    }
 }
 
 fn local_rect(rect: ScreenRectPx, bounds: ScreenRectPx) -> RECT {
@@ -1199,7 +1223,7 @@ mod tests {
         let surface = state.surface.as_ref().unwrap();
         let view = state.view.as_ref().unwrap();
         let bounds = state.bounds.unwrap();
-        state.draw(surface.dc.0).unwrap();
+        state.draw(surface.dc().unwrap()).unwrap();
         assert_eq!(
             state.hover,
             state.hit_test(point),
@@ -1218,9 +1242,10 @@ mod tests {
             let center = view.cell_center(pixel.cache).unwrap();
             let scale = view.scale().factor() as i32;
             assert_eq!(
+                // SAFETY: The fixture retains its private surface/DC; sampled coordinates lie within the allocated bitmap.
                 unsafe {
                     GetPixel(
-                        surface.dc.0,
+                        surface.dc().unwrap(),
                         center.x - bounds.left - scale / 2 + 1,
                         center.y - bounds.top - scale / 2,
                     )
@@ -1236,7 +1261,8 @@ mod tests {
             for y in drawn.top..drawn.bottom {
                 for x in drawn.left..drawn.right - 2 {
                     assert_ne!(
-                        unsafe { GetPixel(surface.dc.0, x, y) },
+                        // SAFETY: The fixture retains its private surface/DC; sampled coordinates lie within the allocated bitmap.
+                        unsafe { GetPixel(surface.dc().unwrap(), x, y) },
                         COLORREF(0x00ffffff)
                     );
                 }
@@ -1568,10 +1594,12 @@ mod tests {
                         bottom: height,
                     };
                     surface.draw_footer(0, &footer, bounds).unwrap();
-                    draw_bottom_right_border(surface.dc.0, width, height, dpi, border).unwrap();
+                    draw_bottom_right_border(surface.dc().unwrap(), width, height, dpi, border)
+                        .unwrap();
                     let color = COLORREF(0x00dddddd);
                     let rows: Vec<_> = (0..height)
-                        .filter(|&y| unsafe { GetPixel(surface.dc.0, 0, y) == color })
+                        // SAFETY: The fixture retains its private surface/DC; sampled coordinates lie within the allocated bitmap.
+                        .filter(|&y| unsafe { GetPixel(surface.dc().unwrap(), 0, y) == color })
                         .collect();
                     assert!(
                         !rows.is_empty(),
@@ -1579,7 +1607,8 @@ mod tests {
                     );
                     let y = rows[rows.len() / 2];
                     let visible_width = (0..width)
-                        .take_while(|&x| unsafe { GetPixel(surface.dc.0, x, y) == color })
+                        // SAFETY: The fixture retains its private surface/DC; sampled coordinates lie within the allocated bitmap.
+                        .take_while(|&x| unsafe { GetPixel(surface.dc().unwrap(), x, y) == color })
                         .count();
                     assert_eq!(
                         visible_width,
@@ -1654,7 +1683,13 @@ mod tests {
                 // Paint through the real GDI path into its own offscreen buffer.
                 // No desktop capture, visible window or synthesized input.
                 surface
-                    .draw(surface.dc.0, &view, bounds, None, &Footer::default())
+                    .draw(
+                        surface.dc().unwrap(),
+                        &view,
+                        bounds,
+                        None,
+                        &Footer::default(),
+                    )
                     .unwrap();
                 let source = view.source_view();
                 for y in [
@@ -1669,8 +1704,13 @@ mod tests {
                     ] {
                         let point = view.cell_center(CachePoint { x, y }).unwrap();
                         let pixel = view.hit_test(point).unwrap();
+                        // SAFETY: The fixture retains its private surface/DC; sampled coordinates lie within the allocated bitmap.
                         let rendered = unsafe {
-                            GetPixel(surface.dc.0, point.x - bounds.left, point.y - bounds.top)
+                            GetPixel(
+                                surface.dc().unwrap(),
+                                point.x - bounds.left,
+                                point.y - bounds.top,
+                            )
                         };
                         let expected = COLORREF(
                             u32::from(pixel.rgb.r)

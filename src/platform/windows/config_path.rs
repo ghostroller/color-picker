@@ -15,6 +15,7 @@ use windows::{
 pub fn default_config_path() -> Result<PathBuf> {
     // KF_FLAG_DEFAULT only locates the known folder; it does not request its
     // creation or alter the folder itself. Saving creates our child directory.
+    // SAFETY: The GUID is initialized; Windows returns a terminated CoTaskMem allocation owned by this guard.
     let allocation = KnownFolderPath(unsafe {
         SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None)?
     });
@@ -27,6 +28,7 @@ pub fn default_config_path() -> Result<PathBuf> {
             ),
         ));
     }
+    // SAFETY: SHGetKnownFolderPath succeeded and returned non-null terminated UTF-16; allocation remains live.
     let path = OsString::from_wide(unsafe { allocation.0.as_wide() });
     if path.is_empty() {
         return Err(Error::new(
@@ -43,6 +45,7 @@ pub fn default_config_path() -> Result<PathBuf> {
 struct KnownFolderPath(PWSTR);
 impl Drop for KnownFolderPath {
     fn drop(&mut self) {
+        // SAFETY: This is the unique allocation returned by SHGetKnownFolderPath, released after the path was copied.
         unsafe { CoTaskMemFree(Some(self.0.0.cast())) };
     }
 }

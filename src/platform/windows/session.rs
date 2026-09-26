@@ -40,6 +40,8 @@ impl SessionTimer {
                 "Session timer IDs must be nonzero",
             ));
         }
+        // SAFETY: The host keeps hwnd alive through this UI-thread timer guard; the callback is None
+        // and its nonzero, non-reused ID routes only queued WM_TIMER messages.
         if unsafe { SetTimer(Some(hwnd), id, SAMPLE_INTERVAL_MS, None) } == 0 {
             return Err(Error::from_thread());
         }
@@ -58,12 +60,14 @@ impl SessionTimer {
 
 impl Drop for SessionTimer {
     fn drop(&mut self) {
+        // SAFETY: This guard owns the timer ID on its live host; cancellation does not dereference application state.
         let _ = unsafe { KillTimer(Some(self.hwnd), self.id) };
     }
 }
 
 pub fn cursor_position() -> Result<ScreenPointPx> {
     let mut point = POINT::default();
+    // SAFETY: point is a writable initialized POINT; GetCursorPos retains no pointer.
     unsafe { GetCursorPos(&mut point)? };
     Ok(ScreenPointPx {
         x: point.x,
@@ -72,5 +76,6 @@ pub fn cursor_position() -> Result<ScreenPointPx> {
 }
 
 pub fn flush_composition() -> Result<()> {
+    // SAFETY: DwmFlush synchronizes composition for this caller and takes no borrowed memory.
     unsafe { DwmFlush() }
 }

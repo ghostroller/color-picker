@@ -68,6 +68,8 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $repositoryRoot
 try {
     Invoke-CheckedNative cargo @('fmt', '--all', '--', '--check')
+    # Cargo.toml enables unsafe_op_in_unsafe_fn and undocumented_unsafe_blocks;
+    # all-targets deliberately includes tests, examples and the build script.
     Invoke-CheckedNative cargo @('clippy', '--all-targets', '--locked', '--', '-D', 'warnings')
     Invoke-CheckedNative cargo @('test', '--locked')
     Invoke-CheckedNative cargo @('build', '--release', '--locked', '--target', 'x86_64-pc-windows-msvc')

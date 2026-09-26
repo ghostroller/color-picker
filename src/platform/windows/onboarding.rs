@@ -33,6 +33,7 @@ thread_local! {
 pub(super) fn dismiss_pending() {
     GUIDE_CANCELLED.set(true);
     if let Some(hwnd) = ACTIVE_GUIDE.get() {
+        // SAFETY: ACTIVE_GUIDE contains only our live dialog; cancellation has scalar parameters and no retained pointer.
         let posted = unsafe {
             PostMessageW(
                 Some(hwnd),
@@ -44,6 +45,7 @@ pub(super) fn dismiss_pending() {
         if posted.is_err() {
             // A full posted-message queue must not strand shutdown. No Rust
             // borrow is retained across the synchronous fallback callback.
+            // SAFETY: The same owned dialog is live on this thread; no Rust borrow crosses SendMessage reentry.
             unsafe {
                 SendMessageW(
                     hwnd,
@@ -56,6 +58,8 @@ pub(super) fn dismiss_pending() {
     }
 }
 
+/// # Safety
+/// Invoked only by TaskDialogIndirect with its live dialog and documented notification values.
 unsafe extern "system" fn guide_callback(
     hwnd: HWND,
     notification: TASKDIALOG_NOTIFICATIONS,
@@ -103,6 +107,8 @@ fn show_guide(owner: HWND, text: &str) -> windows::core::Result<bool> {
         ..Default::default()
     };
     let mut button = 0;
+    // SAFETY: config, buttons, terminated UTF-16 strings and output button all live until this synchronous
+    // nested dialog returns; the callback retains only the temporary HWND, cleared at destruction.
     let result = unsafe { TaskDialogIndirect(&config, Some(&mut button), None, None) };
     // Also clear if native creation failed before TDN_DESTROYED was delivered.
     ACTIVE_GUIDE.set(None);
@@ -209,6 +215,8 @@ mod tests {
         assert!(guide_text("Ctrl + Shift + C", true).contains("按 Ctrl + Shift + C 开始取色"));
     }
 
+    /// # Safety
+    /// Registered only for the test class; parameters are forwarded from native dispatch.
     unsafe extern "system" fn test_owner_proc(
         hwnd: HWND,
         message: u32,
@@ -217,9 +225,11 @@ mod tests {
     ) -> LRESULT {
         match message {
             WM_TIMER if ACTIVE_GUIDE.get().is_some() => {
+                // SAFETY: This callback runs on the test window thread and cancels only its own active timer.
                 let _ = unsafe { KillTimer(Some(hwnd), wparam.0) };
                 // Reproduce the installer's exact host-close request after
                 // the real guide has entered its native message loop.
+                // SAFETY: Only this test's own window receives a scalar WM_CLOSE; no global input is generated.
                 let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
                 LRESULT(0)
             }
@@ -228,6 +238,7 @@ mod tests {
                 dismiss_pending();
                 LRESULT(0)
             }
+            // SAFETY: Forward the original native callback parameters unchanged to the default procedure.
             _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
         }
     }
@@ -238,6 +249,7 @@ mod tests {
         const CLASS: PCWSTR = w!("ColorPicker.OnboardingLifecycleTest.v1");
 
         fn new() -> Result<Self> {
+            // SAFETY: Borrow the process module, which remains loaded throughout this test class/window lifetime.
             let instance = unsafe { GetModuleHandleW(None)? }.into();
             let class = WNDCLASSW {
                 lpfnWndProc: Some(test_owner_proc),
@@ -245,7 +257,9 @@ mod tests {
                 lpszClassName: Self::CLASS,
                 ..Default::default()
             };
+            // SAFETY: class is initialized and callback/name remain valid for this registered test class.
             assert_ne!(unsafe { RegisterClassW(&class) }, 0);
+            // SAFETY: The test owns a fresh hidden window and supplies no application pointer to Windows.
             let hwnd = unsafe {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
@@ -268,6 +282,7 @@ mod tests {
 
     impl Drop for TestOwner {
         fn drop(&mut self) {
+            // SAFETY: This guard owns the window and class on their creation thread; destroy before unregistering.
             unsafe {
                 let _ = DestroyWindow(self.0);
                 let _ = UnregisterClassW(Self::CLASS, Some(self.1));
@@ -289,6 +304,7 @@ mod tests {
         let marker = directory.join("welcome-v1.seen");
         let owner = TestOwner::new().unwrap();
         EXIT_RECEIVED.set(false);
+        // SAFETY: The hidden test owner stays alive until its timer is cancelled and its guide returns.
         assert_ne!(unsafe { SetTimer(Some(owner.0), 1, 30, None) }, 0);
         let started = std::time::Instant::now();
         offer_once(&marker, || {

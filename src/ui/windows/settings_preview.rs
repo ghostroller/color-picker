@@ -9,13 +9,12 @@ use windows::{
     core::{Error, Result},
 };
 
-use super::super::{
-    drawing::{
-        OwnedFont, dip, draw_bottom_right_border, draw_text, live_preview_height_dip, palette,
-    },
-    frost::blur_and_tint,
+use super::super::drawing::{
+    OwnedFont, dip, draw_bottom_right_border, draw_text, live_preview_height_dip, palette,
 };
 use crate::app::{config::AppearanceConfig, i18n::tr};
+use crate::platform::windows::gdi::SavedDc;
+use crate::ui::pixel_effects::blur_and_tint;
 
 // Fill the widest settings content area (500 DIP minus two 40 DIP insets).
 // Narrower panes crop this generated background while keeping the overlay centered.
@@ -64,11 +63,10 @@ impl AppearancePreview {
             },
             ..Default::default()
         };
-        let saved = unsafe { SaveDC(dc) };
-        if saved == 0 {
-            return Err(Error::from_thread());
-        }
+        // SAFETY: this synchronous owner-draw DC remains live until paint returns.
+        let saved = unsafe { SavedDc::new(dc)? };
         let result = (|| {
+            // SAFETY: The local exact BGRX fixture covers BITMAPINFO dimensions and remains borrowed for the native copy.
             if unsafe {
                 SetDIBitsToDevice(
                     dc,
@@ -99,6 +97,7 @@ impl AppearancePreview {
                 self.dpi,
             );
             let y = bounds.top + (height - overlay_height) / 2;
+            // SAFETY: The borrowed owner-draw DC remains live and SavedDc restores the viewport before return.
             unsafe {
                 SetViewportOrgEx(dc, x, y, None).ok()?;
             }
@@ -130,7 +129,7 @@ impl AppearancePreview {
                 self.appearance.border_width_dip,
             )
         })();
-        let _ = unsafe { RestoreDC(dc, saved) };
+        saved.restore()?;
         result
     }
 }
@@ -171,7 +170,8 @@ fn example_pixels(dpi: u32, appearance: AppearanceConfig) -> Vec<u8> {
         overlay_height,
         dip(8, dpi).max(1) as usize,
         appearance.background_transparency_percent,
-    );
+    )
+    .expect("validated appearance and locally allocated exact BGRX fixture dimensions");
     for y in 0..overlay_height {
         for x in 0..swatch_width {
             let position = ((top + y) * width + left + x) * 4;

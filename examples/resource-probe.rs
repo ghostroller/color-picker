@@ -22,6 +22,7 @@ mod probe {
         fs::{File, OpenOptions},
         io::{self, Write},
         mem::size_of,
+        os::windows::io::AsRawHandle,
         path::PathBuf,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
@@ -350,18 +351,34 @@ mod probe {
     }
 
     fn submit_preview_frame() -> ProbeResult<()> {
+        // SAFETY: These identity queries return scalar IDs for the calling
+        // process/thread and do not borrow, retain, or create resources.
         let pid = unsafe { GetCurrentProcessId() };
+        // SAFETY: Query the current measurement thread's scalar identifier.
         let thread_id = unsafe { GetCurrentThreadId() };
         let mut after = None;
+        // SAFETY: The static class name is NUL terminated. after is the previous
+        // enumeration result; the query does not take ownership of any HWND.
         while let Ok(hwnd) =
+            // SAFETY: Enumerate the static preview class after the prior HWND;
+            // this query only borrows identifiers and retains no Rust pointers.
             unsafe { FindWindowExW(None, after, w!("ColorPicker.Preview.v1"), None) }
         {
             after = Some(hwnd);
             let mut owner = 0;
+            // SAFETY: USER32 validates the enumerated HWND and writes the local
+            // PID slot; identity is checked before touching the preview.
             let thread = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner)) };
             if owner == pid && thread == thread_id {
+                // SAFETY: This is our controller-owned preview on this thread;
+                // no state borrow spans paint dispatch, and no rect output is
+                // requested. The owner cannot drop during these synchronous calls.
                 if !unsafe { IsWindowVisible(hwnd) }.as_bool()
+                    // SAFETY: The controller retains this preview on our thread;
+                    // no callback-state borrow spans synchronous paint dispatch.
                     || !unsafe { UpdateWindow(hwnd) }.as_bool()
+                    // SAFETY: Query the owned preview's update status without
+                    // lending an output rectangle or changing its update region.
                     || unsafe { GetUpdateRect(hwnd, None, false) }.as_bool()
                 {
                     return Err(failure("The first preview frame could not be submitted"));
@@ -413,6 +430,8 @@ mod probe {
             if stop_at_live && matches!(controller.state(), AppState::Live { .. }) {
                 break;
             }
+            // SAFETY: MSG is initialized local output; no callback-state borrow
+            // is held while USER32 dispatches synchronous messages internally.
             if !unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
                 break;
             }
@@ -439,6 +458,8 @@ mod probe {
                 // rejected by the controller's current timer generation.
                 controller.on_timer(message.wParam.0)?;
             } else {
+                // SAFETY: MSG came from this measurement thread's queue and
+                // remains live; dispatch occurs outside window-state borrows.
                 unsafe {
                     let _ = TranslateMessage(&message);
                     DispatchMessageW(&message);
@@ -453,7 +474,10 @@ mod probe {
         if remaining.is_zero() {
             return Ok(());
         }
-        let handles = controller.input_wait_handle().map(|handle| [handle]);
+        let worker = controller.input_wait_handle();
+        let handles = worker.map(|handle| [HANDLE(handle.as_raw_handle())]);
+        // SAFETY: The controller borrow keeps its JoinHandle alive through this
+        // bounded wait; the native handles array is local and never retained.
         let result = unsafe {
             MsgWaitForMultipleObjectsEx(
                 handles.as_ref().map(|handles| handles.as_slice()),
@@ -514,12 +538,17 @@ mod probe {
         // Close the temporary thread-list snapshot before counting process
         // handles, so it is not mistaken for a persistent application handle.
         let thread_count = thread_count()?;
+        // SAFETY: This is a borrowed current-process pseudo handle, used only for
+        // queries below and never adopted by the CloseHandle owner.
         let process = unsafe { GetCurrentProcess() };
         let mut memory = PROCESS_MEMORY_COUNTERS_EX {
             cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
             ..Default::default()
         };
         let mut handle_count = 0;
+        // SAFETY: memory is an initialized EX structure whose prefix has the
+        // base layout; its exact allocation size and the local count slot are
+        // supplied. The current-process handle remains valid through the calls.
         unsafe {
             GetProcessMemoryInfo(
                 process,
@@ -529,8 +558,13 @@ mod probe {
             GetProcessHandleCount(process, &mut handle_count)?;
         }
         let gui_count = |flag| -> ProbeResult<u32> {
+            // SAFETY: Clear only the calling thread's error slot to distinguish
+            // a legitimate zero GUI resource count from API failure.
             unsafe { SetLastError(ERROR_SUCCESS) };
+            // SAFETY: The current-process handle is valid and flag is one of the
+            // two resource categories passed immediately below this closure.
             let count = unsafe { GetGuiResources(process, flag) };
+            // SAFETY: Read this thread's error slot immediately after the query.
             let error = unsafe { GetLastError() };
             if count == 0 && error != ERROR_SUCCESS {
                 return Err(Error::from_hresult(HRESULT::from_win32(error.0)).into());
@@ -560,6 +594,8 @@ mod probe {
             FILETIME::default(),
             FILETIME::default(),
         );
+        // SAFETY: The current-process pseudo handle is valid and all four
+        // initialized FILETIME output slots remain live through the query.
         unsafe {
             GetProcessTimes(
                 GetCurrentProcess(),
@@ -575,12 +611,17 @@ mod probe {
     }
 
     fn thread_count() -> ProbeResult<u32> {
+        // SAFETY: The snapshot API creates one owned kernel handle; the private
+        // guard adopts it once and closes it after enumeration, including errors.
         let snapshot = OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)? });
+        // SAFETY: This query returns the calling process's scalar identifier.
         let pid = unsafe { GetCurrentProcessId() };
         let mut entry = THREADENTRY32 {
             dwSize: size_of::<THREADENTRY32>() as u32,
             ..Default::default()
         };
+        // SAFETY: entry is initialized and advertises its actual size; the
+        // snapshot owner outlives this synchronous enumeration call.
         unsafe {
             Thread32First(snapshot.0, &mut entry)?;
         }
@@ -590,6 +631,8 @@ mod probe {
                 count += 1;
             }
             entry.dwSize = size_of::<THREADENTRY32>() as u32;
+            // SAFETY: The snapshot remains owned and entry's capacity/layout is
+            // reset before each bounded native write into this local structure.
             match unsafe { Thread32Next(snapshot.0, &mut entry) } {
                 Ok(()) => {}
                 Err(error) if error.code() == HRESULT::from_win32(ERROR_NO_MORE_FILES.0) => break,
@@ -602,6 +645,8 @@ mod probe {
     struct OwnedHandle(HANDLE);
     impl Drop for OwnedHandle {
         fn drop(&mut self) {
+            // SAFETY: This private guard owns a successful snapshot handle; it
+            // is neither copied nor exposed as a second owner and closes once.
             let _ = unsafe { CloseHandle(self.0) };
         }
     }
@@ -609,6 +654,8 @@ mod probe {
     struct ProbeHost(HWND);
     impl ProbeHost {
         fn new() -> ProbeResult<Self> {
+            // SAFETY: The system STATIC class and static strings are valid for
+            // synchronous creation. No Rust callback/userdata pointer is passed.
             let host = Self(unsafe {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
@@ -625,6 +672,8 @@ mod probe {
                     None,
                 )?
             });
+            // SAFETY: The newly owned host remains live throughout registration
+            // and measurement; its guard unregisters before window destruction.
             unsafe {
                 WTSRegisterSessionNotification(host.0, NOTIFY_FOR_THIS_SESSION)?;
             }
@@ -633,6 +682,8 @@ mod probe {
     }
     impl Drop for ProbeHost {
         fn drop(&mut self) {
+            // SAFETY: This measurement thread owns the hidden STATIC HWND. It
+            // retains no Rust callback references and outlives its controller.
             unsafe {
                 let _ = WTSUnRegisterSessionNotification(self.0);
                 let _ = DestroyWindow(self.0);
@@ -643,6 +694,8 @@ mod probe {
     struct ScopedPmv2(DPI_AWARENESS_CONTEXT);
     impl ScopedPmv2 {
         fn enter() -> ProbeResult<Self> {
+            // SAFETY: Change only this measurement thread to the documented
+            // pseudo context; retain the returned valid context for restoration.
             let old =
                 unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
             if old.0.is_null() {
@@ -654,6 +707,8 @@ mod probe {
     }
     impl Drop for ScopedPmv2 {
         fn drop(&mut self) {
+            // SAFETY: The context was returned by this thread's successful
+            // SetThreadDpiAwarenessContext and is restored on that same thread.
             let _ = unsafe { SetThreadDpiAwarenessContext(self.0) };
         }
     }

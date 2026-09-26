@@ -87,6 +87,7 @@ impl TrayIcon {
         copy_utf16(&mut self.data.szTip, &text);
         let mut data = self.data;
         data.uFlags = NIF_TIP | NIF_SHOWTIP;
+        // SAFETY: data is initialized NOTIFYICONDATAW with bounded terminated strings; the registered host remains live.
         if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
             Ok(())
         } else {
@@ -102,13 +103,16 @@ impl TrayIcon {
 
     fn add(&mut self) -> Result<()> {
         // Shell_NotifyIcon does not promise a useful GetLastError value.
+        // SAFETY: The live host and owned icon outlive this registration; cbSize describes the initialized structure.
         if !unsafe { Shell_NotifyIconW(NIM_ADD, &self.data) }.as_bool() {
             return Err(Error::new(
                 E_FAIL,
                 tr("无法添加托盘图标", "Could not add the notification icon"),
             ));
         }
+        // SAFETY: The just-added registration owns no Rust pointer; its initialized version field requests v4.
         if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &self.data) }.as_bool() {
+            // SAFETY: Undo only the registration just added, before its owned icon can be released.
             let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &self.data) };
             return Err(Error::new(
                 E_FAIL,
@@ -125,6 +129,7 @@ impl TrayIcon {
 
     fn remove(&mut self) {
         if self.added {
+            // SAFETY: Remove our own registration while host and icon remain alive.
             let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &self.data) };
             self.added = false;
         }
@@ -147,6 +152,7 @@ impl TrayIcon {
         data.dwInfoFlags = NIIF_INFO;
         copy_utf16(&mut data.szInfoTitle, title);
         copy_utf16(&mut data.szInfo, message);
+        // SAFETY: The shell synchronously copies initialized bounded UTF-16 notification fields from data.
         if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
             Ok(())
         } else {
@@ -168,6 +174,7 @@ impl TrayIcon {
         // Copy before TrackPopupMenu starts its nested message loop. This method
         // does not access the tray's Rust state while that loop is active.
         let data = self.data;
+        // SAFETY: CreatePopupMenu returns a new menu immediately assigned to its unique guard.
         let menu = PopupMenu(unsafe { CreatePopupMenu()? });
         let status: Vec<u16> = crate::tr_format!(
             "快捷键：{}",
@@ -185,6 +192,7 @@ impl TrayIcon {
         let stop_label = wide(tr("停止预览", "Stop preview"));
         let settings_label = wide(tr("设置", "Settings"));
         let exit_label = wide(tr("退出", "Exit"));
+        // SAFETY: menu owns the live HMENU; every label is terminated UTF-16 and AppendMenuW copies it synchronously.
         unsafe {
             AppendMenuW(
                 menu.0,
@@ -208,11 +216,14 @@ impl TrayIcon {
             AppendMenuW(menu.0, MF_STRING, COMMAND_EXIT, PCWSTR(exit_label.as_ptr()))?;
         }
         let mut point = POINT::default();
+        // SAFETY: point is writable POINT storage and no pointer escapes this synchronous query.
         unsafe { GetCursorPos(&mut point)? };
 
         // A foreground owner lets clicks outside the menu dismiss it. The OS
         // controls whether foreground activation is allowed for this request.
+        // SAFETY: The tray host is alive; this request passes a handle only and holds no callback-state borrow.
         let _ = unsafe { SetForegroundWindow(data.hWnd) };
+        // SAFETY: menu and host stay alive during the nested loop; only copied tray data is used across reentry.
         let command = unsafe {
             TrackPopupMenu(
                 menu.0,
@@ -227,8 +238,10 @@ impl TrayIcon {
         .0;
         // Posting this benign message keeps repeated tray menus from immediately
         // dismissing after the foreground switch, as required by TrackPopupMenu.
+        // SAFETY: WM_NULL has no pointer payload; the host owns its own message queue and remains live.
         let posted = unsafe { PostMessageW(Some(data.hWnd), WM_NULL, WPARAM(0), LPARAM(0)) };
         if command == 0 {
+            // SAFETY: The initialized identity fields refer to this tray registration and no Rust pointer is retained.
             let _ = unsafe { Shell_NotifyIconW(NIM_SETFOCUS, &data) };
         }
         posted?;
@@ -281,6 +294,7 @@ struct PopupMenu(HMENU);
 impl Drop for PopupMenu {
     fn drop(&mut self) {
         // Runs for successful selection, cancellation and every setup failure.
+        // SAFETY: The PopupMenu guard uniquely owns this CreatePopupMenu result after all nested tracking returned.
         let _ = unsafe { DestroyMenu(self.0) };
     }
 }

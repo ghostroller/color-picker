@@ -28,11 +28,13 @@ pub(super) fn fit_to_work_area(request: RECT, minimum: (i32, i32)) -> Result<REC
 }
 
 pub(super) fn work_area(request: RECT) -> Result<RECT> {
+    // SAFETY: request is initialized RECT storage, borrowed only for this monitor lookup.
     let monitor = unsafe { MonitorFromRect(&request, MONITOR_DEFAULTTONEAREST) };
     let mut info = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
+    // SAFETY: the queried monitor handle and initialized MONITORINFO size match this output buffer.
     if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
         return Err(Error::from_thread());
     }

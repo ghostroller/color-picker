@@ -41,6 +41,7 @@ impl Default for Language {
             unsafe extern "system" {
                 fn GetUserDefaultUILanguage() -> u16;
             }
+            // SAFETY: The system language query has no arguments or retained pointers and returns a scalar LANGID.
             Self::from_windows_ui_language(unsafe { GetUserDefaultUILanguage() })
         }
         #[cfg(not(windows))]

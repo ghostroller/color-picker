@@ -80,6 +80,8 @@ fn cached_selection_and_native_result_controls_smoke() {
     )
     .unwrap();
     let magnifier_hwnd = magnifier.hwnd();
+    // SAFETY: Query scalar window style bits for the test-owned live HWND; no callback
+    // pointer is interpreted.
     let overlay_style = unsafe { GetWindowLongW(magnifier_hwnd, GWL_EXSTYLE) } as u32;
     assert_eq!(
         overlay_style & (WS_EX_TOPMOST | WS_EX_NOACTIVATE).0,
@@ -108,6 +110,8 @@ fn cached_selection_and_native_result_controls_smoke() {
     );
     for factor in [8, 16, 32] {
         assert!(magnifier.change_scale(true, hover).unwrap());
+        // SAFETY: Synchronously paint only the live fixture window; no callback-state
+        // borrow spans this reentrant operation.
         assert!(unsafe { UpdateWindow(magnifier.hwnd()) }.as_bool());
         magnifier.update_hover(hover).unwrap(); // propagates any paint failure
         assert_eq!(magnifier.scale_factor(), factor);
@@ -125,9 +129,13 @@ fn cached_selection_and_native_result_controls_smoke() {
     }
     assert!(!magnifier.change_scale(false, hover).unwrap());
     drop(magnifier);
+    // SAFETY: This is a handle-validity assertion only; it neither dereferences userdata nor
+    // establishes ownership for releasing callback memory.
     assert!(!unsafe { IsWindow(Some(magnifier_hwnd)) }.as_bool());
 
     let owner = TestOwner(
+        // SAFETY: The class/title strings remain live and terminated during creation;
+        // this thread owns the returned fixture window and any callback data.
         unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -149,14 +157,22 @@ fn cached_selection_and_native_result_controls_smoke() {
     let result = ResultWindow::new_with_options(picked, owner.0, ColorFormat::Hsl, false).unwrap();
     let result_hwnd = result.hwnd();
     assert_eq!(result.process_pending().unwrap(), None);
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let default_copy = unsafe { GetDlgItem(Some(result_hwnd), 1) }.unwrap();
     assert!(window_text(default_copy).contains("HSL"));
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let minimize = unsafe { GetDlgItem(Some(result_hwnd), 40) }.unwrap();
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let caption_close = unsafe { GetDlgItem(Some(result_hwnd), 41) }.unwrap();
     assert_eq!(window_text(minimize), "最小化");
     assert_eq!(window_text(caption_close), "关闭窗口");
     let mut client = RECT::default();
     let mut window = RECT::default();
+    // SAFETY: The fixture window remains alive and the RECT/POINT outputs are writable local
+    // values used only for these synchronous queries.
     unsafe {
         GetClientRect(result_hwnd, &mut client).unwrap();
         GetWindowRect(result_hwnd, &mut window).unwrap();
@@ -166,17 +182,28 @@ fn cached_selection_and_native_result_controls_smoke() {
         (window.right - window.left, window.bottom - window.top),
         "the custom caption must not leave a native nonclient frame"
     );
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let status = unsafe { GetDlgItem(Some(result_hwnd), 12) }.unwrap();
+    // SAFETY: Query visibility on the fixture HWND without dereferencing or retaining any
+    // native pointer.
     assert!(!unsafe { IsWindowVisible(status) }.as_bool());
     let mut button_bounds = RECT::default();
+    // SAFETY: The fixture window remains alive on this thread and each RECT output is valid
+    // writable stack storage.
     unsafe { GetWindowRect(default_copy, &mut button_bounds) }.unwrap();
+    // SAFETY: Query only the live fixture HWND while its window owner remains in scope.
     let dpi = unsafe { GetDpiForWindow(result_hwnd) };
     assert!(
         window.bottom - button_bounds.bottom <= ((20 * dpi + 48) / 96) as i32,
         "an unused copy-status footer must not leave a large blank area"
     );
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let swatch = unsafe { GetDlgItem(Some(result_hwnd), 10) }.unwrap();
     let mut swatch_bounds = RECT::default();
+    // SAFETY: The fixture window remains alive on this thread and each RECT output is valid
+    // writable stack storage.
     unsafe { GetWindowRect(swatch, &mut swatch_bounds) }.unwrap();
     assert_eq!(
         window.right - swatch_bounds.right,
@@ -187,6 +214,8 @@ fn cached_selection_and_native_result_controls_smoke() {
         // WM_NCHITTEST packs signed screen coordinates into two 16-bit words.
         // Keep the bit patterns for monitors left of or above the primary one.
         let packed = u32::from(point.x as u16) | (u32::from(point.y as u16) << 16);
+        // SAFETY: These messages target live controls in this test-owned tree; control
+        // values are scalar and the calls complete before owner teardown.
         unsafe {
             SendMessageW(
                 result_hwnd,
@@ -197,26 +226,39 @@ fn cached_selection_and_native_result_controls_smoke() {
         }
         .0
     };
+    // SAFETY: Query only the live fixture HWND while its window owner remains in scope.
     let caption_inset = ((16 * unsafe { GetDpiForWindow(result_hwnd) } + 48) / 96) as i32;
     let mut caption_point = POINT {
         x: caption_inset,
         y: caption_inset,
     };
+    // SAFETY: The live fixture HWND is queried with a writable local POINT; its address is
+    // not retained.
     assert!(unsafe { ClientToScreen(result_hwnd, &mut caption_point) }.as_bool());
     assert_eq!(hit_test(caption_point), HTCAPTION as isize);
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let result_content = unsafe { GetDlgItem(Some(result_hwnd), 300) }.unwrap();
     for (index, format) in ColorFormat::ALL.into_iter().enumerate() {
+        // SAFETY: The parent belongs to this test-owned live window tree; the returned
+        // child handle is borrowed only while its owner survives.
         let edit = unsafe { GetDlgItem(Some(result_content), 30 + index as i32) }.unwrap();
         let mut text = [0_u16; 128];
+        // SAFETY: This live fixture control is queried synchronously into a writable
+        // UTF-16 slice; the API receives the slice capacity.
         let length = unsafe { GetWindowTextW(edit, &mut text) };
         assert!(length > 0);
         assert_eq!(
             String::from_utf16(&text[..length as usize]).unwrap(),
             format_color(picked.rgb, format)
         );
+        // SAFETY: Query scalar window style bits for the test-owned live HWND; no
+        // callback pointer is interpreted.
         assert_ne!(unsafe { GetWindowLongW(edit, GWL_STYLE) } & ES_READONLY, 0);
         if index == 0 {
             let mut edit_rect = RECT::default();
+            // SAFETY: The fixture window remains alive on this thread and each RECT
+            // output is valid writable stack storage.
             unsafe { GetWindowRect(edit, &mut edit_rect) }.unwrap();
             assert_eq!(
                 hit_test(POINT {
@@ -229,15 +271,27 @@ fn cached_selection_and_native_result_controls_smoke() {
         }
     }
     // Exercise only this fixture's caption controls; no system input or copy.
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(minimize, BM_CLICK, None, None) };
     assert_eq!(result.process_pending().unwrap(), None);
+    // SAFETY: Query the scalar minimized state of this fixture HWND without taking native
+    // ownership.
     assert!(unsafe { IsIconic(result_hwnd) }.as_bool());
+    // SAFETY: The HWND is the live test-owned window and this operation does not retain a
+    // Rust pointer.
     let _ = unsafe { ShowWindow(result_hwnd, SW_RESTORE) };
     assert_eq!(result.process_pending().unwrap(), None);
+    // SAFETY: Query the scalar minimized state of this fixture HWND without taking native
+    // ownership.
     assert!(!unsafe { IsIconic(result_hwnd) }.as_bool());
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(caption_close, BM_CLICK, None, None) };
     assert_eq!(result.process_pending().unwrap(), Some(ResultAction::Close));
     drop(result);
+    // SAFETY: This is a handle-validity assertion only; it neither dereferences userdata nor
+    // establishes ownership for releasing callback memory.
     assert!(!unsafe { IsWindow(Some(result_hwnd)) }.as_bool());
 
     let config = Config {
@@ -255,21 +309,35 @@ fn cached_selection_and_native_result_controls_smoke() {
     let settings =
         SettingsWindow::new(&config, owner.0, Some("控件测试；不会保存配置"), true).unwrap();
     let settings_hwnd = settings.hwnd();
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let settings_content = unsafe { GetDlgItem(Some(settings_hwnd), 200) }.unwrap();
     assert_eq!(settings.process_pending().unwrap(), None);
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let format_combo = unsafe { GetDlgItem(Some(settings_content), 105) }.unwrap();
     assert_eq!(
+        // SAFETY: These messages target live controls in this test-owned tree; control
+        // values are scalar and the calls complete before owner teardown.
         unsafe { SendMessageW(format_combo, CB_GETCOUNT, None, None) }.0,
         4
     );
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None) };
     assert_eq!(
         settings.process_pending().unwrap(),
         Some(SettingsAction::Apply(config.clone()))
     );
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let quick = unsafe { GetDlgItem(Some(settings_content), 109) }.unwrap();
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let automatic = unsafe { GetDlgItem(Some(settings_content), 106) }.unwrap();
     for ordinary_copy in [false, true] {
+        // SAFETY: These messages target live controls in this test-owned tree; control
+        // values are scalar and the calls complete before owner teardown.
         unsafe {
             SendMessageW(
                 automatic,
@@ -285,12 +353,16 @@ fn cached_selection_and_native_result_controls_smoke() {
             "quick picking remains a draft"
         );
         assert!(
+            // SAFETY: Query enablement on the fixture control while its owning
+            // window tree remains alive.
             !unsafe { windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(automatic) }
                 .as_bool()
         );
         let mut quick_config = config.clone();
         quick_config.quick_pick = true;
         quick_config.auto_copy_on_pick = ordinary_copy;
+        // SAFETY: These messages target live controls in this test-owned tree; control
+        // values are scalar and the calls complete before owner teardown.
         unsafe {
             SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None);
         }
@@ -298,16 +370,22 @@ fn cached_selection_and_native_result_controls_smoke() {
             settings.process_pending().unwrap(),
             Some(SettingsAction::Apply(quick_config))
         );
+        // SAFETY: These messages target live controls in this test-owned tree; control
+        // values are scalar and the calls complete before owner teardown.
         unsafe {
             SendMessageW(quick, BM_CLICK, None, None);
         }
         assert_eq!(settings.process_pending().unwrap(), None);
         assert!(
+            // SAFETY: Query enablement on the fixture control while its owning
+            // window tree remains alive.
             unsafe { windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(automatic) }
                 .as_bool()
         );
         let mut normal_config = config.clone();
         normal_config.auto_copy_on_pick = ordinary_copy;
+        // SAFETY: These messages target live controls in this test-owned tree; control
+        // values are scalar and the calls complete before owner teardown.
         unsafe {
             SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None);
         }
@@ -317,16 +395,29 @@ fn cached_selection_and_native_result_controls_smoke() {
             "turning off quick picking restores the ordinary copy preference"
         );
     }
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let border = unsafe { GetDlgItem(Some(settings_content), 107) }.unwrap();
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let transparency = unsafe { GetDlgItem(Some(settings_content), 108) }.unwrap();
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let apply = unsafe { GetDlgItem(Some(settings_hwnd), 1) }.unwrap();
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let close = unsafe { GetDlgItem(Some(settings_hwnd), 2) }.unwrap();
     let mut original = RECT::default();
+    // SAFETY: The fixture window remains alive on this thread and each RECT output is valid
+    // writable stack storage.
     unsafe { GetWindowRect(settings_hwnd, &mut original) }.unwrap();
     assert!(original.top >= work.top && original.bottom <= work.bottom);
     // A narrow, short work area is simulated by resizing only this fixture.
     // Content reflows, the footer stays fixed, and focus reveals scrolled rows.
+    // SAFETY: Query only the live fixture HWND while its window owner remains in scope.
     let settings_dpi = unsafe { GetDpiForWindow(settings_hwnd) };
+    // SAFETY: Resize/reposition only the test-owned window on its UI thread; dimensions are
+    // scalar and no callback borrow spans the call.
     unsafe {
         SetWindowPos(
             settings_hwnd,
@@ -342,13 +433,19 @@ fn cached_selection_and_native_result_controls_smoke() {
     settings.process_pending().unwrap();
     let mut viewport_bounds = RECT::default();
     let mut footer_before = RECT::default();
+    // SAFETY: The fixture window remains alive on this thread and each RECT output is valid
+    // writable stack storage.
     unsafe {
         GetWindowRect(settings_content, &mut viewport_bounds).unwrap();
         GetWindowRect(apply, &mut footer_before).unwrap();
     }
     for id in [110, 101, 102, 103, 104, 105, 106, 107, 108, 109] {
+        // SAFETY: The parent belongs to this test-owned live window tree; the returned
+        // child handle is borrowed only while its owner survives.
         let control = unsafe { GetDlgItem(Some(settings_content), id) }.unwrap();
         let mut bounds = RECT::default();
+        // SAFETY: The fixture window remains alive on this thread and each RECT output
+        // is valid writable stack storage.
         unsafe {
             GetWindowRect(control, &mut bounds).unwrap();
         }
@@ -359,12 +456,16 @@ fn cached_selection_and_native_result_controls_smoke() {
     }
     for button in [apply, close] {
         let mut bounds = RECT::default();
+        // SAFETY: The fixture window remains alive on this thread and each RECT output
+        // is valid writable stack storage.
         unsafe {
             GetWindowRect(button, &mut bounds).unwrap();
         }
         assert!(bounds.top >= viewport_bounds.bottom);
         assert!(bounds.bottom <= original.top + (360 * settings_dpi / 96) as i32);
     }
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe {
         SendMessageW(
             settings_content,
@@ -375,6 +476,8 @@ fn cached_selection_and_native_result_controls_smoke() {
     }
     settings.process_pending().unwrap();
     let mut footer_after = RECT::default();
+    // SAFETY: The fixture window remains alive on this thread and each RECT output is valid
+    // writable stack storage.
     unsafe {
         GetWindowRect(apply, &mut footer_after).unwrap();
     }
@@ -382,13 +485,19 @@ fn cached_selection_and_native_result_controls_smoke() {
         footer_before, footer_after,
         "scrolling must keep Apply stationary"
     );
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let ctrl = unsafe { GetDlgItem(Some(settings_content), 101) }.unwrap();
+    // SAFETY: Focus is changed only among live controls of this fixture; no Rust state
+    // borrow is held across synchronous focus callbacks.
     unsafe {
         windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(apply)).unwrap();
         windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(ctrl)).unwrap();
     }
     settings.process_pending().unwrap();
     let mut control_bounds = RECT::default();
+    // SAFETY: The fixture window remains alive on this thread and each RECT output is valid
+    // writable stack storage.
     unsafe {
         GetWindowRect(ctrl, &mut control_bounds).unwrap();
     }
@@ -396,6 +505,8 @@ fn cached_selection_and_native_result_controls_smoke() {
         control_bounds.top >= viewport_bounds.top
             && control_bounds.bottom <= viewport_bounds.bottom
     );
+    // SAFETY: Focus is changed only among live controls of this fixture; no Rust state
+    // borrow is held across synchronous focus callbacks.
     unsafe {
         windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(border)).unwrap();
     }
@@ -407,8 +518,12 @@ fn cached_selection_and_native_result_controls_smoke() {
         lParam: LPARAM(1),
         ..Default::default()
     };
+    // SAFETY: The fixture dialog and stack MSG remain live for synchronous dispatch; no
+    // RefCell state borrow spans this call.
     assert!(unsafe { IsDialogMessageW(settings_hwnd, &next) }.as_bool());
     settings.process_pending().unwrap();
+    // SAFETY: The fixture window remains alive on this thread and each RECT output is valid
+    // writable stack storage.
     unsafe {
         GetWindowRect(transparency, &mut control_bounds).unwrap();
     }
@@ -417,6 +532,8 @@ fn cached_selection_and_native_result_controls_smoke() {
             && control_bounds.bottom <= viewport_bounds.bottom,
         "Tab must reveal the focused native control"
     );
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe {
         SendMessageW(
             settings_content,
@@ -445,24 +562,37 @@ fn cached_selection_and_native_result_controls_smoke() {
         ),
     ] {
         assert_ne!(
+            // SAFETY: Query scalar window style bits for the test-owned live HWND;
+            // no callback pointer is interpreted.
             unsafe { GetWindowLongW(slider, GWL_STYLE) } as u32 & WS_TABSTOP.0,
             0
         );
         assert_eq!(
+            // SAFETY: These messages target live controls in this test-owned tree;
+            // control values are scalar and the calls complete before owner
+            // teardown.
             unsafe { SendMessageW(slider, TBM_GETRANGEMIN, None, None) }.0,
             0
         );
         assert_eq!(
+            // SAFETY: These messages target live controls in this test-owned tree;
+            // control values are scalar and the calls complete before owner
+            // teardown.
             unsafe { SendMessageW(slider, TBM_GETRANGEMAX, None, None) }.0,
             maximum
         );
         // TBM_GETPOS is the WM_USER alias omitted by windows-rs.
         assert_eq!(
+            // SAFETY: These messages target live controls in this test-owned tree;
+            // control values are scalar and the calls complete before owner
+            // teardown.
             unsafe { SendMessageW(slider, WM_USER, None, None) }.0,
             isize::from(expected)
         );
     }
     assert_eq!(
+        // SAFETY: Both dialog and starting control belong to this live fixture tree; the
+        // next handle is borrowed for comparison only.
         unsafe { GetNextDlgTabItem(settings_hwnd, Some(border), false) }.unwrap(),
         transparency
     );
@@ -474,19 +604,29 @@ fn cached_selection_and_native_result_controls_smoke() {
         "slider changes remain a draft"
     );
     assert_eq!(
+        // SAFETY: The parent belongs to this test-owned live window tree; the returned
+        // child handle is borrowed only while its owner survives.
         window_text(unsafe { GetDlgItem(Some(settings_content), 22) }.unwrap()),
         "3 DIP"
     );
     assert_eq!(
+        // SAFETY: The parent belongs to this test-owned live window tree; the returned
+        // child handle is borrowed only while its owner survives.
         window_text(unsafe { GetDlgItem(Some(settings_content), 24) }.unwrap()),
         "80%"
     );
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let appearance_preview = unsafe { GetDlgItem(Some(settings_content), 26) }.unwrap();
     assert!(window_text(appearance_preview).contains("边框 3 DIP，背景透明度 80%"));
+    // SAFETY: Synchronously paint only the live fixture window; no callback-state borrow
+    // spans this reentrant operation.
     assert!(unsafe { UpdateWindow(appearance_preview) }.as_bool());
     let mut edited = config.clone();
     edited.appearance.border_width_dip = 3;
     edited.appearance.background_transparency_percent = 80;
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None) };
     assert_eq!(
         settings.process_pending().unwrap(),
@@ -494,17 +634,25 @@ fn cached_selection_and_native_result_controls_smoke() {
     );
     // Changing the language remains a draft until Apply. Relabeling the same
     // window must preserve both edited controls and the user's scroll position.
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let language = unsafe { GetDlgItem(Some(settings_content), 110) }.unwrap();
     assert_eq!(
+        // SAFETY: These messages target live controls in this test-owned tree; control
+        // values are scalar and the calls complete before owner teardown.
         unsafe { SendMessageW(language, CB_GETCOUNT, None, None) }.0,
         2
     );
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(language, CB_SETCURSEL, Some(WPARAM(1)), None) };
     assert_eq!(settings.process_pending().unwrap(), None);
     assert_eq!(i18n::language(), Language::SimplifiedChinese);
     assert_eq!(window_text(apply), "应用");
     let mut english_draft = edited.clone();
     english_draft.language = Language::English;
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe {
         SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None);
     }
@@ -512,6 +660,8 @@ fn cached_selection_and_native_result_controls_smoke() {
         settings.process_pending().unwrap(),
         Some(SettingsAction::Apply(english_draft.clone()))
     );
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe {
         SendMessageW(
             settings_content,
@@ -522,6 +672,8 @@ fn cached_selection_and_native_result_controls_smoke() {
     }
     settings.process_pending().unwrap();
     let mut before_language_switch = RECT::default();
+    // SAFETY: The fixture window remains alive on this thread and each RECT output is valid
+    // writable stack storage.
     unsafe { GetWindowRect(border, &mut before_language_switch).unwrap() };
     i18n::set_language(Language::English);
     settings.refresh_language().unwrap();
@@ -529,18 +681,26 @@ fn cached_selection_and_native_result_controls_smoke() {
     assert_eq!(window_text(apply), "Apply");
     assert_eq!(window_text(close), "Close");
     assert_eq!(
+        // SAFETY: The parent belongs to this test-owned live window tree; the returned
+        // child handle is borrowed only while its owner survives.
         window_text(unsafe { GetDlgItem(Some(settings_content), 15) }.unwrap()),
         "Preferences"
     );
     assert!(window_text(appearance_preview).contains("border 3 DIP, transparency 80%"));
     let mut after_language_switch = RECT::default();
+    // SAFETY: The fixture window remains alive on this thread and each RECT output is valid
+    // writable stack storage.
     unsafe { GetWindowRect(border, &mut after_language_switch).unwrap() };
     assert_eq!(before_language_switch, after_language_switch);
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None) };
     assert_eq!(
         settings.process_pending().unwrap(),
         Some(SettingsAction::Apply(english_draft))
     );
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe {
         SendMessageW(language, CB_SETCURSEL, Some(WPARAM(0)), None);
         SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None);
@@ -552,6 +712,8 @@ fn cached_selection_and_native_result_controls_smoke() {
     i18n::set_language(Language::SimplifiedChinese);
     settings.refresh_language().unwrap();
     assert_eq!(window_text(apply), "应用");
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe {
         SendMessageW(
             settings_content,
@@ -563,12 +725,18 @@ fn cached_selection_and_native_result_controls_smoke() {
     settings.process_pending().unwrap();
     // Exercise the native key control, including the dialog message path.
     // These messages target only this fixture; no global input is generated.
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let key = unsafe { GetDlgItem(Some(settings_content), 104) }.unwrap();
     assert!(window_text(key).contains("F11"));
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(key, BM_CLICK, None, None) };
     settings.process_pending().unwrap();
     press_key(key, 0x7b, false); // F12 is reserved; keep listening.
     assert_eq!(settings.process_pending().unwrap(), None);
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(key, WM_KEYDOWN, Some(WPARAM(0x0d)), Some(LPARAM(1))) };
     press_key(key, 0x4b, false); // K replaces F11.
     settings.process_pending().unwrap();
@@ -580,6 +748,8 @@ fn cached_selection_and_native_result_controls_smoke() {
         lParam: LPARAM(0x4000_0001),
         ..Default::default()
     };
+    // SAFETY: The live fixture control receives a pointer to the stack MSG for this
+    // synchronous query only; it is not queued or retained.
     let wants_repeat = unsafe {
         SendMessageW(
             key,
@@ -594,16 +764,24 @@ fn cached_selection_and_native_result_controls_smoke() {
         0,
         "accepting K must not release a still-held Enter"
     );
+    // SAFETY: The fixture dialog and stack MSG remain live for synchronous dispatch; no
+    // RefCell state borrow spans this call.
     assert!(unsafe { IsDialogMessageW(settings_hwnd, &held_enter) }.as_bool());
     assert_eq!(settings.process_pending().unwrap(), None);
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(key, WM_KEYUP, Some(WPARAM(0x0d)), Some(LPARAM(0xc000_0001))) };
     edited.hotkey.key = "K".into();
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None) };
     assert_eq!(
         settings.process_pending().unwrap(),
         Some(SettingsAction::Apply(edited.clone()))
     );
 
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(key, BM_CLICK, None, None) };
     settings.process_pending().unwrap();
     let enter = MSG {
@@ -613,6 +791,8 @@ fn cached_selection_and_native_result_controls_smoke() {
         lParam: LPARAM(1),
         ..Default::default()
     };
+    // SAFETY: The live fixture control receives a pointer to the stack MSG for this
+    // synchronous query only; it is not queued or retained.
     let wants_enter = unsafe {
         SendMessageW(
             key,
@@ -627,26 +807,38 @@ fn cached_selection_and_native_result_controls_smoke() {
         0,
         "recording must claim Enter before the dialog applies settings"
     );
+    // SAFETY: The fixture dialog and stack MSG remain live for synchronous dispatch; no
+    // RefCell state borrow spans this call.
     assert!(unsafe { IsDialogMessageW(settings_hwnd, &enter) }.as_bool());
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(key, WM_KEYUP, Some(WPARAM(0x0d)), Some(LPARAM(0xc000_0001))) };
     assert_eq!(settings.process_pending().unwrap(), None);
     press_key(key, 0x1b, false); // Esc cancels recording, not the settings window.
     assert_eq!(settings.process_pending().unwrap(), None);
     assert!(window_text(key).contains('K'));
 
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(key, BM_CLICK, None, None) };
     settings.process_pending().unwrap();
     press_key(key, 0x79, true); // F10 arrives as a system-key message.
     settings.process_pending().unwrap();
     edited.hotkey.key = "F10".into();
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None) };
     assert_eq!(
         settings.process_pending().unwrap(),
         Some(SettingsAction::Apply(edited))
     );
 
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(key, BM_CLICK, None, None) };
     settings.process_pending().unwrap();
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(key, WM_KEYDOWN, Some(WPARAM(0x0d)), Some(LPARAM(1))) };
     let tab = MSG {
         hwnd: key,
@@ -655,6 +847,8 @@ fn cached_selection_and_native_result_controls_smoke() {
         lParam: LPARAM(1),
         ..Default::default()
     };
+    // SAFETY: The fixture dialog and stack MSG remain live for synchronous dispatch; no
+    // RefCell state borrow spans this call.
     assert!(unsafe { IsDialogMessageW(settings_hwnd, &tab) }.as_bool());
     settings.process_pending().unwrap();
     assert!(
@@ -681,12 +875,18 @@ fn cached_selection_and_native_result_controls_smoke() {
     };
     assert!(!settings.filter_key_message(&fresh));
     // Removing both Ctrl and Alt is invalid; no draft may reach persistence.
+    // SAFETY: The parent belongs to this test-owned live window tree; the returned child
+    // handle is borrowed only while its owner survives.
     let alt = unsafe { GetDlgItem(Some(settings_content), 102) }.unwrap();
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe {
         SendMessageW(alt, BM_SETCHECK, Some(WPARAM(0)), None);
         SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None);
     }
     assert_eq!(settings.process_pending().unwrap(), None);
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe {
         SendMessageW(border, TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(0)));
         SendMessageW(
@@ -697,16 +897,22 @@ fn cached_selection_and_native_result_controls_smoke() {
         );
     }
     assert_eq!(settings.process_pending().unwrap(), None);
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(settings_hwnd, WM_CLOSE, None, None) };
     assert_eq!(
         settings.process_pending().unwrap(),
         Some(SettingsAction::Close)
     );
     drop(settings);
+    // SAFETY: This is a handle-validity assertion only; it neither dereferences userdata nor
+    // establishes ownership for releasing callback memory.
     assert!(!unsafe { IsWindow(Some(settings_hwnd)) }.as_bool());
 
     let readonly = SettingsWindow::new(&config, owner.0, None, false).unwrap();
     assert!(
+        // SAFETY: The parent belongs to this test-owned live window tree; the returned
+        // child handle is borrowed only while its owner survives.
         !unsafe {
             windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
                 GetDlgItem(Some(readonly.hwnd()), 1).unwrap(),
@@ -714,12 +920,18 @@ fn cached_selection_and_native_result_controls_smoke() {
         }
         .as_bool()
     );
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(readonly.hwnd(), WM_COMMAND, Some(WPARAM(1)), None) };
     assert_eq!(readonly.process_pending().unwrap(), None);
     drop(readonly);
+    // SAFETY: This is a handle-validity assertion only; it neither dereferences userdata nor
+    // establishes ownership for releasing callback memory.
     assert!(unsafe { IsWindow(Some(owner.0)) }.as_bool());
     let owner_hwnd = owner.0;
     drop(owner);
+    // SAFETY: This is a handle-validity assertion only; it neither dereferences userdata nor
+    // establishes ownership for releasing callback memory.
     assert!(!unsafe { IsWindow(Some(owner_hwnd)) }.as_bool());
 }
 
@@ -794,6 +1006,7 @@ fn edge_freeze_preserves_initial_source_and_standard_window_size() {
         .unwrap();
         assert_eq!(captures, 1, "freeze must use one immutable snapshot");
         let bounds = magnifier.rect().unwrap();
+        // SAFETY: Query only the live fixture HWND while its window owner remains in scope.
         let dpi = unsafe { GetDpiForWindow(magnifier.hwnd()) };
         let footer_height = (28 * dpi + 48) / 96;
         assert_eq!(
@@ -819,12 +1032,16 @@ fn edge_freeze_preserves_initial_source_and_standard_window_size() {
         assert_eq!(picked.kind, SampleKind::Frozen);
         assert_eq!(magnifier.scale_factor(), 4);
         let hwnd = magnifier.hwnd();
+        // SAFETY: Query scalar window style bits for the test-owned live HWND; no
+        // callback pointer is interpreted.
         let style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
         assert_eq!(
             style & (WS_EX_TOPMOST | WS_EX_NOACTIVATE).0,
             (WS_EX_TOPMOST | WS_EX_NOACTIVATE).0
         );
         drop(magnifier);
+        // SAFETY: This is a handle-validity assertion only; it neither dereferences
+        // userdata nor establishes ownership for releasing callback memory.
         assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
     }
 }
@@ -841,7 +1058,12 @@ fn failed_capture_destroys_the_hidden_magnifier() {
         core::{BOOL, Error},
     };
 
+    /// # Safety
+    /// EnumThreadWindows calls this synchronously with the local Vec pointer
+    /// supplied by magnifiers; the pointer must remain unique for enumeration.
     unsafe extern "system" fn collect(hwnd: HWND, context: LPARAM) -> BOOL {
+        // SAFETY: EnumThreadWindows synchronously passes the unique Vec pointer supplied
+        // below; no other borrow exists during enumeration.
         let windows = unsafe { &mut *(context.0 as *mut Vec<HWND>) };
         if windows.try_reserve(1).is_err() {
             return false.into();
@@ -853,6 +1075,8 @@ fn failed_capture_destroys_the_hidden_magnifier() {
     let magnifiers = || {
         let mut windows = Vec::<HWND>::new();
         assert!(
+            // SAFETY: The callback receives the live local Vec pointer synchronously
+            // on this thread; it does not retain the pointer.
             unsafe {
                 EnumThreadWindows(
                     GetCurrentThreadId(),
@@ -864,6 +1088,8 @@ fn failed_capture_destroys_the_hidden_magnifier() {
         );
         windows.retain(|hwnd| {
             let mut class = [0_u16; 64];
+            // SAFETY: The test HWND is borrowed for this query and the output UTF-16
+            // slice supplies its exact writable capacity.
             let length = unsafe { GetClassNameW(*hwnd, &mut class) } as usize;
             String::from_utf16_lossy(&class[..length]) == "ColorPicker.Magnifier.v1"
         });
@@ -887,8 +1113,12 @@ fn failed_capture_destroys_the_hidden_magnifier() {
                 .collect();
             assert_eq!(created.len(), 1);
             let hwnd = created[0];
+            // SAFETY: Query visibility on the fixture HWND without dereferencing or
+            // retaining any native pointer.
             assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
             let mut rect = RECT::default();
+            // SAFETY: The fixture window remains alive on this thread and each RECT
+            // output is valid writable stack storage.
             unsafe { GetWindowRect(hwnd, &mut rect) }.unwrap();
             assert_eq!((rect.right - rect.left, rect.bottom - rect.top), (1, 1));
             hidden = Some(hwnd);
@@ -897,17 +1127,23 @@ fn failed_capture_destroys_the_hidden_magnifier() {
     );
     assert!(outcome.is_err());
     let hidden = hidden.expect("the freeze operation must reach the capture callback");
+    // SAFETY: This is a handle-validity assertion only; it neither dereferences userdata nor
+    // establishes ownership for releasing callback memory.
     assert!(!unsafe { IsWindow(Some(hidden)) }.as_bool());
     assert_eq!(magnifiers(), before);
 }
 
 fn window_text(hwnd: HWND) -> String {
     let mut text = [0_u16; 256];
+    // SAFETY: This live fixture control is queried synchronously into a writable UTF-16
+    // slice; the API receives the slice capacity.
     let length = unsafe { GetWindowTextW(hwnd, &mut text) };
     String::from_utf16(&text[..length as usize]).unwrap()
 }
 
 fn press_key(hwnd: HWND, key: usize, system: bool) {
+    // SAFETY: These messages target live controls in this test-owned tree; control values
+    // are scalar and the calls complete before owner teardown.
     unsafe {
         SendMessageW(
             hwnd,
@@ -928,6 +1164,8 @@ struct TestOwner(HWND);
 
 impl Drop for TestOwner {
     fn drop(&mut self) {
+        // SAFETY: This thread owns the fixture HWND; synchronous teardown finishes
+        // before its surrounding fixture resources are released.
         let _ = unsafe { DestroyWindow(self.0) };
     }
 }

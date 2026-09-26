@@ -1,6 +1,6 @@
 //! GDI drawing resources owned by a single preview window on the UI thread.
 
-use windows::Win32::Foundation::{COLORREF, E_FAIL, HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, E_FAIL, RECT};
 use windows::Win32::Graphics::Gdi::*;
 use windows::core::{Error, PCWSTR, Result, w};
 
@@ -9,6 +9,7 @@ use crate::app::config::AppearanceConfig;
 use crate::app::i18n::{Language, language};
 use crate::core::color::Rgb8;
 use crate::core::geometry::ScreenPointPx;
+use crate::platform::windows::gdi::{BitmapDc, DesktopDc, OwnedFont as FontHandle, SavedDc};
 
 pub(super) fn dip(value: i32, dpi: u32) -> i32 {
     ((i64::from(value) * i64::from(dpi) + 48) / 96) as i32
@@ -44,23 +45,7 @@ pub(super) struct Content {
     pub coordinates: Vec<u16>,
 }
 
-struct MemoryDc(HDC);
-
-impl Drop for MemoryDc {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteDC(self.0) };
-    }
-}
-
-struct OwnedBitmap(HBITMAP);
-
-impl Drop for OwnedBitmap {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteObject(HGDIOBJ(self.0.0)) };
-    }
-}
-
-pub(super) struct OwnedFont(HFONT);
+pub(super) struct OwnedFont(FontHandle);
 
 impl OwnedFont {
     pub(super) fn measure(
@@ -68,22 +53,29 @@ impl OwnedFont {
         dc: HDC,
         text: &[u16],
     ) -> Result<windows::Win32::Foundation::SIZE> {
-        let old = unsafe { SelectObject(dc, self.0.into()) };
+        // SAFETY: the caller's drawing DC and this font remain alive through restore.
+        let saved = unsafe { SavedDc::new(dc)? };
+        // SAFETY: this font is owned here; selecting a font does not transfer ownership.
+        let old = unsafe { SelectObject(dc, self.0.raw().into()) };
         if invalid_selection(old) {
-            return Err(Error::from_thread());
+            return Err(Error::new(E_FAIL, "Could not select measuring font"));
         }
         let mut size = windows::Win32::Foundation::SIZE::default();
+        // SAFETY: text is a valid UTF-16 slice and size is a writable output slot.
         let measured = unsafe { GetTextExtentPoint32W(dc, text, &mut size) };
-        unsafe {
-            SelectObject(dc, old);
+        if let Err(error) = saved.restore() {
+            self.0.retain();
+            return Err(error);
         }
         measured.ok()?;
         Ok(size)
     }
 
     pub fn new(size: i32, weight: i32, dpi: u32) -> Result<Self> {
+        // SAFETY: CreateFontW returns a fresh font; the facade retains its unique
+        // owner until every drawing selection has been restored.
         let font = Self(unsafe {
-            CreateFontW(
+            FontHandle::from_raw(CreateFontW(
                 -dip(size, dpi),
                 0,
                 0,
@@ -101,38 +93,18 @@ impl OwnedFont {
                     Language::SimplifiedChinese => w!("Microsoft YaHei UI"),
                     Language::English => w!("Segoe UI"),
                 },
-            )
+            ))?
         });
-        if font.0.is_invalid() {
-            Err(Error::new(E_FAIL, "Could not create an overlay font"))
-        } else {
-            Ok(font)
-        }
-    }
-}
-
-impl Drop for OwnedFont {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteObject(HGDIOBJ(self.0.0)) };
-    }
-}
-
-struct ScreenDc(HDC);
-
-impl Drop for ScreenDc {
-    fn drop(&mut self) {
-        let _ = unsafe { ReleaseDC(None, self.0) };
+        Ok(font)
     }
 }
 
 pub(super) struct Surface {
-    dc: MemoryDc,
-    _bitmap: OwnedBitmap,
+    buffer: BitmapDc,
     heading_font: OwnedFont,
     body_font: OwnedFont,
     frost: Option<FrostedPanel>,
     appearance: AppearanceConfig,
-    old_bitmap: HGDIOBJ,
     pub width: i32,
     pub height: i32,
     pub dpi: u32,
@@ -146,21 +118,8 @@ impl Surface {
         capture_excluded: bool,
         appearance: AppearanceConfig,
     ) -> Result<Self> {
-        let screen = ScreenDc(unsafe { GetDC(None) });
-        if screen.0.0.is_null() {
-            return Err(Error::new(E_FAIL, "Could not obtain a drawing DC"));
-        }
-        let dc = MemoryDc(unsafe { CreateCompatibleDC(Some(screen.0)) });
-        if dc.0.0.is_null() {
-            return Err(Error::new(E_FAIL, "Could not create a preview memory DC"));
-        }
-        let bitmap = OwnedBitmap(unsafe { CreateCompatibleBitmap(screen.0, width, height) });
-        if bitmap.0.0.is_null() {
-            return Err(Error::new(
-                E_FAIL,
-                "Could not create the preview back buffer",
-            ));
-        }
+        let screen = DesktopDc::new()?;
+        let buffer = BitmapDc::compatible(screen.raw(), width, height)?;
         let heading_font = OwnedFont::new(13, 600, dpi)?;
         let body_font = OwnedFont::new(10, 400, dpi)?;
         let frost = if capture_excluded && appearance.background_transparency_percent != 0 {
@@ -181,18 +140,12 @@ impl Surface {
         } else {
             None
         };
-        let old_bitmap = unsafe { SelectObject(dc.0, HGDIOBJ(bitmap.0.0)) };
-        if invalid_selection(old_bitmap) {
-            return Err(Error::new(E_FAIL, "Could not select the preview bitmap"));
-        }
         Ok(Self {
-            dc,
-            _bitmap: bitmap,
+            buffer,
             heading_font,
             body_font,
             frost,
             appearance,
-            old_bitmap,
             width,
             height,
             dpi,
@@ -200,13 +153,15 @@ impl Surface {
     }
 
     pub fn draw(&self, target: HDC, content: &Content, origin: ScreenPointPx) -> Result<()> {
+        // SAFETY: the private compatible buffer has no CPU views or escaped DC.
+        let saved = unsafe { SavedDc::new(self.dc())? };
         let rect = RECT {
             left: 0,
             top: 0,
             right: self.width,
             bottom: self.height,
         };
-        // DC_BRUSH is a shared stock object and must never be deleted. Its
+        // SAFETY: DC_BRUSH is a shared stock object and must never be deleted. Its
         // per-DC color avoids allocating a new brush for each sampled color.
         let swatch_brush = HBRUSH(unsafe { GetStockObject(DC_BRUSH) }.0);
         if swatch_brush.0.is_null() {
@@ -222,7 +177,7 @@ impl Surface {
                 left: dip(38, self.dpi),
                 ..rect
             };
-            if frost.paint(self.dc.0, panel, origin).is_err() {
+            if frost.paint(self.dc(), panel, origin).is_err() {
                 self.fill(swatch_brush, palette::PANEL, panel)?;
             }
         }
@@ -263,32 +218,38 @@ impl Surface {
             &content.coordinates,
         )?;
         draw_bottom_right_border(
-            self.dc.0,
+            self.dc(),
             self.width,
             self.height,
             self.dpi,
             self.appearance.border_width_dip,
         )?;
-        unsafe {
+        // SAFETY: target is the active paint DC; our selected buffer and bounds
+        // remain alive on this UI thread for this synchronous copy.
+        let result = unsafe {
             BitBlt(
                 target,
                 0,
                 0,
                 self.width,
                 self.height,
-                Some(self.dc.0),
+                Some(self.dc()),
                 0,
                 0,
                 SRCCOPY,
             )
-        }
+        };
+        saved.restore()?;
+        result
     }
 
     fn fill(&self, brush: HBRUSH, color: COLORREF, rect: RECT) -> Result<()> {
-        if unsafe { SetDCBrushColor(self.dc.0, color) }.0 == CLR_INVALID {
+        // SAFETY: this private DC and stock brush remain live throughout the fill.
+        if unsafe { SetDCBrushColor(self.dc(), color) }.0 == CLR_INVALID {
             return Err(Error::new(E_FAIL, "Could not set the preview swatch color"));
         }
-        if unsafe { FillRect(self.dc.0, &rect, brush) } == 0 {
+        // SAFETY: rect is an initialized value; FillRect only borrows the brush.
+        if unsafe { FillRect(self.dc(), &rect, brush) } == 0 {
             return Err(Error::new(E_FAIL, "Could not paint the preview swatch"));
         }
         Ok(())
@@ -304,15 +265,15 @@ impl Surface {
     }
 
     fn text(&self, font: &OwnedFont, rect: RECT, color: COLORREF, text: &[u16]) -> Result<()> {
-        draw_text(self.dc.0, font, self.scale_rect(rect), color, text)
+        draw_text(self.dc(), font, self.scale_rect(rect), color, text)
     }
-}
-
-impl Drop for Surface {
-    fn drop(&mut self) {
-        // Restore borrowed stock objects before fields delete the DC/resources.
+    fn dc(&self) -> HDC {
+        // SAFETY: this private compatible buffer is never temporarily reselected
+        // or mapped for CPU access; callers only use its DC synchronously.
         unsafe {
-            SelectObject(self.dc.0, self.old_bitmap);
+            self.buffer
+                .raw()
+                .expect("owned drawing buffer remains valid")
         }
     }
 }
@@ -334,7 +295,11 @@ pub(super) fn draw_bottom_right_border(
     if thickness == 0 {
         return Ok(());
     }
+    // SAFETY: dc is borrowed for this draw; save before changing its brush color.
+    let saved = unsafe { SavedDc::new(dc)? };
+    // SAFETY: the stock brush is borrowed, never converted into an owner.
     let brush = HBRUSH(unsafe { GetStockObject(DC_BRUSH) }.0);
+    // SAFETY: dc stays live and SavedDc restores its brush color on exit.
     if brush.is_invalid() || unsafe { SetDCBrushColor(dc, palette::BORDER) }.0 == CLR_INVALID {
         return Err(Error::new(E_FAIL, "Could not configure the overlay border"));
     }
@@ -352,11 +317,12 @@ pub(super) fn draw_bottom_right_border(
             bottom: height,
         },
     ] {
+        // SAFETY: the initialized edge rectangle and stock brush are borrowed only here.
         if unsafe { FillRect(dc, &edge, brush) } == 0 {
             return Err(Error::new(E_FAIL, "Could not paint the overlay border"));
         }
     }
-    Ok(())
+    saved.restore()
 }
 
 pub(super) fn border_thickness(width: i32, height: i32, dpi: u32, width_dip: u8) -> i32 {
@@ -379,15 +345,22 @@ pub(super) fn draw_text(
     if rect.right <= rect.left || rect.bottom <= rect.top || text.is_empty() {
         return Ok(());
     }
+    // SAFETY: caller's paint/private DC and the cached font outlive this draw.
+    let saved = unsafe { SavedDc::new(dc)? };
+    // SAFETY: only synchronous DC state changes occur, restored below.
     if unsafe { SetBkMode(dc, TRANSPARENT) } == 0
+        // SAFETY: the same live DC and restoration scope cover text color.
         || unsafe { SetTextColor(dc, color) }.0 == CLR_INVALID
     {
         return Err(Error::new(E_FAIL, "Could not configure overlay text"));
     }
-    let old_font = unsafe { SelectObject(dc, font.0.into()) };
+    // SAFETY: font owns this HFONT and is borrowed beyond SavedDc restoration.
+    let old_font = unsafe { SelectObject(dc, font.0.raw().into()) };
     if invalid_selection(old_font) {
         return Err(Error::new(E_FAIL, "Could not select an overlay font"));
     }
+    // SAFETY: the text pointer covers exactly text.len() UTF-16 units and rect is
+    // initialized; ExtTextOutW does not retain either pointer.
     let result = unsafe {
         ExtTextOutW(
             dc,
@@ -400,34 +373,15 @@ pub(super) fn draw_text(
             None,
         )
     };
-    // Restore the borrowed previous font even when text drawing failed.
-    if invalid_selection(unsafe { SelectObject(dc, old_font) }) {
-        return Err(Error::new(E_FAIL, "Could not restore the overlay font"));
+    // A failed restore leaves selection uncertain: retain this native font.
+    if let Err(error) = saved.restore() {
+        font.0.retain();
+        return Err(error);
     }
     if result.as_bool() {
         Ok(())
     } else {
         Err(Error::new(E_FAIL, "Could not draw overlay text"))
-    }
-}
-
-pub(super) struct PaintSession {
-    hwnd: HWND,
-    paint: PAINTSTRUCT,
-    pub dc: HDC,
-}
-
-impl PaintSession {
-    pub fn begin(hwnd: HWND) -> Self {
-        let mut paint = PAINTSTRUCT::default();
-        let dc = unsafe { BeginPaint(hwnd, &mut paint) };
-        Self { hwnd, paint, dc }
-    }
-}
-
-impl Drop for PaintSession {
-    fn drop(&mut self) {
-        let _ = unsafe { EndPaint(self.hwnd, &self.paint) };
     }
 }
 
@@ -459,7 +413,7 @@ mod tests {
             // Draw directly into its own offscreen bitmap: no window, screen
             // capture, focus change or clipboard access is involved.
             reference
-                .draw(reference.dc.0, &content, ScreenPointPx { x: 0, y: 0 })
+                .draw(reference.dc(), &content, ScreenPointPx { x: 0, y: 0 })
                 .unwrap();
             for border in 0..=6 {
                 let height = dip(live_preview_height_dip(border), dpi);
@@ -475,17 +429,19 @@ mod tests {
                 )
                 .unwrap();
                 actual
-                    .draw(actual.dc.0, &content, ScreenPointPx { x: 0, y: 0 })
+                    .draw(actual.dc(), &content, ScreenPointPx { x: 0, y: 0 })
                     .unwrap();
                 let mut text_pixels = [0, 0];
                 for y in dip(2, dpi)..dip(37, dpi) {
                     for x in dip(44, dpi)..dip(164, dpi) {
-                        let expected = unsafe { GetPixel(reference.dc.0, x, y) };
+                        // SAFETY: both test surfaces own offscreen bitmaps covering x/y.
+                        let expected = unsafe { GetPixel(reference.dc(), x, y) };
                         if expected != palette::PANEL {
                             let line = usize::from(y >= dip(21, dpi));
                             text_pixels[line] += 1;
                             assert_eq!(
-                                unsafe { GetPixel(actual.dc.0, x, y) },
+                                // SAFETY: actual owns this DC and x/y are within its bitmap.
+                                unsafe { GetPixel(actual.dc(), x, y) },
                                 expected,
                                 "border {border} at {dpi} DPI covered text at ({x}, {y})"
                             );
@@ -498,11 +454,13 @@ mod tests {
                 );
                 if border > 0 {
                     assert_eq!(
-                        unsafe { GetPixel(actual.dc.0, width - 1, height / 2) },
+                        // SAFETY: right-edge coordinates are inside the owned surface.
+                        unsafe { GetPixel(actual.dc(), width - 1, height / 2) },
                         palette::BORDER
                     );
                     assert_eq!(
-                        unsafe { GetPixel(actual.dc.0, width / 2, height - 1) },
+                        // SAFETY: bottom-edge coordinates are inside the owned surface.
+                        unsafe { GetPixel(actual.dc(), width / 2, height - 1) },
                         palette::BORDER
                     );
                 }

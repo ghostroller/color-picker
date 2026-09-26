@@ -1,6 +1,10 @@
 //! Native settings editor. Only Apply returns a validated draft; the host owns
 //! persistence and the hotkey transaction. Callbacks never perform either task.
 
+use super::messages;
+use super::window_lifetime::{WindowInit, WindowLifetime, WindowRole};
+use crate::platform::windows::gdi::{PaintSession, SavedDc, WindowDc};
+
 use std::{
     cell::{Cell, RefCell},
     marker::PhantomData,
@@ -12,8 +16,8 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{
-            COLORREF, E_FAIL, ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND,
-            LPARAM, LRESULT, POINT, RECT, SetLastError, WPARAM,
+            COLORREF, E_FAIL, ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT,
+            POINT, RECT, WPARAM,
         },
         Graphics::{
             Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute},
@@ -25,9 +29,9 @@ use windows::{
         },
         UI::{
             Controls::{
-                DRAWITEMSTRUCT, EM_GETLINECOUNT, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX,
-                InitCommonControlsEx, SetScrollInfo, ShowScrollBar, TBM_SETPAGESIZE, TBM_SETPOS,
-                TBM_SETRANGEMAX, TBM_SETRANGEMIN, TBS_NOTICKS, TRACKBAR_CLASSW,
+                EM_GETLINECOUNT, ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
+                SetScrollInfo, ShowScrollBar, TBM_SETPAGESIZE, TBM_SETPOS, TBM_SETRANGEMAX,
+                TBM_SETRANGEMIN, TBS_NOTICKS, TRACKBAR_CLASSW,
             },
             HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
             Input::KeyboardAndMouse::{
@@ -133,6 +137,7 @@ enum CaptureHint {
 }
 
 struct CallbackState {
+    lifetime: WindowLifetime,
     notify: HWND,
     theme: Theme,
     status_tone: Cell<Tone>,
@@ -196,6 +201,8 @@ impl CallbackState {
         update(&mut pending);
         self.pending.set(pending);
         if !self.wake_posted.replace(true)
+            // SAFETY: The host outlives this window's callback tree; this private wake message
+            // carries scalar values only and retains no Rust reference.
             && unsafe { PostMessageW(Some(self.notify), WM_SETTINGS_WAKE, WPARAM(0), LPARAM(0)) }
                 .is_err()
         {
@@ -287,6 +294,14 @@ struct FontState {
     _fonts: Vec<Font>,
 }
 
+impl FontState {
+    fn retain_fonts(&self) {
+        for font in &self._fonts {
+            font.retain();
+        }
+    }
+}
+
 pub struct SettingsWindow {
     hwnd: HWND,
     callback: Box<CallbackState>,
@@ -321,10 +336,14 @@ impl SettingsWindow {
                     ),
                 )
             })?;
+        // SAFETY: None borrows the process module containing the static callback; the module
+        // lives for the process and is never freed by this window owner.
         let instance = unsafe { GetModuleHandleW(None)? }.into();
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
+            // SAFETY: IDC_ARROW is a documented system cursor identifier. The returned shared
+            // cursor is borrowed by the class and is never destroyed as an owned resource.
             hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
             lpszClassName: CLASS,
             ..Default::default()
@@ -334,13 +353,18 @@ impl SettingsWindow {
                 lpszClassName: name,
                 ..class
             };
+            // SAFETY: The initialized descriptor refers to static class names and callbacks;
+            // registration copies it synchronously and these references outlive all windows.
             if unsafe { RegisterClassW(&class) } == 0
+                // SAFETY: Read this thread's last-error value immediately after class registration;
+                // no pointer or borrowed resource is involved.
                 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS
             {
                 return Err(Error::from_thread());
             }
         }
         let callback = Box::new(CallbackState {
+            lifetime: WindowLifetime::default(),
             notify,
             theme: Theme::new()?,
             status_tone: Cell::new(Tone::Muted),
@@ -362,24 +386,34 @@ impl SettingsWindow {
             preview: RefCell::new(None),
         });
         let pointer = callback.as_ref() as *const CallbackState;
-        let mut cursor = POINT::default();
-        unsafe { GetCursorPos(&mut cursor)? };
-        let hwnd = unsafe {
-            CreateWindowExW(
-                EX_STYLE,
-                CLASS,
-                PCWSTR(wide(tr("设置 — Color Picker", "Settings — Color Picker")).as_ptr()),
-                STYLE,
-                cursor.x,
-                cursor.y,
-                1,
-                1,
-                Some(notify),
-                None,
-                Some(instance),
-                Some(pointer.cast()),
-            )?
+        let init = WindowInit {
+            state: pointer.cast(),
+            role: WindowRole::Root,
         };
+        let mut cursor = POINT::default();
+        // SAFETY: cursor is initialized, writable POINT storage retained through this query.
+        unsafe { GetCursorPos(&mut cursor)? };
+        // SAFETY: The callback Box stays stable while synchronous creation reads stack
+        // WindowInit and text; only the Box pointer is retained, checked by creation_result.
+        let hwnd = unsafe {
+            super::window_lifetime::create_window(|| {
+                CreateWindowExW(
+                    EX_STYLE,
+                    CLASS,
+                    PCWSTR(wide(tr("设置 — Color Picker", "Settings — Color Picker")).as_ptr()),
+                    STYLE,
+                    cursor.x,
+                    cursor.y,
+                    1,
+                    1,
+                    Some(notify),
+                    None,
+                    Some(instance),
+                    Some((&init as *const WindowInit).cast()),
+                )
+            })
+        };
+        let hwnd = callback.lifetime.creation_result("settings", hwnd)?;
         let mut window = Self {
             hwnd,
             callback,
@@ -392,6 +426,8 @@ impl SettingsWindow {
             _thread_affinity: PhantomData,
         };
         let disable_transitions = BOOL::from(true);
+        // SAFETY: The root owner is already established. The local attribute value has the
+        // matching native type/size and remains valid through this synchronous copy.
         unsafe {
             DwmSetWindowAttribute(
                 hwnd,
@@ -401,21 +437,29 @@ impl SettingsWindow {
             )?;
         }
         theme::configure_window(hwnd, &window.callback.theme);
+        let init = WindowInit {
+            state: pointer.cast(),
+            role: WindowRole::Content,
+        };
+        // SAFETY: The root owner retains callback state and owns partial-child cleanup.
+        // The stack content WindowInit/text live through this synchronous creation only.
         let viewport = unsafe {
-            CreateWindowExW(
-                WS_EX_CONTROLPARENT,
-                CONTENT_CLASS,
-                PCWSTR(wide(tr("设置内容", "Settings content")).as_ptr()),
-                WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL,
-                0,
-                0,
-                1,
-                1,
-                Some(hwnd),
-                Some(HMENU(CONTENT as *mut _)),
-                Some(instance),
-                Some(pointer.cast()),
-            )?
+            super::window_lifetime::create_window(|| {
+                CreateWindowExW(
+                    WS_EX_CONTROLPARENT,
+                    CONTENT_CLASS,
+                    PCWSTR(wide(tr("设置内容", "Settings content")).as_ptr()),
+                    WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL,
+                    0,
+                    0,
+                    1,
+                    1,
+                    Some(hwnd),
+                    Some(HMENU(CONTENT as *mut _)),
+                    Some(instance),
+                    Some((&init as *const WindowInit).cast()),
+                )
+            })?
         };
         window.callback.viewport.set(viewport);
         window.create_controls(config)?;
@@ -442,11 +486,19 @@ impl SettingsWindow {
                 Tone::Muted
             },
         )?;
+        // SAFETY: The target belongs to this live control tree; the scalar enabled state
+        // retains no pointer and no callback-state RefMut spans synchronous dispatch.
         unsafe {
             let _ = EnableWindow(window.controls.apply, save_allowed);
-            let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
-            let _ = SetForegroundWindow(hwnd);
-            let _ = SetFocus(Some(window.controls.ctrl));
+        }
+        if super::window_lifetime::show_native_windows() {
+            // SAFETY: The window/control belongs to the live UI-thread owner. These synchronous
+            // calls occur without a held callback-state mutable borrow.
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+                let _ = SetForegroundWindow(hwnd);
+                let _ = SetFocus(Some(window.controls.ctrl));
+            }
         }
         Ok(window)
     }
@@ -540,6 +592,8 @@ impl SettingsWindow {
             (self.controls.close, tr("关闭", "Close")),
             (self.controls.apply, tr("应用", "Apply")),
         ] {
+            // SAFETY: The target control belongs to this owner and the terminated UTF-16 string
+            // lives until SetWindowTextW finishes copying it; no text pointer is retained.
             unsafe { SetWindowTextW(hwnd, PCWSTR(wide(text).as_ptr()))? };
         }
         self.update_capture_text()?;
@@ -555,6 +609,8 @@ impl SettingsWindow {
     /// until release, including after Tab/click moves focus to another control.
     /// This is window-local message filtering, not a global keyboard hook.
     pub fn filter_key_message(&self, message: &MSG) -> bool {
+        // SAFETY: Both identifiers are borrowed; USER32 validates their descendant relation
+        // without dereferencing any Rust storage or taking HWND ownership.
         if message.hwnd != self.hwnd && !unsafe { IsChild(self.hwnd, message.hwnd) }.as_bool() {
             return false;
         }
@@ -588,6 +644,8 @@ impl SettingsWindow {
     fn set_status(&self, text: &str, tone: Tone) -> Result<()> {
         self.callback.status_tone.set(tone);
         let text = wide(text);
+        // SAFETY: Both status controls belong to this owner; the terminated UTF-16 text
+        // lives through synchronous copying and no callback-state RefMut is held.
         unsafe {
             SetWindowTextW(self.controls.status, PCWSTR(text.as_ptr()))?;
             SetWindowTextW(self.controls.status_details, PCWSTR(text.as_ptr()))?;
@@ -616,6 +674,8 @@ impl SettingsWindow {
         }
         if let Some(rect) = pending.dpi_rect {
             let rect = fit_to_work_area(rect, self.minimum_size()?)?;
+            // SAFETY: The live owner retains these HWNDs on their creating thread. Geometry is
+            // passed by value and no callback-state RefMut spans synchronous layout reentry.
             unsafe {
                 SetWindowPos(
                     self.hwnd,
@@ -630,8 +690,12 @@ impl SettingsWindow {
         }
         if pending.fit_work_area {
             let mut rect = RECT::default();
+            // SAFETY: The live window owner or callback retains this HWND. The initialized local
+            // RECT is writable for exactly this synchronous query and is not retained.
             unsafe { GetWindowRect(self.hwnd, &mut rect)? };
             let rect = fit_to_work_area(rect, self.minimum_size()?)?;
+            // SAFETY: The live owner retains these HWNDs on their creating thread. Geometry is
+            // passed by value and no callback-state RefMut spans synchronous layout reentry.
             unsafe {
                 SetWindowPos(
                     self.hwnd,
@@ -650,6 +714,8 @@ impl SettingsWindow {
         if pending.layout || pending.scroll.is_some() || pending.fit_work_area {
             self.layout()?;
             if pending.scroll.is_none() {
+                // SAFETY: This queries a borrowed HWND from the current UI thread; reveal_control
+                // checks membership in the owned viewport before using its geometry.
                 self.reveal_control(unsafe { GetFocus() })?;
             }
         }
@@ -663,6 +729,8 @@ impl SettingsWindow {
             self.update_capture_text()?;
         }
         if pending.focus_key && self.callback.recording.get() {
+            // SAFETY: The window/control belongs to the live UI-thread owner. These synchronous
+            // calls occur without a held callback-state mutable borrow.
             unsafe { SetFocus(Some(self.controls.key))? };
         }
         if pending.appearance {
@@ -684,6 +752,8 @@ impl SettingsWindow {
     }
 
     fn create_controls(&mut self, config: &Config) -> Result<()> {
+        // SAFETY: INITCOMMONCONTROLSEX advertises its actual size and lives for this call;
+        // the requested trackbar classes retain no pointers to the descriptor.
         if !unsafe {
             InitCommonControlsEx(&INITCOMMONCONTROLSEX {
                 dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -730,6 +800,8 @@ impl SettingsWindow {
         self.controls.shift = self.control(w!("BUTTON"), "Shift", SHIFT, check)?;
         self.controls.key_label = self.control(w!("STATIC"), "", 11, label)?;
         self.controls.key = self.control(w!("BUTTON"), "", KEY, button)?;
+        // SAFETY: The key button is a child of this root. Its subclass borrows the stable
+        // callback Box until child WM_NCDESTROY, which precedes root-state release.
         if !unsafe {
             SetWindowSubclass(
                 self.controls.key,
@@ -828,27 +900,33 @@ impl SettingsWindow {
     fn control(&self, class: PCWSTR, text: &str, id: usize, style: WINDOW_STYLE) -> Result<HWND> {
         let text = wide(text);
         let footer = matches!(id, APPLY | CLOSE | STATUS | STATUS_DETAILS);
+        // SAFETY: class/text are terminated strings read only during synchronous creation.
+        // The root owner owns this child tree, including cleanup after partial failure.
         let hwnd = unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
-                class,
-                PCWSTR(text.as_ptr()),
-                WS_CHILD | WS_VISIBLE | style,
-                0,
-                0,
-                1,
-                1,
-                Some(if footer {
-                    self.hwnd
-                } else {
-                    self.callback.viewport.get()
-                }),
-                Some(HMENU(id as *mut _)),
-                Some(GetModuleHandleW(None)?.into()),
-                None,
-            )?
+            super::window_lifetime::create_window(|| {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    class,
+                    PCWSTR(text.as_ptr()),
+                    WS_CHILD | WS_VISIBLE | style,
+                    0,
+                    0,
+                    1,
+                    1,
+                    Some(if footer {
+                        self.hwnd
+                    } else {
+                        self.callback.viewport.get()
+                    }),
+                    Some(HMENU(id as *mut _)),
+                    Some(GetModuleHandleW(None)?.into()),
+                    None,
+                )
+            })?
         };
         if !footer
+            // SAFETY: This content control belongs to the root tree. The stable Box referenced
+            // by its subclass outlives child teardown and the subclass removes itself.
             && !unsafe {
                 SetWindowSubclass(
                     hwnd,
@@ -922,6 +1000,8 @@ impl SettingsWindow {
                 format!("{}%", slider_value(self.controls.background_transparency)?),
             ),
         ] {
+            // SAFETY: The target control belongs to this owner and the terminated UTF-16 string
+            // lives until SetWindowTextW finishes copying it; no text pointer is retained.
             unsafe { SetWindowTextW(hwnd, PCWSTR(wide(&text).as_ptr()))? };
         }
         self.update_appearance_preview()
@@ -931,6 +1011,8 @@ impl SettingsWindow {
         // Keep the ordinary-mode preference intact, even when quick picking
         // makes copying mandatory. Unchecking quick mode restores this choice.
         let _ =
+            // SAFETY: The target belongs to this live control tree; the scalar enabled state
+            // retains no pointer and no callback-state RefMut spans synchronous dispatch.
             unsafe { EnableWindow(self.controls.auto_copy, !checked(self.controls.quick_pick)) };
     }
 
@@ -956,6 +1038,8 @@ impl SettingsWindow {
                 appearance.border_width_dip,
                 appearance.background_transparency_percent
             );
+            // SAFETY: The preview control belongs to this owner; the description is a live
+            // terminated temporary copied synchronously, and invalidation retains no pointer.
             unsafe {
                 SetWindowTextW(self.controls.preview, PCWSTR(wide(&description).as_ptr()))?;
                 let _ = InvalidateRect(Some(self.controls.preview), None, false);
@@ -999,6 +1083,8 @@ impl SettingsWindow {
                 "Original key kept\r\nClick to record again",
             ),
         };
+        // SAFETY: The button/hint belong to this owner. Each temporary UTF-16 string lives
+        // through its synchronous SetWindowTextW call; no borrowed text is retained.
         unsafe {
             SetWindowTextW(self.controls.key, PCWSTR(wide(&button).as_ptr()))?;
             SetWindowTextW(self.controls.hint, PCWSTR(wide(hint).as_ptr()))?;
@@ -1007,6 +1093,8 @@ impl SettingsWindow {
     }
 
     fn dpi(&self) -> Result<u32> {
+        // SAFETY: The current callback or window owner retains this HWND through the scalar
+        // DPI query; no native handle ownership is transferred.
         let dpi = unsafe { GetDpiForWindow(self.hwnd) };
         if dpi == 0 || dpi > 9600 {
             Err(Error::new(
@@ -1022,17 +1110,23 @@ impl SettingsWindow {
     }
 
     fn place_initially(&self, cursor: POINT) -> Result<()> {
+        // SAFETY: The screen coordinate is passed by value and the query returns a borrowed
+        // monitor identifier; it creates or retains no Rust references.
         let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
         let mut info = MONITORINFO {
             cbSize: size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
+        // SAFETY: The monitor came from the native lookup; initialized MONITORINFO advertises
+        // its exact size and stays writable for the duration of this query.
         if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
             return Err(Error::from_thread());
         }
         let work = info.rcWork;
         let center_x = ((i64::from(work.left) + i64::from(work.right)) / 2) as i32;
         let center_y = ((i64::from(work.top) + i64::from(work.bottom)) / 2) as i32;
+        // SAFETY: The live owner retains these HWNDs on their creating thread. Geometry is
+        // passed by value and no callback-state RefMut spans synchronous layout reentry.
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -1050,6 +1144,8 @@ impl SettingsWindow {
             bottom: dip(CLIENT_HEIGHT, dpi),
             ..Default::default()
         };
+        // SAFETY: outer is initialized local RECT storage; styles and validated DPI are
+        // values, and the geometry calculation retains no pointers.
         unsafe {
             AdjustWindowRectExForDpi(&mut outer, STYLE, false, EX_STYLE, dpi)?;
         }
@@ -1076,6 +1172,8 @@ impl SettingsWindow {
             rect.right - rect.left,
             rect.bottom - rect.top,
         );
+        // SAFETY: The live owner retains these HWNDs on their creating thread. Geometry is
+        // passed by value and no callback-state RefMut spans synchronous layout reentry.
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -1100,6 +1198,8 @@ impl SettingsWindow {
             bottom: dip(180, dpi),
             ..Default::default()
         };
+        // SAFETY: outer is initialized local RECT storage; styles and validated DPI are
+        // values, and the geometry calculation retains no pointers.
         unsafe { AdjustWindowRectExForDpi(&mut outer, STYLE, false, EX_STYLE, dpi)? };
         Ok((outer.right - outer.left, outer.bottom - outer.top))
     }
@@ -1114,49 +1214,61 @@ impl SettingsWindow {
             .is_none_or(|(font_dpi, _)| *font_dpi != dpi)
         {
             let font = Font::for_language(14, dpi, 400, false, Language::SimplifiedChinese)?;
+            // SAFETY: The new language font remains owned locally until stored in language_font;
+            // WM_SETFONT replaces the control reference before the previous font is dropped.
             unsafe {
                 SendMessageW(
                     self.controls.language,
                     WM_SETFONT,
-                    Some(WPARAM(font.0.0 as usize)),
+                    Some(WPARAM(font.raw().0 as usize)),
                     Some(LPARAM(1)),
                 );
             }
-            self.language_font.replace(Some((dpi, font)));
+            let old = self.language_font.replace(Some((dpi, font)));
+            if self.callback.theme.fonts_must_be_retained()
+                && let Some((_, font)) = &old
+            {
+                font.retain();
+            }
+            drop(old);
         }
         if self.font.borrow().dpi != dpi {
             let body = Font::new(14, dpi, 400, false)?;
             let title = Font::new(20, dpi, 600, false)?;
             let heading = Font::new(14, dpi, 600, false)?;
             let small = Font::new(12, dpi, 400, false)?;
-            let small_line_height = font_line_height(self.controls.status, small.0, dpi);
+            let small_line_height = font_line_height(self.controls.status, &small, dpi);
             for hwnd in self.controls.handles() {
                 if hwnd == self.controls.language {
                     continue;
                 }
+                // SAFETY: All new fonts were successfully created before notifications begin; these
+                // owned controls switch fonts before replacing and dropping the old FontState.
                 unsafe {
                     SendMessageW(
                         hwnd,
                         WM_SETFONT,
-                        Some(WPARAM(body.0.0 as usize)),
+                        Some(WPARAM(body.raw().0 as usize)),
                         Some(LPARAM(1)),
                     );
                 }
             }
             for (hwnd, font) in [
-                (self.controls.title, title.0),
-                (self.controls.hotkey_label, heading.0),
-                (self.controls.copy_heading, heading.0),
-                (self.controls.appearance_heading, heading.0),
-                (self.controls.usage_heading, small.0),
-                (self.controls.subtitle, small.0),
-                (self.controls.hint, small.0),
-                (self.controls.usage_hint, small.0),
-                (self.controls.status, small.0),
-                (self.controls.status_details, small.0),
-                (self.controls.preview_heading, small.0),
-                (self.controls.preview_hint, small.0),
+                (self.controls.title, title.raw()),
+                (self.controls.hotkey_label, heading.raw()),
+                (self.controls.copy_heading, heading.raw()),
+                (self.controls.appearance_heading, heading.raw()),
+                (self.controls.usage_heading, small.raw()),
+                (self.controls.subtitle, small.raw()),
+                (self.controls.hint, small.raw()),
+                (self.controls.usage_hint, small.raw()),
+                (self.controls.status, small.raw()),
+                (self.controls.status_details, small.raw()),
+                (self.controls.preview_heading, small.raw()),
+                (self.controls.preview_hint, small.raw()),
             ] {
+                // SAFETY: The new body/heading font owners remain live through these synchronous
+                // WM_SETFONT calls and are retained in FontState after all controls switch.
                 unsafe {
                     SendMessageW(
                         hwnd,
@@ -1171,9 +1283,14 @@ impl SettingsWindow {
                 small_line_height,
                 _fonts: vec![body, title, heading, small],
             });
+            if self.callback.theme.fonts_must_be_retained() {
+                old.retain_fonts();
+            }
             drop(old);
         }
         let mut client = RECT::default();
+        // SAFETY: The live window owner or callback retains this HWND. The initialized local
+        // RECT is writable for exactly this synchronous query and is not retained.
         unsafe { GetClientRect(self.hwnd, &mut client)? };
         let narrow = client.right < dip(480, dpi);
         let panes = SheetLayout::new(
@@ -1185,6 +1302,8 @@ impl SettingsWindow {
         )?;
         let viewport_height = panes.viewport.bottom;
         let viewport = self.callback.viewport.get();
+        // SAFETY: The live owner retains these HWNDs on their creating thread. Geometry is
+        // passed by value and no callback-state RefMut spans synchronous layout reentry.
         unsafe { MoveWindow(viewport, 0, 0, client.right, viewport_height, true)? };
         self.callback.viewport_height.set(viewport_height);
         // Start at the full width so a previously visible scrollbar cannot keep
@@ -1193,6 +1312,8 @@ impl SettingsWindow {
         let full_width = ((i64::from(client.right) * 96) / i64::from(dpi)) as i32;
         let needs_scroll = dip(settings_content_layout(full_width).height, dpi) > viewport_height;
         let mut viewport_client = RECT::default();
+        // SAFETY: The owner retains the viewport during scrollbar reentry. viewport_client
+        // is local writable RECT storage; no callback-state mutable borrow spans calls.
         unsafe {
             ShowScrollBar(viewport, SB_VERT, needs_scroll)?;
             GetClientRect(viewport, &mut viewport_client)?;
@@ -1217,10 +1338,14 @@ impl SettingsWindow {
             nPos: offset,
             ..Default::default()
         };
+        // SAFETY: scroll is an initialized, correctly sized local SCROLLINFO for the owned
+        // viewport; USER32 copies it synchronously and retains no Rust reference.
         unsafe {
             SetScrollInfo(viewport, SB_VERT, &scroll, true);
         }
         for (id, rect) in geometry.controls {
+            // SAFETY: The live owner retains the parent and child tree. This query borrows an
+            // existing child HWND and transfers no ownership.
             let control = unsafe { GetDlgItem(Some(viewport), id as i32)? };
             // COMBOBOX uses the requested height for its opened dropdown.
             let height = if matches!(id, LANGUAGE | FORMAT) {
@@ -1228,6 +1353,8 @@ impl SettingsWindow {
             } else {
                 rect.bottom - rect.top
             };
+            // SAFETY: The live owner retains these HWNDs on their creating thread. Geometry is
+            // passed by value and no callback-state RefMut spans synchronous layout reentry.
             unsafe {
                 MoveWindow(
                     control,
@@ -1247,6 +1374,8 @@ impl SettingsWindow {
         let close_x = apply_x - gap - button_width;
         let button_y = footer_top + if narrow { dip(44, dpi) } else { 0 };
         for status in [self.controls.status, self.controls.status_details] {
+            // SAFETY: The live owner retains these HWNDs on their creating thread. Geometry is
+            // passed by value and no callback-state RefMut spans synchronous layout reentry.
             unsafe {
                 MoveWindow(
                     status,
@@ -1262,6 +1391,8 @@ impl SettingsWindow {
                 )?;
             }
         }
+        // SAFETY: The live owner retains these HWNDs on their creating thread. Geometry is
+        // passed by value and no callback-state RefMut spans synchronous layout reentry.
         unsafe {
             MoveWindow(
                 self.controls.close,
@@ -1281,6 +1412,8 @@ impl SettingsWindow {
             )?;
         }
         for combo in [self.controls.language, self.controls.format] {
+            // SAFETY: These are this owner's COMBOBOX controls. Item-height messages use scalar
+            // indices/heights only and no mutable state borrow spans synchronous dispatch.
             unsafe {
                 SendMessageW(
                     combo,
@@ -1301,6 +1434,8 @@ impl SettingsWindow {
             // border), not the dropdown height passed to MoveWindow.
             let mut combo = RECT::default();
             let mut label = RECT::default();
+            // SAFETY: Both controls belong to this tree. combo/label are initialized local RECT
+            // outputs and the APIs do not retain pointers after return.
             unsafe {
                 GetWindowRect(self.controls.language, &mut combo)?;
                 GetWindowRect(self.controls.language_label, &mut label)?;
@@ -1309,6 +1444,8 @@ impl SettingsWindow {
                 x: label.left,
                 y: combo.top,
             };
+            // SAFETY: The live viewport maps a local POINT; the associated owned label is moved
+            // synchronously after successful conversion, with no state RefMut held.
             unsafe {
                 if !ScreenToClient(viewport, &mut origin).as_bool() {
                     return Err(Error::from_thread());
@@ -1325,18 +1462,26 @@ impl SettingsWindow {
         }
         self.update_status_scrollbar()?;
         self.update_appearance_preview()?;
+        // SAFETY: The owner retains this window on its UI thread; None invalidates its client
+        // area without lending any RECT pointer or triggering immediate drawing here.
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+        // SAFETY: The owner retains this window on its UI thread; None invalidates its client
+        // area without lending any RECT pointer or triggering immediate drawing here.
         let _ = unsafe { InvalidateRect(Some(viewport), None, false) };
         Ok(())
     }
 
     fn reveal_control(&self, hwnd: HWND) -> Result<()> {
         let viewport = self.callback.viewport.get();
+        // SAFETY: Both identifiers are borrowed; USER32 validates their descendant relation
+        // without dereferencing any Rust storage or taking HWND ownership.
         if !unsafe { IsChild(viewport, hwnd) }.as_bool() {
             return Ok(());
         }
         let mut rect = RECT::default();
         let mut origin = POINT::default();
+        // SAFETY: The verified descendant and viewport remain owned here. RECT/POINT are
+        // valid local output slots used only by these synchronous geometry queries.
         unsafe {
             GetWindowRect(hwnd, &mut rect)?;
             if !ClientToScreen(viewport, &mut origin).as_bool() {
@@ -1362,16 +1507,24 @@ impl SettingsWindow {
         // Measure wrapping in the hidden edit. Short statuses use a static label;
         // long diagnostics keep the existing readable, scrollable detail view.
         let details = self.controls.status_details;
+        // SAFETY: The status EDIT belongs to this window and lives through this scalar
+        // scrollbar change; no RefCell borrow spans native reentrant processing.
         unsafe {
             ShowScrollBar(details, SB_VERT, false)?;
         }
         let mut client = RECT::default();
+        // SAFETY: The live window owner or callback retains this HWND. The initialized local
+        // RECT is writable for exactly this synchronous query and is not retained.
         unsafe {
             GetClientRect(details, &mut client)?;
         }
+        // SAFETY: The helper uses an owned control and a documented scalar-only message;
+        // synchronous processing retains no Rust pointer or mutable state borrow.
         let lines = unsafe { SendMessageW(details, EM_GETLINECOUNT, None, None) }.0;
         let visible_lines = ((client.bottom - client.top) / line_height).max(1);
         let overflow = lines > visible_lines as isize;
+        // SAFETY: The live status/action controls belong to this owner. Focus/style updates
+        // use values only and occur outside callback-state mutable borrows.
         unsafe {
             if !overflow && GetFocus() == details {
                 let _ = SetFocus(Some(self.controls.close));
@@ -1397,6 +1550,8 @@ impl SettingsWindow {
             } else {
                 BS_PUSHBUTTON
             };
+            // SAFETY: The owned BUTTON controls receive only scalar BM_SETSTYLE flags; this
+            // synchronous dispatch occurs without a callback-state RefMut.
             unsafe {
                 SendMessageW(
                     hwnd,
@@ -1412,7 +1567,14 @@ impl SettingsWindow {
 impl Drop for SettingsWindow {
     fn drop(&mut self) {
         self.callback.closing.set(true);
-        let _ = unsafe { DestroyWindow(self.hwnd) };
+        self.callback.lifetime.destroy("settings");
+        // Include failures from teardown reentry before any font owner drops.
+        if self.callback.theme.fonts_must_be_retained() {
+            self.font.get_mut().retain_fonts();
+            if let Some((_, font)) = self.language_font.get_mut() {
+                font.retain();
+            }
+        }
     }
 }
 
@@ -1531,13 +1693,17 @@ fn settings_content_layout(width: i32) -> SettingsContentLayout {
 }
 
 fn paint_content(hwnd: HWND, offset: i32, width: i32) -> LRESULT {
-    let mut paint = PAINTSTRUCT::default();
-    let dc = unsafe { BeginPaint(hwnd, &mut paint) };
-    if !dc.is_invalid() {
-        let saved = unsafe { SaveDC(dc) };
-        if saved != 0 {
+    // SAFETY: native WM_PAINT; establish its DC before any mutable state borrow.
+    if let Ok(paint) = unsafe { PaintSession::begin(hwnd) } {
+        let dc = paint.dc;
+        // SAFETY: the paint session outlives this stock-object drawing scope.
+        if let Ok(saved) = unsafe { SavedDc::new(dc) } {
+            // SAFETY: The current callback or window owner retains this HWND through the scalar
+            // DPI query; no native handle ownership is transferred.
             let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
             let mut client = RECT::default();
+            // SAFETY: PaintSession keeps this DC/window alive; local RECT output is initialized.
+            // Only stock brush/pen objects are selected, with SavedDc restoring attributes.
             unsafe {
                 let _ = GetClientRect(hwnd, &mut client);
                 SelectObject(dc, GetStockObject(DC_BRUSH));
@@ -1557,14 +1723,21 @@ fn paint_content(hwnd: HWND, offset: i32, width: i32) -> LRESULT {
                         dip(16, dpi),
                     );
                 }
-                let _ = RestoreDC(dc, saved);
+            }
+            if let Err(error) = saved.restore() {
+                crate::app::diagnostics::event(format_args!(
+                    "settings.paint_restore_failed {error}"
+                ));
             }
         }
     }
-    let _ = unsafe { EndPaint(hwnd, &paint) };
     LRESULT(0)
 }
 
+/// # Safety
+/// Invoked by the installed child subclass on its creating UI thread. reference
+/// must be this root's stable CallbackState pointer, retained through child
+/// WM_NCDESTROY; message parameters obey the native subclass contract.
 unsafe extern "system" fn scroll_control_proc(
     hwnd: HWND,
     message: u32,
@@ -1574,43 +1747,53 @@ unsafe extern "system" fn scroll_control_proc(
     reference: usize,
 ) -> LRESULT {
     catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: The installed subclass reference points to this root's stable callback
+        // Box. Root teardown keeps it alive until every child/subclass callback returns.
         let state = unsafe { &*(reference as *const CallbackState) };
         match message {
             WM_SETFOCUS => state.queue(|pending| pending.reveal = Some(hwnd)),
             WM_NCDESTROY => {
+                // SAFETY: This removes the exact subclass identity installed on this child. The
+                // root lifetime keeps callback state alive until all child teardown finishes.
                 let _ = unsafe { RemoveWindowSubclass(hwnd, Some(scroll_control_proc), subclass) };
             }
             _ => {}
         }
         // Native sliders and combos retain their wheel/arrow semantics. Other
         // controls let DefWindowProc propagate an unhandled wheel to the pane.
+        // SAFETY: The original subclass message and any native payload remain valid until
+        // this callback returns; all temporary mutable state borrows have ended.
         unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
     }))
     .unwrap_or_else(|_| std::process::abort())
 }
 
-fn font_line_height(hwnd: HWND, font: HFONT, dpi: u32) -> i32 {
-    let dc = unsafe { GetDC(Some(hwnd)) };
-    if dc.is_invalid() {
-        return dip(16, dpi).max(1);
-    }
-    let old = unsafe { SelectObject(dc, HGDIOBJ(font.0)) };
-    if old.is_invalid() {
-        unsafe {
-            ReleaseDC(Some(hwnd), dc);
-        }
-        return dip(16, dpi).max(1);
+fn font_line_height(hwnd: HWND, font: &Font, dpi: u32) -> i32 {
+    let fallback = dip(16, dpi).max(1);
+    // SAFETY: the owned control remains live for this synchronous measurement.
+    let Ok(dc) = (unsafe { WindowDc::new(hwnd) }) else {
+        return fallback;
+    };
+    // SAFETY: dc and font remain live until saved state is restored below.
+    let Ok(saved) = (unsafe { SavedDc::new(dc.raw()) }) else {
+        return fallback;
+    };
+    // SAFETY: this is the live font owner; only the selection is borrowed by GDI.
+    let old = unsafe { SelectObject(dc.raw(), font.raw().into()) };
+    if crate::platform::windows::gdi::invalid_selection(old) {
+        return fallback;
     }
     let mut metric = TEXTMETRICW::default();
-    let measured = unsafe { GetTextMetricsW(dc, &mut metric) }.as_bool();
-    unsafe {
-        SelectObject(dc, old);
-        ReleaseDC(Some(hwnd), dc);
+    // SAFETY: metric is writable output storage for the live window DC.
+    let measured = unsafe { GetTextMetricsW(dc.raw(), &mut metric) }.as_bool();
+    if saved.restore().is_err() {
+        font.retain();
+        return fallback;
     }
     if measured {
         metric.tmHeight.max(1)
     } else {
-        dip(16, dpi).max(1)
+        fallback
     }
 }
 
@@ -1624,6 +1807,8 @@ fn key_name(key: u32) -> Option<String> {
 
 fn append_choice(hwnd: HWND, text: &str) -> Result<()> {
     let text = wide(text);
+    // SAFETY: This is an owned string COMBOBOX (not owner-drawn without strings). It
+    // copies the terminated UTF-16 allocation synchronously before this call returns.
     let result = unsafe {
         SendMessageW(
             hwnd,
@@ -1643,6 +1828,8 @@ fn append_choice(hwnd: HWND, text: &str) -> Result<()> {
 }
 
 fn set_choice(hwnd: HWND, index: usize) -> Result<()> {
+    // SAFETY: The helper uses an owned control and a documented scalar-only message;
+    // synchronous processing retains no Rust pointer or mutable state borrow.
     if unsafe { SendMessageW(hwnd, CB_SETCURSEL, Some(WPARAM(index)), None) }.0 < 0 {
         Err(Error::new(
             E_FAIL,
@@ -1654,22 +1841,30 @@ fn set_choice(hwnd: HWND, index: usize) -> Result<()> {
 }
 
 fn selected_choice(hwnd: HWND) -> Result<usize> {
+    // SAFETY: The helper uses an owned control and a documented scalar-only message;
+    // synchronous processing retains no Rust pointer or mutable state borrow.
     let result = unsafe { SendMessageW(hwnd, CB_GETCURSEL, None, None) }.0;
     usize::try_from(result)
         .map_err(|_| Error::new(E_FAIL, tr("请选择有效的选项", "Choose a valid option")))
 }
 
 fn set_checked(hwnd: HWND, value: bool) {
+    // SAFETY: This private helper is called with owned checkbox BUTTON controls; the
+    // message contains only a scalar check state and retains no Rust references.
     unsafe {
         SendMessageW(hwnd, BM_SETCHECK, Some(WPARAM(usize::from(value))), None);
     }
 }
 
 fn checked(hwnd: HWND) -> bool {
+    // SAFETY: The helper uses an owned control and a documented scalar-only message;
+    // synchronous processing retains no Rust pointer or mutable state borrow.
     unsafe { SendMessageW(hwnd, BM_GETCHECK, None, None) }.0 == 1
 }
 
 fn set_slider(hwnd: HWND, maximum: u8, value: u8, page_size: u8) {
+    // SAFETY: This private helper receives owned TRACKBAR controls; all four messages
+    // carry scalar range/position values and retain no Rust pointers.
     unsafe {
         SendMessageW(hwnd, TBM_SETRANGEMIN, Some(WPARAM(0)), Some(LPARAM(0)));
         SendMessageW(
@@ -1694,6 +1889,8 @@ fn set_slider(hwnd: HWND, maximum: u8, value: u8, page_size: u8) {
 }
 
 fn slider_value(hwnd: HWND) -> Result<u8> {
+    // SAFETY: The helper uses an owned control and a documented scalar-only message;
+    // synchronous processing retains no Rust pointer or mutable state borrow.
     let value = unsafe { SendMessageW(hwnd, TBM_GETPOS, None, None) }.0;
     u8::try_from(value).map_err(|_| {
         Error::new(
@@ -1703,6 +1900,10 @@ fn slider_value(hwnd: HWND) -> Result<u8> {
     })
 }
 
+/// # Safety
+/// Invoked by the installed child subclass on its creating UI thread. reference
+/// must be this root's stable CallbackState pointer, retained through child
+/// WM_NCDESTROY; message parameters obey the native subclass contract.
 unsafe extern "system" fn key_button_proc(
     hwnd: HWND,
     message: u32,
@@ -1711,12 +1912,18 @@ unsafe extern "system" fn key_button_proc(
     subclass: usize,
     reference: usize,
 ) -> LRESULT {
+    // SAFETY: This registered native callback supplies the dispatcher's valid HWND and
+    // message payload; the panic boundary prevents unwind across the system ABI.
     catch_unwind(AssertUnwindSafe(|| unsafe {
         key_button_dispatch(hwnd, message, wparam, lparam, subclass, reference)
     }))
     .unwrap_or_else(|_| std::process::abort())
 }
 
+/// # Safety
+/// Invoked by the installed child subclass on its creating UI thread. reference
+/// must be this root's stable CallbackState pointer, retained through child
+/// WM_NCDESTROY; message parameters obey the native subclass contract.
 unsafe fn key_button_dispatch(
     hwnd: HWND,
     message: u32,
@@ -1726,13 +1933,19 @@ unsafe fn key_button_dispatch(
     reference: usize,
 ) -> LRESULT {
     // The owner destroys all child windows before dropping this stable Box.
+    // SAFETY: The installed subclass reference points to this root's stable callback
+    // Box. Root teardown keeps it alive until every child/subclass callback returns.
     let state = unsafe { &*(reference as *const CallbackState) };
     let key = wparam.0 as u32;
     match message {
         WM_NCDESTROY => {
+            // SAFETY: This removes the exact subclass identity installed on this child. The
+            // root lifetime keeps callback state alive until all child teardown finishes.
             let _ = unsafe { RemoveWindowSubclass(hwnd, Some(key_button_proc), subclass) };
         }
         WM_GETDLGCODE => {
+            // SAFETY: The original subclass message and any native payload remain valid until
+            // this callback returns; all temporary mutable state borrows have ended.
             let native = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
             // IsDialogMessage must dispatch Enter/Esc to the recording button,
             // while Tab keeps its normal navigation and cancels on focus loss.
@@ -1780,34 +1993,59 @@ unsafe fn key_button_dispatch(
         WM_CHAR | WM_SYSCHAR => return LRESULT(0),
         _ => {}
     }
+    // SAFETY: The original subclass message and any native payload remain valid until
+    // this callback returns; all temporary mutable state borrows have ended.
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
+/// # Safety
+/// Invoked for this registered class with native message payloads valid for the
+/// callback duration. WM_NCCREATE must carry our synchronous WindowInit pointing
+/// to stable CallbackState; later userdata remains owned until root termination.
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // SAFETY: This registered native callback supplies the dispatcher's valid HWND and
+    // message payload; the panic boundary prevents unwind across the system ABI.
     catch_unwind(AssertUnwindSafe(|| unsafe {
         dispatch(hwnd, message, wparam, lparam)
     }))
     .unwrap_or_else(|_| std::process::abort())
 }
 
+/// # Safety
+/// Invoked for this registered class with native message payloads valid for the
+/// callback duration. WM_NCCREATE must carry our synchronous WindowInit pointing
+/// to stable CallbackState; later userdata remains owned until root termination.
 unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if message == WM_NCCREATE {
-        let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
-        unsafe {
-            SetLastError(ERROR_SUCCESS);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+        // SAFETY: native WM_NCCREATE carries our synchronous WindowInit;
+        // only the stable callback pointer is installed, never the stack init.
+        return unsafe {
+            messages::with_window_init(lparam, |init| {
+                let state = &*(init.state as *const CallbackState);
+                if state.lifetime.attach(hwnd, init) {
+                    // Preserve native nonclient initialization, including the
+                    // accessible window title copied from CREATESTRUCTW.
+                    DefWindowProcW(hwnd, message, wparam, lparam)
+                } else {
+                    LRESULT(0)
+                }
+            })
         }
-        if unsafe { GetLastError() } != ERROR_SUCCESS {
-            return LRESULT(0);
-        }
+        .unwrap_or(LRESULT(0));
     }
+    // SAFETY: Read only userdata installed by this class's WM_NCCREATE on the UI thread;
+    // root lifetime tracking retains its stable callback allocation until teardown.
     let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const CallbackState;
+    // SAFETY: A nonnull value is this class's installed stable Box pointer, not an
+    // arbitrary address; root termination completes before its owner can free it.
     let Some(state) = (unsafe { pointer.as_ref() }) else {
+        // SAFETY: Forward the unchanged native message while its payload remains valid for
+        // this callback; the default procedure does not gain Rust-state ownership.
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     };
     match message {
@@ -1819,6 +2057,8 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         WM_PAINT => state.theme.paint(hwnd, &[]),
         WM_ERASEBKGND => LRESULT(1),
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
+            // SAFETY: This message supplies a child-control HWND (not a payload pointer); USER32
+            // queries its numeric ID without taking ownership or retaining Rust references.
             let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut _)) } as usize;
             let (panel, tone) = match id {
                 TITLE => (false, Tone::Text),
@@ -1844,18 +2084,37 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                 .theme
                 .control_color(HDC(wparam.0 as *mut _), panel, tone)
         }
-        WM_NOTIFY => theme::custom_draw(lparam, APPLY)
-            .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }),
-        WM_DRAWITEM if wparam.0 == APPEARANCE_PREVIEW && lparam.0 != 0 => {
-            let draw = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
-            if let Some(preview) = state.preview.borrow().as_ref()
-                && let Err(error) = preview.paint(draw.hDC, draw.rcItem)
-            {
-                crate::app::diagnostics::event(format_args!(
-                    "settings.preview_paint_failed {error}"
-                ));
+        WM_NOTIFY => {
+            // SAFETY: native notification is validated before typed custom drawing.
+            unsafe {
+                messages::with_button_custom_draw(hwnd, lparam, |draw| {
+                    theme::custom_draw(&state.theme, draw, APPLY)
+                })
             }
-            LRESULT(1)
+            // SAFETY: Forward the unchanged native message while its payload remains valid for
+            // this callback; the default procedure does not gain Rust-state ownership.
+            .flatten()
+            .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) })
+        }
+        WM_DRAWITEM if wparam.0 == APPEARANCE_PREVIEW => {
+            // SAFETY: native owner draw is decoded once; the preview borrows its DC only here.
+            unsafe {
+                messages::with_static_draw(hwnd, lparam, APPEARANCE_PREVIEW, |draw| {
+                    if let Some(preview) = state.preview.borrow().as_ref()
+                        && let Err(error) = preview.paint(draw.hDC, draw.rcItem)
+                    {
+                        crate::app::diagnostics::event(format_args!(
+                            "settings.preview_paint_failed {error}"
+                        ));
+                    }
+                    LRESULT(1)
+                })
+            }
+            .unwrap_or_else(|| {
+                // SAFETY: The original owner-draw payload remains valid for
+                // default handling throughout this callback.
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            })
         }
         WM_CLOSE => {
             state.queue(|pending| pending.close = true);
@@ -1872,6 +2131,8 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             LRESULT(0)
         }
         WM_HSCROLL => {
+            // SAFETY: This message supplies a child-control HWND (not a payload pointer); USER32
+            // queries its numeric ID without taking ownership or retaining Rust references.
             let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut _)) } as usize;
             if matches!(id, BORDER_WIDTH | BACKGROUND_TRANSPARENCY) {
                 state.queue(|pending| pending.appearance = true);
@@ -1884,7 +2145,11 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                 fMask: SIF_ALL,
                 ..Default::default()
             };
+            // SAFETY: The callback retains its viewport; initialized SCROLLINFO advertises the
+            // actual layout size and is writable only for this synchronous query.
             if unsafe { GetScrollInfo(hwnd, SB_VERT, &mut info) }.is_ok() {
+                // SAFETY: The current callback or window owner retains this HWND through the scalar
+                // DPI query; no native handle ownership is transferred.
                 let line = dip(28, unsafe { GetDpiForWindow(hwnd) }.max(96));
                 let current = state
                     .pending
@@ -1916,6 +2181,8 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                     .get()
                     .scroll
                     .unwrap_or(state.scroll_offset.get());
+                // SAFETY: The current callback or window owner retains this HWND through the scalar
+                // DPI query; no native handle ownership is transferred.
                 let next = current - steps * dip(72, unsafe { GetDpiForWindow(hwnd) }.max(96));
                 state.queue(|pending| pending.scroll = Some(next));
             }
@@ -1923,11 +2190,13 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         }
         WM_ACTIVATE if wparam.0 as u32 & 0xffff == WA_INACTIVE => {
             state.cancel_capture();
+            // SAFETY: Forward the unchanged native message while its payload remains valid for
+            // this callback; the default procedure does not gain Rust-state ownership.
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_DPICHANGED => {
-            if let Some(rect) = unsafe { (lparam.0 as *const RECT).as_ref() } {
-                let rect = *rect;
+            // SAFETY: dispatch is handling native WM_DPICHANGED.
+            if let Some(rect) = unsafe { messages::dpi_rect(lparam) } {
                 state.queue(|pending| {
                     pending.dpi_rect = Some(rect);
                     pending.layout = true;
@@ -1949,10 +2218,18 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             state.queue(|pending| pending.default_style = true);
             LRESULT(1)
         }
-        WM_NCDESTROY => unsafe {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            DefWindowProcW(hwnd, message, wparam, lparam)
-        },
+        WM_NCDESTROY => {
+            // SAFETY: the native tree still borrows state through this callback.
+            let result = unsafe {
+                let result = DefWindowProcW(hwnd, message, wparam, lparam);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                result
+            };
+            state.lifetime.terminated(hwnd);
+            result
+        }
+        // SAFETY: Forward the unchanged native message while its payload remains valid for
+        // this callback; the default procedure does not gain Rust-state ownership.
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }
@@ -1960,6 +2237,60 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
 #[cfg(test)]
 mod responsive_layout_tests {
     use super::*;
+
+    #[test]
+    fn custom_draw_restore_failure_retains_replaced_and_final_settings_fonts() {
+        use super::super::{theme::restore_tests, window_lifetime::with_hidden_windows};
+        with_hidden_windows(|| {
+            for fail_restore in [false, true] {
+                let window =
+                    SettingsWindow::new(&Config::default(), HWND::default(), None, true).unwrap();
+                let handles = || {
+                    let mut fonts = window
+                        .font
+                        .borrow()
+                        ._fonts
+                        .iter()
+                        .map(Font::raw)
+                        .collect::<Vec<_>>();
+                    fonts.push(window.language_font.borrow().as_ref().unwrap().1.raw());
+                    fonts
+                };
+                let previous = handles();
+                restore_tests::begin_font_delete_tracking();
+                restore_tests::draw_button(
+                    window.hwnd,
+                    window.controls.apply,
+                    APPLY,
+                    &window.callback.theme,
+                    fail_restore,
+                );
+                window.font.borrow_mut().dpi = 0;
+                window.language_font.borrow_mut().as_mut().unwrap().0 = 0;
+                window.layout().unwrap();
+                restore_tests::assert_font_delete_attempts(&previous, !fail_restore);
+                let current = handles();
+                restore_tests::begin_font_delete_tracking();
+                drop(window);
+                restore_tests::assert_font_delete_attempts(&current, !fail_restore);
+                if fail_restore {
+                    restore_tests::cleanup_retained_fonts(&previous);
+                    restore_tests::cleanup_retained_fonts(&current);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_settings_partial_creation_failures_end_every_root() {
+        for nth in [1, 2, 3, 8, 15] {
+            super::super::window_lifetime::creation_failure_test(nth, || {
+                assert!(
+                    SettingsWindow::new(&Config::default(), HWND::default(), None, true).is_err()
+                );
+            });
+        }
+    }
 
     #[test]
     fn settings_content_reflows_without_horizontal_clipping_or_hidden_focus() {

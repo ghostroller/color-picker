@@ -1,19 +1,17 @@
 //! Main-thread GDI sampling for the composed, eight-bit SDR desktop.
 //! A sampler owns one reusable pixel surface for the duration of Live mode.
 
-use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
-
 use windows::{
     Win32::{
-        Foundation::{E_FAIL, E_OUTOFMEMORY, POINT},
-        Graphics::Gdi::{
-            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC,
-            CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC,
-            GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, MONITOR_DEFAULTTONULL, MONITORINFO,
-            MonitorFromPoint, ReleaseDC, SRCCOPY, SelectObject,
-        },
+        Foundation::{E_FAIL, POINT},
+        Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint},
     },
     core::Error,
+};
+
+use super::{
+    dib::{Dib32Layout, Dib32Surface, OwnedDib32},
+    gdi::DesktopDc,
 };
 
 use crate::core::{
@@ -67,65 +65,15 @@ impl From<Error> for CaptureError {
 /// Owns thread-bound GDI resources. Create and use on the application's UI thread.
 /// No image/DC allocation or color formatting occurs in sample_pixel.
 pub struct GdiSampler {
-    // Drop first restores previous_bitmap, then Rust drops these fields in
-    // declaration order: bitmap -> memory DC -> screen DC.
-    _bitmap: OwnedBitmap,
-    memory: MemoryDc,
-    screen: ScreenDc,
-    previous_bitmap: HGDIOBJ,
-    pixels: NonNull<u8>,
-    _main_thread_only: PhantomData<Rc<()>>,
+    surface: Dib32Surface,
+    screen: DesktopDc,
 }
 
 impl GdiSampler {
     pub fn new() -> Result<Self, CaptureError> {
-        let screen = ScreenDc::new()?;
-        let memory = MemoryDc::new(screen.0)?;
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: 1,
-                biHeight: -1, // Negative height means top-down scanline order.
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                biSizeImage: 4,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut raw_pixels: *mut c_void = std::ptr::null_mut();
-        // SAFETY: BITMAPINFO describes one 32-bit pixel; ppvbits is a valid
-        // output slot. The returned bitmap guard owns the allocation thereafter.
-        let bitmap = OwnedBitmap(unsafe {
-            CreateDIBSection(
-                Some(screen.0),
-                &info,
-                DIB_RGB_COLORS,
-                &mut raw_pixels,
-                None,
-                0,
-            )?
-        });
-        let pixels = NonNull::new(raw_pixels.cast::<u8>())
-            .ok_or_else(|| api_failure("CreateDIBSection returned null pixel storage"))?;
-        // SAFETY: this newly created bitmap is not selected into any other DC.
-        // Remember the shared default bitmap but never assume ownership of it.
-        let previous_bitmap = unsafe { SelectObject(memory.0, bitmap.0.into()) };
-        if previous_bitmap.is_invalid() {
-            return Err(api_failure(
-                "SelectObject could not select the sampling bitmap",
-            ));
-        }
-
-        Ok(Self {
-            _bitmap: bitmap,
-            memory,
-            screen,
-            previous_bitmap,
-            pixels,
-            _main_thread_only: PhantomData,
-        })
+        let screen = DesktopDc::new().map_err(|_| CaptureError::DesktopUnavailable)?;
+        let surface = Dib32Surface::new(screen.raw(), Dib32Layout::new(1, 1)?)?;
+        Ok(Self { surface, screen })
     }
 
     /// Returns a fresh pixel or an error. The caller must hide any intersecting
@@ -147,32 +95,11 @@ impl GdiSampler {
             return Err(CaptureError::NoMonitor);
         }
 
-        // SAFETY: both DCs and the selected 1x1 destination remain owned by this
-        // sampler, on their creating thread. The source point was just checked.
-        unsafe {
-            BitBlt(
-                self.memory.0,
-                0,
-                0,
-                1,
-                1,
-                Some(self.screen.0),
-                point.x,
-                point.y,
-                SRCCOPY | CAPTUREBLT,
-            )?;
-            // Flush GDI's current-thread batch before direct CPU access to DIB
-            // storage. DwmFlush is a separate overlay-composition concern.
-            if !GdiFlush().as_bool() {
-                return Err(api_failure("GdiFlush reported a failed GDI operation"));
-            }
-            // The 32-bit BI_RGB layout is B,G,R,X. Only read the color channels;
-            // the fourth byte does not describe an original alpha value.
-            let b = self.pixels.as_ptr().read();
-            let g = self.pixels.as_ptr().add(1).read();
-            let r = self.pixels.as_ptr().add(2).read();
-            Ok(Rgb8::new(r, g, b))
-        }
+        self.surface.capture_from(&self.screen, point)?;
+        // CPU access checks GdiFlush and borrows the reusable surface exclusively.
+        Ok(self
+            .surface
+            .with_pixels(|pixels| Rgb8::new(pixels[2], pixels[1], pixels[0]))?)
     }
 
     /// Copy one small physical-pixel area into an immutable top-down snapshot.
@@ -185,6 +112,7 @@ impl GdiSampler {
         {
             return Err(CaptureError::InvalidRectangle);
         }
+        // SAFETY: physical signed coordinates are values; no pointer is retained.
         let monitor = unsafe {
             MonitorFromPoint(
                 POINT {
@@ -201,6 +129,7 @@ impl GdiSampler {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
+        // SAFETY: monitor was returned above and monitor_info has the API-required size.
         if !unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }.as_bool() {
             return Err(api_failure("Could not validate the freeze monitor"));
         }
@@ -214,101 +143,24 @@ impl GdiSampler {
         }
         let width = rect.width();
         let height = rect.height();
-        // The preceding per-axis limit makes these dimensions and sizes small,
-        // positive and representable in both GDI's i32 and usize arithmetic.
-        let stride_bytes = width as usize * 4;
-        let length = stride_bytes * height as usize;
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width as i32,
-                biHeight: -(height as i32),
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                biSizeImage: length as u32,
-                ..Default::default()
-            },
-            ..Default::default()
+        // Freeze policy above remains stricter than the shared storage limits.
+        let layout = Dib32Layout::new(width as i32, height as i32)?;
+        let mut temporary = OwnedDib32::new(self.screen.raw(), layout)?;
+        let origin = ScreenPointPx {
+            x: rect.left,
+            y: rect.top,
         };
-        let mut raw_pixels: *mut c_void = std::ptr::null_mut();
-        let bitmap = OwnedBitmap(unsafe {
-            CreateDIBSection(
-                Some(self.screen.0),
-                &info,
-                DIB_RGB_COLORS,
-                &mut raw_pixels,
-                None,
-                0,
-            )?
-        });
-        let pixels = NonNull::new(raw_pixels.cast::<u8>())
-            .ok_or_else(|| api_failure("CreateDIBSection returned null freeze storage"))?;
-        let previous = unsafe { SelectObject(self.memory.0, bitmap.0.into()) };
-        if previous.is_invalid() {
-            return Err(api_failure("Could not select the freeze bitmap"));
-        }
-        // Declared after bitmap: restore the reusable 1x1 surface before the
-        // temporary bitmap is deleted, on both successful and failed captures.
-        let _selection = BitmapSelection {
-            dc: self.memory.0,
-            previous,
-        };
-        unsafe {
-            BitBlt(
-                self.memory.0,
-                0,
-                0,
-                width as i32,
-                height as i32,
-                Some(self.screen.0),
-                rect.left,
-                rect.top,
-                SRCCOPY | CAPTUREBLT,
-            )?;
-            if !GdiFlush().as_bool() {
-                return Err(api_failure("GdiFlush failed while freezing the screen"));
-            }
-        }
-        let mut bgrx = Vec::new();
-        bgrx.try_reserve_exact(length).map_err(|_| {
-            CaptureError::Api(Error::new(
-                E_OUTOFMEMORY,
-                "Could not allocate the frozen pixels",
-            ))
+        let bgrx = self.surface.with_temporary(&mut temporary, |selection| {
+            selection.capture_from(&self.screen, origin)?;
+            selection.copy_pixels()
         })?;
-        // The selected DIB owns this exact byte span until the guards above drop.
-        bgrx.extend_from_slice(unsafe { std::slice::from_raw_parts(pixels.as_ptr(), length) });
         Ok(FrozenImage {
-            origin: ScreenPointPx {
-                x: rect.left,
-                y: rect.top,
-            },
+            origin,
             width,
             height,
-            stride_bytes,
+            stride_bytes: layout.stride_bytes(),
             bgrx,
         })
-    }
-}
-
-struct BitmapSelection {
-    dc: HDC,
-    previous: HGDIOBJ,
-}
-
-impl Drop for BitmapSelection {
-    fn drop(&mut self) {
-        let _ = unsafe { SelectObject(self.dc, self.previous) };
-    }
-}
-
-impl Drop for GdiSampler {
-    fn drop(&mut self) {
-        // SAFETY: memory still exists and owns the selection. Restore before
-        // field destructors delete the bitmap and then its DC. The original
-        // bitmap belongs to GDI and is never deleted by this sampler.
-        let _ = unsafe { SelectObject(self.memory.0, self.previous_bitmap) };
     }
 }
 
@@ -318,51 +170,52 @@ fn api_failure(message: &'static str) -> CaptureError {
     CaptureError::Api(Error::new(E_FAIL, message))
 }
 
-struct ScreenDc(HDC);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::windows::{
+        dib::test_support as dib_test,
+        gdi::{BitmapDc, test_support as gdi_test},
+    };
+    use windows::Win32::{Foundation::COLORREF, Graphics::Gdi::SetPixel};
 
-impl ScreenDc {
-    fn new() -> Result<Self, CaptureError> {
-        let handle = unsafe { GetDC(None) };
-        if handle.is_invalid() {
-            Err(CaptureError::DesktopUnavailable)
-        } else {
-            Ok(Self(handle))
-        }
-    }
-}
-
-impl Drop for ScreenDc {
-    fn drop(&mut self) {
-        // Paired with GetDC(None), never DeleteDC or CloseHandle.
-        let _ = unsafe { ReleaseDC(None, self.0) };
-    }
-}
-
-struct MemoryDc(HDC);
-
-impl MemoryDc {
-    fn new(screen: HDC) -> Result<Self, CaptureError> {
-        let handle = unsafe { CreateCompatibleDC(Some(screen)) };
-        if handle.is_invalid() {
-            Err(api_failure(
-                "CreateCompatibleDC could not allocate a memory DC",
-            ))
-        } else {
-            Ok(Self(handle))
-        }
-    }
-}
-
-impl Drop for MemoryDc {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteDC(self.0) };
-    }
-}
-
-struct OwnedBitmap(HBITMAP);
-
-impl Drop for OwnedBitmap {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteObject(self.0.into()) };
+    #[test]
+    fn sampling_reuses_one_pixel_and_freeze_reuses_its_dc() {
+        let screen = DesktopDc::new().unwrap();
+        let source = BitmapDc::compatible(screen.raw(), 4, 4).unwrap();
+        // SAFETY: the synthetic source owns this private DC/bitmap and no CPU
+        // slices exist; write one known color for every capture in this test.
+        let color = unsafe { SetPixel(source.raw().unwrap(), 0, 0, COLORREF(0x00563412)) };
+        assert_eq!(color, COLORREF(0x00563412));
+        dib_test::with_source(&source, || {
+            let mut sampler = GdiSampler::new().unwrap();
+            let point = ScreenPointPx { x: 0, y: 0 };
+            let rect = ScreenRectPx {
+                left: 0,
+                top: 0,
+                right: 2,
+                bottom: 2,
+            };
+            let expected = Rgb8::new(0x12, 0x34, 0x56);
+            gdi_test::fail_next(gdi_test::Failure::Memory);
+            for _ in 0..32 {
+                assert_eq!(sampler.sample_pixel(point).unwrap(), expected);
+            }
+            assert_eq!(
+                sampler.capture_rect(rect).unwrap().pixel_at(0, 0),
+                Some(expected)
+            );
+            // Neither live samples nor a temporary freeze created an extra DC:
+            // the injected failure is still waiting for this explicit creation.
+            assert!(BitmapDc::compatible(screen.raw(), 1, 1).is_err());
+            dib_test::fail_next(dib_test::Failure::Create);
+            assert_eq!(sampler.sample_pixel(point).unwrap(), expected);
+            assert!(sampler.capture_rect(rect).is_err());
+            for fault in [dib_test::Failure::BitBlt, dib_test::Failure::Flush] {
+                dib_test::fail_next(fault);
+                assert!(sampler.sample_pixel(point).is_err());
+                assert_eq!(sampler.sample_pixel(point).unwrap(), expected);
+            }
+        });
     }
 }
