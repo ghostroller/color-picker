@@ -17,7 +17,11 @@ use windows::{
             LPARAM, LRESULT, POINT, RECT, SetLastError, WPARAM,
         },
         Graphics::{
-            Dwm::{DWMWA_BORDER_COLOR, DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute},
+            Dwm::{
+                DWM_WINDOW_CORNER_PREFERENCE, DWMNCRENDERINGPOLICY, DWMNCRP_DISABLED,
+                DWMWA_BORDER_COLOR, DWMWA_NCRENDERING_POLICY, DWMWA_TRANSITIONS_FORCEDISABLED,
+                DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DwmSetWindowAttribute,
+            },
             Gdi::*,
         },
         System::{
@@ -360,9 +364,31 @@ impl ResultWindow {
             quick_pick_pending: Cell::new(quick_pick),
             _thread_affinity: PhantomData,
         };
-        theme::configure_window(hwnd, &window.callback.theme);
+        window.callback.theme.update_window_icons(hwnd);
         // Keep the window's native title for taskbar/accessibility, while the
-        // client area replaces the visible frame. DWM rounding is best effort.
+        // client area replaces the visible frame. Disable DWM's nonclient
+        // rendering (including its shadow) on both Windows 10 and Windows 11;
+        // only our bottom/right border should surround this flat sheet.
+        let nonclient_policy = DWMNCRP_DISABLED;
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_NCRENDERING_POLICY,
+                (&nonclient_policy as *const DWMNCRENDERINGPOLICY).cast(),
+                size_of::<DWMNCRENDERINGPOLICY>() as u32,
+            )?;
+        }
+        // Windows 11 supports explicit square corners. Windows 10 already has
+        // square corners and safely ignores these optional appearance hints.
+        let corners = DWMWCP_DONOTROUND;
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                (&corners as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
+                size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+            )
+        };
         let no_border = 0xffff_fffe_u32; // DWMWA_COLOR_NONE
         let _ = unsafe {
             DwmSetWindowAttribute(
@@ -1511,6 +1537,10 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
     };
     match message {
         WM_NCCALCSIZE if hwnd != state.viewport.get() => LRESULT(0),
+        // With DWM nonclient rendering disabled, DefWindowProc would paint a
+        // classic caption/frame over our client area, including on activation.
+        WM_NCPAINT if hwnd != state.viewport.get() => LRESULT(0),
+        WM_NCACTIVATE if hwnd != state.viewport.get() => LRESULT(1),
         WM_NCHITTEST if hwnd != state.viewport.get() => {
             caption_hit_test(hwnd, lparam, state.header_height.get())
         }
