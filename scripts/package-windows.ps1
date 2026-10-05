@@ -47,7 +47,7 @@ try {
     $imageUrl = "https://raw.githubusercontent.com/ghostroller/color-picker/$commit"
     $localFiles = @('README.md', 'README.zh-CN.md', 'LICENSE')
     foreach ($name in @('README.md', 'README.zh-CN.md')) {
-        $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot $name) -Raw
+        $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot $name) -Raw -Encoding UTF8
         $readme = [regex]::Replace($readme, '(?<prefix>!?\[[^\]]*\]\()(?<target>[^)\s]+)(?<suffix>\))', {
             param($match)
             $target = $match.Groups['target'].Value

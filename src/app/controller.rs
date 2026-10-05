@@ -173,6 +173,15 @@ impl PreviewController {
     }
 
     pub fn stop(&mut self, reason: &str) {
+        self.finish(reason, false);
+    }
+
+    /// End a failed/invalidated session with a bounded wait for owned releases.
+    pub fn abort(&mut self, reason: &str) {
+        self.finish(reason, true);
+    }
+
+    fn finish(&mut self, reason: &str, bounded: bool) {
         let Some(session) = self.machine.session_id() else {
             return;
         };
@@ -183,10 +192,10 @@ impl PreviewController {
             Event::Cancel(session)
         };
         let _ = self.transition(event);
-        self.begin_finish(reason);
+        self.begin_finish(reason, bounded);
     }
 
-    fn begin_finish(&mut self, reason: &str) {
+    fn begin_finish(&mut self, reason: &str, bounded: bool) {
         // Stop sampling now; retain resources until consumed releases drain.
         self.timer.take();
         self.pending_hover = None;
@@ -197,7 +206,12 @@ impl PreviewController {
             if let Some(magnifier) = resources.magnifier.as_ref() {
                 magnifier.hide();
             }
-            if let Err(error) = resources.input.request_finish() {
+            let finish = if bounded {
+                resources.input.request_abort()
+            } else {
+                resources.input.request_finish()
+            };
+            if let Err(error) = finish {
                 diagnostics::event(format_args!("input.finish_request_failed error={error}"));
             }
         }
@@ -219,7 +233,7 @@ impl PreviewController {
             _ => Ok(()),
         };
         if let Err(error) = outcome {
-            self.stop("sample_failure");
+            self.abort("sample_failure");
             return Err(error);
         }
         self.process_input()
@@ -234,7 +248,7 @@ impl PreviewController {
         let mut error = None;
         for event in events {
             if let Err(failure) = self.handle_input(event) {
-                self.stop("input_event_failure");
+                self.abort("input_event_failure");
                 error.get_or_insert(failure);
             }
         }
@@ -248,7 +262,7 @@ impl PreviewController {
             && matches!(self.state(), AppState::Frozen { .. })
             && let Err(failure) = self.queue_frozen_hover(point)
         {
-            self.stop("frozen_preview_failure");
+            self.abort("frozen_preview_failure");
             error.get_or_insert(failure);
         }
         if let Some(resources) = self.session.as_mut()
@@ -257,7 +271,7 @@ impl PreviewController {
         {
             resources.input_failure_reported = true;
             error.get_or_insert_with(|| platform_error(failure));
-            self.stop("input_failure");
+            self.abort("input_failure");
         }
         let finished = self
             .session
@@ -278,7 +292,7 @@ impl PreviewController {
                 .unwrap_or_default();
             for event in final_events {
                 if let Err(failure) = self.handle_input(event) {
-                    self.stop("final_input_failure");
+                    self.abort("final_input_failure");
                     error.get_or_insert(failure);
                 }
             }
@@ -290,7 +304,7 @@ impl PreviewController {
                 if !already_reported {
                     error.get_or_insert_with(|| platform_error(failure));
                 }
-                self.stop("input_thread_failure");
+                self.abort("input_thread_failure");
             }
             if !matches!(self.state(), AppState::Finishing { .. }) {
                 error.get_or_insert_with(|| {
@@ -302,7 +316,7 @@ impl PreviewController {
                         ),
                     )
                 });
-                self.stop("input_thread_stopped");
+                self.abort("input_thread_stopped");
             }
             let session = self
                 .machine
@@ -370,7 +384,7 @@ impl PreviewController {
                 match action {
                     CandidateAction::Pick(picked) => {
                         self.transition(Event::Confirm { session, picked })?;
-                        self.begin_finish("confirmed");
+                        self.begin_finish("confirmed", false);
                     }
                     // The input worker has already consumed the complete click.
                     // Keep it alive to drain any other owned button releases.
@@ -611,7 +625,7 @@ impl Drop for PreviewController {
         // Normal shutdown already pumped through InputStopped. A fatal host
         // failure still asks the worker to release its own hooks.
         if self.session.is_some() {
-            self.stop("host_failure");
+            self.abort("host_failure");
         }
         self.timer.take();
     }

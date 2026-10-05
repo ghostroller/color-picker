@@ -287,7 +287,7 @@ mod probe {
             Ok(())
         })();
         if controller.active() {
-            controller.stop("resource_probe_cleanup");
+            controller.abort("resource_probe_cleanup");
             if let Err(error) = drain_to_idle(&mut controller, host.0) {
                 report.cleanup_error = Some(error.to_string());
             }
@@ -397,7 +397,7 @@ mod probe {
         while controller.active() {
             if let Err(error) = controller.process_input() {
                 first_error.get_or_insert_with(|| error.to_string());
-                controller.stop("resource_probe_drain_error");
+                controller.abort("resource_probe_drain_error");
             }
             if !controller.active() {
                 break;
@@ -409,7 +409,7 @@ mod probe {
             }
             if let Err(error) = pump(controller, host, false) {
                 first_error.get_or_insert_with(|| error.to_string());
-                controller.stop("resource_probe_message_failure");
+                controller.abort("resource_probe_message_failure");
             }
             if controller.active() {
                 wait(controller, deadline)?;

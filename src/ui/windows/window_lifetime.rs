@@ -37,7 +37,20 @@ pub(super) struct WindowInit {
 }
 
 #[cfg(test)]
-thread_local! { static HIDDEN_FIXTURES: Cell<bool> = const { Cell::new(false) }; }
+thread_local! {
+    static HIDDEN_FIXTURES: Cell<bool> = const { Cell::new(false) };
+    static MINIMIZED_FIXTURES: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(super) fn initial_window_style(
+    style: windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE,
+) -> windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE {
+    #[cfg(test)]
+    if MINIMIZED_FIXTURES.with(Cell::get) {
+        return style | windows::Win32::UI::WindowsAndMessaging::WS_MINIMIZE;
+    }
+    style
+}
 
 /// Test-only desktop isolation; release builds always retain ordinary visibility.
 pub(super) fn show_native_windows() -> bool {
@@ -61,6 +74,71 @@ pub(super) fn with_hidden_windows<R>(run: impl FnOnce() -> R) -> R {
     }
     let _restore = Restore(HIDDEN_FIXTURES.with(|s| s.replace(true)));
     run()
+}
+
+/// Start genuinely minimized without ever showing or activating a fixture.
+#[cfg(test)]
+pub(super) fn with_hidden_minimized_windows<R>(run: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MINIMIZED_FIXTURES.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(MINIMIZED_FIXTURES.with(|s| s.replace(true)));
+    with_hidden_windows(run)
+}
+
+/// Complete native restoration without making or activating a visible window.
+#[cfg(test)]
+pub(super) fn restore_hidden_window(hwnd: HWND, bounds: windows::Win32::Foundation::RECT) {
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    /// # Safety
+    /// Installed only on the retained hidden fixture; WINDOWPOS is native
+    /// synchronous writable message storage. No callback state is retained.
+    unsafe extern "system" fn keep_hidden(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _: usize,
+        _: usize,
+    ) -> LRESULT {
+        if message == WM_WINDOWPOSCHANGING {
+            // SAFETY: the native message supplies initialized writable WINDOWPOS.
+            if let Some(position) = unsafe { (lparam.0 as *mut WINDOWPOS).as_mut() } {
+                position.flags &= !SWP_SHOWWINDOW;
+            }
+        }
+        // SAFETY: forward the fixture's original synchronous native message.
+        unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+    }
+
+    // SAFETY: callers retain the hidden UI-thread fixture during this temporary
+    // subclass. SW_SHOWNOACTIVATE preserves focus and the subclass blocks showing.
+    unsafe {
+        assert!(!IsWindowVisible(hwnd).as_bool());
+        assert!(IsIconic(hwnd).as_bool());
+        assert!(SetWindowSubclass(hwnd, Some(keep_hidden), usize::MAX, 0).as_bool());
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        assert!(RemoveWindowSubclass(hwnd, Some(keep_hidden), usize::MAX).as_bool());
+        assert!(!IsIconic(hwnd).as_bool());
+        assert!(!IsWindowVisible(hwnd).as_bool());
+        SetWindowPos(
+            hwnd,
+            None,
+            bounds.left,
+            bounds.top,
+            bounds.right - bounds.left,
+            bounds.bottom - bounds.top,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        )
+        .unwrap();
+        assert!(!IsWindowVisible(hwnd).as_bool());
+    }
 }
 
 /// Production dispatch is inlined; the thread-local failure switch exists only

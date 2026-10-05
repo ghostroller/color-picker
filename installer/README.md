@@ -32,6 +32,14 @@ An error cancels the operation and asks the user to exit via the tray. Windows
 Restart Manager remains enabled as a non-forcing fallback; automatic restart is
 disabled. The final launch checkbox runs `--startup` only in interactive installs.
 
+If the installed executable cannot run `--quit`, Setup and Uninstall independently
+enumerate same-name processes and query their actual executable paths. They proceed
+only after confirming that no process is running from this installation's resolved
+path. This permits repair and removal of a damaged executable without stopping a
+portable copy in another directory. Process/path queries that fail, including access
+denied, block the operation; a candidate proven to have exited is ignored. Path
+resolution accounts for short names, case differences, and directory junctions.
+
 Downgrades are rejected before the wizard and checked again immediately before
 installation. Comparison numerically parses Inno's `DisplayVersion` in the
 product's HKCU 64-bit uninstall key. Packaging accepts numeric `major.minor.patch` only.

@@ -160,6 +160,12 @@ struct CallbackState {
 }
 
 impl CallbackState {
+    fn defer(&self, update: impl FnOnce(&mut Pending)) {
+        let mut pending = self.pending.get();
+        update(&mut pending);
+        self.pending.set(pending);
+    }
+
     fn suppresses(&self, key: u32) -> bool {
         key < 256 && self.suppressed_keys.get()[key as usize / 64] & (1 << (key % 64)) != 0
     }
@@ -197,9 +203,7 @@ impl CallbackState {
         if self.closing.get() {
             return;
         }
-        let mut pending = self.pending.get();
-        update(&mut pending);
-        self.pending.set(pending);
+        self.defer(update);
         if !self.wake_posted.replace(true)
             // SAFETY: The host outlives this window's callback tree; this private wake message
             // carries scalar values only and retains no Rust reference.
@@ -401,7 +405,7 @@ impl SettingsWindow {
                     EX_STYLE,
                     CLASS,
                     PCWSTR(wide(tr("设置 — Color Picker", "Settings — Color Picker")).as_ptr()),
-                    STYLE,
+                    super::window_lifetime::initial_window_style(STYLE),
                     cursor.x,
                     cursor.y,
                     1,
@@ -666,11 +670,25 @@ impl SettingsWindow {
                 ),
             ));
         }
-        let pending = self.callback.pending.take();
+        let mut pending = self.callback.pending.take();
         if pending.close {
             self.callback.recording.set(false);
             self.callback.closing.set(true);
             return Ok(Some(SettingsAction::Close));
+        }
+        // A minimized window has an icon rectangle and a zero client area.
+        // Keep geometry work for restoration without delaying Apply or Close.
+        // DPI suggestions made for that icon are replaced by a fit using the
+        // restored window's actual rectangle and DPI.
+        // SAFETY: this UI-thread owner retains the root throughout this query.
+        if unsafe { IsIconic(self.hwnd) }.as_bool() {
+            let dpi_changed = pending.dpi_rect.take().is_some();
+            self.callback.defer(|deferred| {
+                deferred.fit_work_area |= std::mem::take(&mut pending.fit_work_area) || dpi_changed;
+                deferred.layout |= std::mem::take(&mut pending.layout);
+                deferred.scroll = pending.scroll.take().or(deferred.scroll);
+                deferred.reveal = pending.reveal.take().or(deferred.reveal);
+            });
         }
         if let Some(rect) = pending.dpi_rect {
             let rect = fit_to_work_area(rect, self.minimum_size()?)?;
@@ -1205,6 +1223,13 @@ impl SettingsWindow {
     }
 
     fn layout(&self) -> Result<()> {
+        // refresh_language can request layout outside process_pending, including
+        // when an Apply was queued just before minimizing the settings window.
+        // SAFETY: this UI-thread owner retains the root throughout this query.
+        if unsafe { IsIconic(self.hwnd) }.as_bool() {
+            self.callback.defer(|pending| pending.layout = true);
+            return Ok(());
+        }
         self.callback.theme.update_window_icons(self.hwnd);
         let dpi = self.dpi()?;
         if self
@@ -2237,6 +2262,87 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
 #[cfg(test)]
 mod responsive_layout_tests {
     use super::*;
+
+    #[test]
+    fn minimized_settings_defer_broadcast_geometry_but_keep_apply_and_restore_layout() {
+        use super::super::window_lifetime::{restore_hidden_window, with_hidden_minimized_windows};
+        with_hidden_minimized_windows(|| {
+            let config = Config::default();
+            let window = SettingsWindow::new(&config, HWND::default(), None, true).unwrap();
+            let icon = RECT {
+                left: -32000,
+                top: -32000,
+                right: -31724,
+                bottom: -31955,
+            };
+            let mut client = RECT::default();
+            // SAFETY: these scalar broadcasts and synchronous DPI payload target
+            // only this retained hidden fixture. No system settings are changed.
+            unsafe {
+                assert!(IsIconic(window.hwnd).as_bool());
+                assert!(!IsWindowVisible(window.hwnd).as_bool());
+                GetClientRect(window.hwnd, &mut client).unwrap();
+                SendMessageW(window.hwnd, WM_SETTINGCHANGE, None, None);
+                SendMessageW(window.hwnd, WM_DISPLAYCHANGE, None, None);
+                SendMessageW(
+                    window.hwnd,
+                    WM_DPICHANGED,
+                    None,
+                    Some(LPARAM(&icon as *const RECT as isize)),
+                );
+                SendMessageW(window.hwnd, WM_COMMAND, Some(WPARAM(APPLY)), None);
+            }
+            assert_eq!((client.right, client.bottom), (0, 0));
+            assert_eq!(
+                window.process_pending().unwrap(),
+                Some(SettingsAction::Apply(config))
+            );
+            assert!(window.callback.pending.get().fit_work_area);
+            assert!(window.callback.pending.get().dpi_rect.is_none());
+            window.show_status("saved while minimized", true).unwrap();
+            // Repeated host passes must neither error nor consume deferred fitting.
+            assert_eq!(window.process_pending().unwrap(), None);
+            assert!(window.callback.pending.get().fit_work_area);
+            // Localization refresh also reaches layout outside process_pending.
+            window.layout().unwrap();
+            assert!(window.callback.pending.get().layout);
+
+            let dpi = window.dpi().unwrap();
+            let request = RECT {
+                left: 0,
+                top: 0,
+                right: dip(CLIENT_WIDTH, dpi),
+                bottom: dip(CLIENT_HEIGHT, dpi),
+            };
+            let work = layout::work_area(request).unwrap();
+            // Begin partly beyond the work area so deferred fitting is observable.
+            restore_hidden_window(
+                window.hwnd,
+                RECT {
+                    left: work.right - dip(120, dpi),
+                    top: work.top,
+                    right: work.right + dip(CLIENT_WIDTH - 120, dpi),
+                    bottom: work.top + dip(CLIENT_HEIGHT, dpi),
+                },
+            );
+            window.process_pending().unwrap();
+            window.process_pending().unwrap();
+            let mut restored = RECT::default();
+            // SAFETY: the fixture still owns this hidden root and output storage.
+            unsafe {
+                GetWindowRect(window.hwnd, &mut restored).unwrap();
+                GetClientRect(window.hwnd, &mut client).unwrap();
+                assert!(!IsWindowVisible(window.hwnd).as_bool());
+            }
+            assert!(client.right > 0 && client.bottom > 0);
+            let work = layout::work_area(restored).unwrap();
+            assert!(restored.left >= work.left && restored.right <= work.right);
+            assert!(restored.top >= work.top && restored.bottom <= work.bottom);
+            assert_eq!(window.font.borrow().dpi, window.dpi().unwrap());
+            assert!(!window.callback.pending.get().fit_work_area);
+            assert!(!window.callback.pending.get().layout);
+        });
+    }
 
     #[test]
     fn custom_draw_restore_failure_retains_replaced_and_final_settings_fonts() {

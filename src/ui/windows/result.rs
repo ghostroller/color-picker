@@ -128,13 +128,17 @@ struct CallbackState {
 }
 
 impl CallbackState {
+    fn defer(&self, update: impl FnOnce(&mut Pending)) {
+        let mut pending = self.pending.get();
+        update(&mut pending);
+        self.pending.set(pending);
+    }
+
     fn queue(&self, update: impl FnOnce(&mut Pending)) {
         if self.closing.get() {
             return;
         }
-        let mut pending = self.pending.get();
-        update(&mut pending);
-        self.pending.set(pending);
+        self.defer(update);
         if !self.wake_posted.replace(true)
             // SAFETY: The host outlives this window's callback tree; this private wake message
             // carries scalar values only and retains no Rust reference.
@@ -372,7 +376,7 @@ impl ResultWindow {
                     EX_STYLE,
                     CLASS,
                     PCWSTR(title.as_ptr()),
-                    STYLE,
+                    super::window_lifetime::initial_window_style(STYLE),
                     picked.source.x,
                     picked.source.y,
                     1,
@@ -535,12 +539,25 @@ impl ResultWindow {
         if self.callback.wake_failed.replace(false) {
             return Err(Error::new(E_FAIL, "Could not queue result-window work"));
         }
-        let pending = self.callback.pending.take();
+        let mut pending = self.callback.pending.take();
         if let Some(action) = pending.action {
             self.callback.closing.set(true);
             self.cancel_copy();
             self.clear_copy_feedback()?;
             return Ok(Some(action));
+        }
+        // Icon coordinates and the minimized client area cannot be laid out. Retain
+        // geometry until restoration while allowing copies and feedback timers
+        // to complete. Use actual restored geometry for minimized DPI changes.
+        // SAFETY: this UI-thread owner retains the root throughout this query.
+        if unsafe { IsIconic(self.hwnd) }.as_bool() {
+            let dpi_changed = pending.dpi_rect.take().is_some();
+            self.callback.defer(|deferred| {
+                deferred.fit_work_area |= std::mem::take(&mut pending.fit_work_area) || dpi_changed;
+                deferred.layout |= std::mem::take(&mut pending.layout);
+                deferred.scroll = pending.scroll.take().or(deferred.scroll);
+                deferred.reveal = pending.reveal.take().or(deferred.reveal);
+            });
         }
         if let Some(rect) = pending.dpi_rect {
             let rect = fit_to_work_area(rect, self.minimum_size()?)?;
@@ -879,6 +896,12 @@ impl ResultWindow {
     }
 
     fn fit_window(&self) -> Result<()> {
+        // Copy feedback can reach this method without a queued layout message.
+        // SAFETY: this UI-thread owner retains the root throughout this query.
+        if unsafe { IsIconic(self.hwnd) }.as_bool() {
+            self.callback.defer(|pending| pending.fit_work_area = true);
+            return Ok(());
+        }
         let dpi = self.dpi()?;
         let mut rect = RECT::default();
         // SAFETY: The live window owner or callback retains this HWND. The initialized local
@@ -913,6 +936,11 @@ impl ResultWindow {
     }
 
     fn layout(&self) -> Result<()> {
+        // SAFETY: this UI-thread owner retains the root throughout this query.
+        if unsafe { IsIconic(self.hwnd) }.as_bool() {
+            self.callback.defer(|pending| pending.layout = true);
+            return Ok(());
+        }
         let dpi = self.dpi()?;
         self.callback.theme.update_window_icons(self.hwnd);
         if self.resources.borrow().dpi != dpi {
@@ -1912,6 +1940,115 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimized_result_defer_broadcast_geometry_but_keep_feedback_and_restore_layout() {
+        use super::super::window_lifetime::{restore_hidden_window, with_hidden_minimized_windows};
+        with_hidden_minimized_windows(|| {
+            let result = ResultWindow::new_with_appearance(
+                PickedColor {
+                    rgb: crate::core::color::Rgb8::new(1, 2, 3),
+                    source: crate::core::geometry::ScreenPointPx { x: 0, y: 0 },
+                    kind: SampleKind::Live,
+                },
+                HWND::default(),
+                ColorFormat::Hex,
+                false,
+                AppearanceConfig::default(),
+            )
+            .unwrap();
+            let mut client = RECT::default();
+            let icon = RECT {
+                left: -32000,
+                top: -32000,
+                right: -31724,
+                bottom: -31955,
+            };
+            // SAFETY: broadcasts and synchronous DPI payload target only this
+            // hidden fixture; no system setting, input or clipboard is changed.
+            unsafe {
+                assert!(IsIconic(result.hwnd).as_bool());
+                assert!(!IsWindowVisible(result.hwnd).as_bool());
+                GetClientRect(result.hwnd, &mut client).unwrap();
+                SendMessageW(result.hwnd, WM_SETTINGCHANGE, None, None);
+                SendMessageW(result.hwnd, WM_DISPLAYCHANGE, None, None);
+                SendMessageW(
+                    result.hwnd,
+                    WM_DPICHANGED,
+                    None,
+                    Some(LPARAM(&icon as *const RECT as isize)),
+                );
+            }
+            assert!(client.bottom < result.minimum_size().unwrap().1);
+            assert_eq!(result.process_pending().unwrap(), None);
+            assert!(result.callback.pending.get().fit_work_area);
+            assert!(result.callback.pending.get().dpi_rect.is_none());
+            result
+                .status("copy failure while minimized", Tone::Error)
+                .unwrap();
+            assert!(result.status_visible.get());
+            // Simulate a completed copy through its result handler; never open
+            // or write the user's clipboard. Feedback still completes minimized.
+            let target = CopyTarget {
+                format: ColorFormat::Hex,
+                button_id: COPY_DEFAULT,
+            };
+            result
+                .finish_copy_attempt(
+                    CopyRequest {
+                        token: next_copy_token().unwrap(),
+                        target,
+                        retries_left: MAX_RETRIES,
+                    },
+                    Ok(()),
+                )
+                .unwrap();
+            assert!(!result.status_visible.get());
+            assert_eq!(result.copied_target.get(), Some(target));
+            let timer = result.callback.feedback_timer.get();
+            assert_ne!(timer, 0);
+            // SAFETY: deliver only this live fixture's scalar feedback timer.
+            unsafe { SendMessageW(result.hwnd, WM_TIMER, Some(WPARAM(timer)), None) };
+            assert_eq!(result.process_pending().unwrap(), None);
+            assert_eq!(result.copied_target.get(), None);
+            assert_eq!(result.callback.feedback_timer.get(), 0);
+            assert!(result.callback.pending.get().fit_work_area);
+
+            let dpi = result.dpi().unwrap();
+            let work = layout::work_area(RECT {
+                left: 0,
+                top: 0,
+                right: dip(CLIENT_WIDTH, dpi),
+                bottom: dip(CLIENT_HEIGHT, dpi),
+            })
+            .unwrap();
+            restore_hidden_window(
+                result.hwnd,
+                RECT {
+                    left: work.right - dip(120, dpi),
+                    top: work.top,
+                    right: work.right + dip(CLIENT_WIDTH - 120, dpi),
+                    bottom: work.top + dip(CLIENT_HEIGHT, dpi),
+                },
+            );
+            result.process_pending().unwrap();
+            result.process_pending().unwrap();
+            let mut restored = RECT::default();
+            // SAFETY: this hidden root and writable outputs remain owned here.
+            unsafe {
+                GetWindowRect(result.hwnd, &mut restored).unwrap();
+                GetClientRect(result.hwnd, &mut client).unwrap();
+                assert!(!IsWindowVisible(result.hwnd).as_bool());
+            }
+            assert!(client.right > 0 && client.bottom > 0);
+            let work = layout::work_area(restored).unwrap();
+            assert!(restored.left >= work.left && restored.right <= work.right);
+            assert!(restored.top >= work.top && restored.bottom <= work.bottom);
+            assert_eq!(result.resources.borrow().dpi, result.dpi().unwrap());
+            assert!(!result.callback.pending.get().fit_work_area);
+            assert!(!result.callback.pending.get().layout);
+        });
+    }
 
     #[test]
     fn custom_draw_restore_failure_retains_replaced_and_final_result_fonts() {

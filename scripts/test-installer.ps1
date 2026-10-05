@@ -170,6 +170,104 @@ function Assert-FixtureContents {
     }
 }
 
+function Start-SmokeProcess {
+    param([string] $Executable, [string] $Stage)
+    # This is our synthetic, sleeping fixture, never the real application.
+    $process = Start-Process -FilePath $Executable -ArgumentList '--wait' -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $caseRoot "$Stage.stdout.log") `
+        -RedirectStandardError (Join-Path $caseRoot "$Stage.stderr.log")
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ($process.HasExited) { throw "Synthetic process exited before readiness: $Stage" }
+            $output = Join-Path $caseRoot "$Stage.stdout.log"
+            if ((Test-Path -LiteralPath $output) -and (Get-Content -LiteralPath $output -Raw) -match 'ready') {
+                return $process
+            }
+            Start-Sleep -Milliseconds 50
+        }
+        throw "Synthetic process did not become ready: $Stage"
+    }
+    catch {
+        Stop-SmokeProcess $process
+        throw
+    }
+}
+
+function Stop-SmokeProcess {
+    param([Diagnostics.Process] $Process)
+    if ($null -ne $Process) {
+        try {
+            if (-not $Process.HasExited) {
+                $Process.Kill($true) # Only the synthetic child launched by this script.
+                if (-not $Process.WaitForExit(5000)) { throw 'Synthetic process cleanup timed out.' }
+            }
+        }
+        finally { $Process.Dispose() }
+    }
+}
+
+function Assert-IndependentProcessCheck {
+    param([string] $Installer)
+    $fixtureDirectory = Join-Path $caseRoot 'process-fixture'
+    $fixtureSource = Join-Path $fixtureDirectory 'fixture.rs'
+    $fixtureExe = Join-Path $fixtureDirectory 'color-picker.exe'
+    Write-SmokeFixture $fixtureSource @'
+use std::{io::{self, Write}, time::Duration};
+fn main() {
+    if std::env::args().skip(1).eq(["--wait"]) {
+        println!("ready");
+        io::stdout().flush().unwrap();
+        std::thread::sleep(Duration::from_secs(120));
+    } else {
+        std::process::exit(1);
+    }
+}
+'@
+    & rustc --edition=2024 --target x86_64-pc-windows-msvc -C target-feature=+crt-static `
+        -o $fixtureExe $fixtureSource | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'Could not build the isolated process-check fixture.' }
+    $portable = $null
+    $installed = $null
+    $alias = Join-Path $caseRoot 'installation-alias'
+    try {
+        $portable = Start-SmokeProcess $fixtureExe 'portable-process'
+        Copy-Item -LiteralPath $fixtureExe -Destination $installedExe -Force
+        foreach ($launchPath in @($installedExe, (Join-Path $alias 'color-picker.exe'))) {
+            $stageSuffix = if ($launchPath -eq $installedExe) { 'direct' } else { 'alias' }
+            if ($launchPath -ne $installedExe) {
+                $null = New-Item -ItemType Junction -Path $alias -Target $installDirectory
+            }
+            $installed = Start-SmokeProcess $launchPath "installed-process-$stageSuffix"
+            $repairCode = Invoke-SmokeInstall $Installer "reject-running-damaged-executable-$stageSuffix" -AllowFailure
+            if ($repairCode -eq 0 -or $installed.HasExited -or $portable.HasExited) {
+                throw 'Failed --quit must block replacement of the running installation and preserve both fixtures.'
+            }
+            $uninstallCode = Invoke-BoundedProcess $uninstaller @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
+                "/LOG=$(Join-Path $caseRoot "reject-running-uninstall-$stageSuffix.setup.log")") `
+                "reject-running-uninstall-$stageSuffix" -AllowFailure
+            if ($uninstallCode -eq 0 -or $installed.HasExited -or $portable.HasExited -or
+                -not (Test-Path -LiteralPath $uninstallKey)) {
+                throw 'Failed --quit must also block uninstallation while the installation process remains running.'
+            }
+            Stop-SmokeProcess $installed
+            $installed = $null
+            Remove-SmokeFixture $alias
+        }
+        # The same installed stub still returns failure for --quit, but now only
+        # a portable instance in a different directory remains. Repair must pass.
+        $null = Invoke-SmokeInstall $Installer 'repair-with-other-directory-process'
+        if ($portable.HasExited) { throw 'Repair stopped a same-name process from another directory.' }
+    }
+    finally {
+        try { Stop-SmokeProcess $installed }
+        finally {
+            try { Stop-SmokeProcess $portable }
+            finally { Remove-SmokeFixture $alias }
+        }
+    }
+}
+
 function Add-LegacyFixtures {
     Write-SmokeFixture (Join-Path $installDirectory 'docs/unchanged.txt') $originalFixture
     Write-SmokeFixture (Join-Path $installDirectory 'licenses/nested/license.txt') $originalFixture
@@ -233,6 +331,13 @@ try {
     $null = Invoke-SmokeInstall $older 'install-default'
     Assert-Installed '0.1.0' $false $false
     $null = Invoke-BoundedProcess $installedExe @('--check-environment') 'check-environment'
+    # A damaged, non-running executable must be repairable without first
+    # deleting it manually. The installer must use its independent process check.
+    Write-SmokeFixture $installedExe "Damaged smoke executable`n"
+    $null = Invoke-SmokeInstall $older 'repair-damaged-executable'
+    Assert-Installed '0.1.0' $false $false
+    Assert-IndependentProcessCheck $older
+    Assert-Installed '0.1.0' $false $false
     $null = Invoke-SmokeInstall $older 'enable-tasks' @('/TASKS=startup,desktopicon')
     Assert-Installed '0.1.0' $true $true
     Add-LegacyFixtures
@@ -251,6 +356,9 @@ try {
     Assert-Installed '0.1.1' $false $false
     $null = Invoke-SmokeInstall $newer 'reenable-before-uninstall' @('/TASKS=startup,desktopicon')
     Assert-Installed '0.1.1' $true $true
+    # The same native check is compiled into Uninstall; it must not require a
+    # helper extracted from Setup or a healthy installed application binary.
+    Write-SmokeFixture $installedExe "Damaged smoke executable before uninstall`n"
     $null = Invoke-BoundedProcess $uninstaller @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
         "/LOG=$(Join-Path $caseRoot 'uninstall.setup.log')") 'uninstall'
     Assert-Uninstalled

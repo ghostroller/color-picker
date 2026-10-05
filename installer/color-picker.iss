@@ -125,6 +125,7 @@ Filename: "{app}\color-picker.exe"; Parameters: "--startup"; Description: "{cm:L
 
 [Code]
 #include "legacy-cleanup.iss"
+#include "process-check.iss"
 
 const
   InstalledKey = '{#UninstallRegistryKey}';
@@ -187,6 +188,15 @@ begin
   if not Exec(Executable, '--quit', ExpandConstant('{app}'), SW_HIDE,
               ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
   begin
+    // A damaged executable cannot run --quit. Do not treat that as proof that
+    // its resident instance stopped: check independently, using system APIs
+    // available to Setup and Uninstall even when the payload is unusable.
+    Log('Installed --quit failed; checking the installation path independently.');
+    if InstallationPathIdle(Executable) then
+    begin
+      Log('No running instance at the installation path; allowing repair or removal.');
+      Exit;
+    end;
     Result := FmtMessage(CustomMessage('QuitFailed'), [IntToStr(ExitCode)]);
     Log(Result);
   end;

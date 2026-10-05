@@ -264,7 +264,11 @@ fn message_loop(
             settings_window.take();
         }
         if cancellation != 0 {
-            controller.stop("pending_cancellation");
+            if cancellation & (EXIT | ENVIRONMENT_CHANGED) != 0 {
+                controller.abort("pending_cancellation");
+            } else {
+                controller.stop("pending_cancellation");
+            }
         }
         if let Err(error) = controller.process_input() {
             diagnostics::event(format_args!("input.failed error={error}"));
@@ -415,7 +419,7 @@ fn message_loop(
                 cancel_quick_copy(&mut copy_job);
                 result_window.take();
                 settings_window.take();
-                controller.stop("host_exit");
+                controller.abort("host_exit");
                 publish_preview_status(&controller);
             }
             if exiting {
@@ -446,7 +450,7 @@ fn message_loop(
                 if cancel_quick_copy(&mut copy_job) {
                     controller.close_result()?;
                 }
-                controller.stop("environment_changed");
+                controller.abort("environment_changed");
                 publish_preview_status(&controller);
                 diagnostics::event(format_args!("environment.changed"));
             }
@@ -573,7 +577,7 @@ fn message_loop(
                         diagnostics::event(format_args!("tray.menu_selected command=exit"));
                         exiting = true;
                         cancel_quick_copy(&mut copy_job);
-                        controller.stop("host_exit");
+                        controller.abort("host_exit");
                     }
                     None => {}
                 }
@@ -657,7 +661,7 @@ fn message_loop(
             cancel_quick_copy(&mut copy_job);
             result_window.take();
             settings_window.take();
-            controller.stop("quit_message");
+            controller.abort("quit_message");
             continue;
         }
         // SAFETY: The ResultWindow owner retains its dialog/control tree, and

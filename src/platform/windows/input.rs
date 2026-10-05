@@ -166,6 +166,7 @@ impl InputSession {
             notify: notify.0 as usize,
             control: signal,
             finish: AtomicBool::new(false),
+            bounded_drain: AtomicBool::new(false),
             reject: AtomicBool::new(false),
             failure: AtomicU64::new(0),
             movement: MovementMailbox::default(),
@@ -232,6 +233,12 @@ impl InputSession {
         self.shared.finish.store(true, Ordering::Release);
         self.shared.signal_control()
     }
+    /// Exceptional cleanup must remain bounded even if an owned release is lost.
+    /// A normal finish request cannot downgrade this exceptional cleanup policy.
+    pub fn request_abort(&self) -> Result<()> {
+        self.shared.bounded_drain.store(true, Ordering::Release);
+        self.request_finish()
+    }
     pub fn is_finished(&self) -> bool {
         self.worker.as_ref().is_none_or(JoinHandle::is_finished)
     }
@@ -260,7 +267,7 @@ impl Drop for InputSession {
     fn drop(&mut self) {
         // Normal owners poll/join before dropping. Exceptional unwinding/early
         // return still requests bounded draining; never synchronously join here.
-        let _ = self.request_finish();
+        let _ = self.request_abort();
         if self.is_finished() {
             let _ = self.try_join();
         }
@@ -360,6 +367,7 @@ mod handle_tests {
                 notify: 0,
                 control: ControlSignal::new().unwrap(),
                 finish: AtomicBool::new(false),
+                bounded_drain: AtomicBool::new(false),
                 reject: AtomicBool::new(false),
                 failure: AtomicU64::new(0),
                 movement: MovementMailbox::default(),
@@ -409,6 +417,56 @@ mod handle_tests {
             InputFailureKind::ThreadPanicked
         );
     }
+
+    #[test]
+    fn abort_wakes_a_normal_drain_and_cannot_be_downgraded_by_finish() {
+        let mut input = session(thread::spawn(|| Ok(())));
+        wait_for_worker(&input);
+        input.try_join().unwrap().unwrap();
+        input.request_finish().unwrap();
+        assert!(!input.shared.bounded_drain.load(Ordering::Acquire));
+        // Consume the normal-finish wake before waiting for the upgrade.
+        let handle = input.shared.control.handle();
+        // SAFETY: input retains this auto-reset event for the nonblocking wait.
+        assert_eq!(
+            // SAFETY: input owns this borrowed event during the query.
+            unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 0) },
+            WAIT_OBJECT_0
+        );
+        let shared = input.shared.clone();
+        input.worker = Some(thread::spawn(move || {
+            let handle = shared.control.handle();
+            // SAFETY: shared owns this event throughout the bounded test wait.
+            assert_eq!(
+                // SAFETY: the shared owner lives until this wait completes.
+                unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 5000) },
+                WAIT_OBJECT_0
+            );
+            assert!(shared.bounded_drain.load(Ordering::Acquire));
+            Ok(())
+        }));
+        input.request_abort().unwrap();
+        input.request_finish().unwrap();
+        wait_for_worker(&input);
+        input.try_join().unwrap().unwrap();
+        assert!(input.shared.bounded_drain.load(Ordering::Acquire));
+        assert!(input.failure().is_none());
+    }
+
+    #[test]
+    fn drop_requests_bounded_cleanup_and_failures_retain_the_original_cause() {
+        let mut input = session(thread::spawn(|| Ok(())));
+        wait_for_worker(&input);
+        input.try_join().unwrap().unwrap();
+        let shared = input.shared.clone();
+        drop(input);
+        assert!(shared.finish.load(Ordering::Acquire));
+        assert!(shared.bounded_drain.load(Ordering::Acquire));
+        let original = failure(InputFailureKind::ReceiverDisconnected, 0);
+        shared.fail(original);
+        shared.fail(failure(InputFailureKind::DrainTimeout, 0));
+        assert_eq!(shared.failure(), Some(original));
+    }
 }
 
 struct Shared {
@@ -416,6 +474,7 @@ struct Shared {
     notify: usize,
     control: ControlSignal,
     finish: AtomicBool,
+    bounded_drain: AtomicBool,
     reject: AtomicBool,
     failure: AtomicU64,
     movement: MovementMailbox,
@@ -430,6 +489,7 @@ impl Shared {
         let _ = self
             .failure
             .compare_exchange(0, packed, Ordering::AcqRel, Ordering::Acquire);
+        self.bounded_drain.store(true, Ordering::Release);
         self.finish.store(true, Ordering::Release);
         let _ = self.control.set();
     }
@@ -726,16 +786,17 @@ fn run_input(
         if phase == Phase::Stopped {
             break;
         }
-        let timeout = if phase == Phase::Draining {
-            let until = *deadline.get_or_insert_with(|| Instant::now() + DRAIN_LIMIT);
-            let remaining = until.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                shared.fail(failure(InputFailureKind::DrainTimeout, 0));
+        let timeout = match drain_timeout(
+            &mut deadline,
+            phase,
+            shared.bounded_drain.load(Ordering::Acquire),
+            Instant::now(),
+        ) {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                shared.fail(error);
                 break;
             }
-            remaining.as_millis().max(1) as u32
-        } else {
-            INFINITE
         };
         let signal = shared.control.handle();
         let handles = [HANDLE(signal.as_raw_handle())];
@@ -765,6 +826,7 @@ fn run_input(
                 break;
             }
             if message.message == WM_QUIT {
+                shared.bounded_drain.store(true, Ordering::Release);
                 shared.finish.store(true, Ordering::Release);
                 break;
             }
@@ -778,6 +840,138 @@ fn run_input(
     }
     hooks.uninstall(&shared);
     shared.failure().map_or(Ok(()), Err)
+}
+
+fn drain_timeout(
+    deadline: &mut Option<Instant>,
+    phase: Phase,
+    bounded: bool,
+    now: Instant,
+) -> std::result::Result<u32, InputFailure> {
+    if phase != Phase::Draining || !bounded {
+        return Ok(INFINITE);
+    }
+    let until = *deadline.get_or_insert(now + DRAIN_LIMIT);
+    let remaining = until.saturating_duration_since(now);
+    if remaining.is_zero() {
+        Err(failure(InputFailureKind::DrainTimeout, 0))
+    } else {
+        Ok(remaining.as_millis().max(1) as u32)
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::core::{
+        color::Rgb8,
+        state::{AppState, Event, PickedColor, SampleKind, StateMachine},
+    };
+
+    #[test]
+    fn confirmation_preserves_the_color_until_a_long_held_button_is_released() {
+        let mut machine = StateMachine::new();
+        machine.dispatch(Event::Activate).unwrap();
+        let session = machine.session_id().unwrap();
+        machine.dispatch(Event::ResourcesReady(session)).unwrap();
+        machine.dispatch(Event::InputReady(session)).unwrap();
+        let picked = PickedColor {
+            rgb: Rgb8::new(12, 34, 56),
+            source: ScreenPointPx { x: 10, y: 20 },
+            kind: SampleKind::Live,
+        };
+        let mut protocol = Protocol::new();
+        protocol.arm();
+        assert!(protocol.button(Button::Middle, true).swallow);
+        assert!(protocol.button(Button::Left, true).swallow);
+        assert_eq!(
+            protocol.button(Button::Left, false).signal,
+            Some(Signal::Candidate)
+        );
+        machine
+            .dispatch(Event::Confirm { session, picked })
+            .unwrap();
+        protocol.finish();
+        let now = Instant::now();
+        let mut deadline = None;
+        for elapsed in [Duration::ZERO, Duration::from_secs(30)] {
+            assert_eq!(
+                drain_timeout(&mut deadline, protocol.phase(), false, now + elapsed),
+                Ok(INFINITE)
+            );
+            assert_eq!(
+                machine.state(),
+                AppState::Finishing {
+                    session,
+                    picked: Some(picked)
+                }
+            );
+        }
+        assert!(deadline.is_none());
+        assert!(protocol.button(Button::Middle, false).swallow);
+        assert_eq!(protocol.phase(), Phase::Stopped);
+        machine.dispatch(Event::InputStopped(session)).unwrap();
+        assert_eq!(machine.state(), AppState::Result(picked));
+    }
+
+    #[test]
+    fn long_escape_cancellation_consumes_repeats_and_the_final_release() {
+        let mut protocol = Protocol::new();
+        protocol.arm();
+        assert_eq!(
+            protocol.button(Button::Escape, true).signal,
+            Some(Signal::Cancel)
+        );
+        let now = Instant::now();
+        let mut deadline = None;
+        assert_eq!(
+            drain_timeout(&mut deadline, protocol.phase(), false, now),
+            Ok(INFINITE)
+        );
+        let repeated = protocol.button(Button::Escape, true);
+        assert!(repeated.swallow);
+        assert_eq!(repeated.signal, None);
+        assert_eq!(
+            drain_timeout(
+                &mut deadline,
+                protocol.phase(),
+                false,
+                now + Duration::from_secs(30)
+            ),
+            Ok(INFINITE)
+        );
+        assert!(protocol.button(Button::Escape, false).swallow);
+        assert_eq!(protocol.phase(), Phase::Stopped);
+    }
+
+    #[test]
+    fn exceptional_cleanup_starts_its_limit_at_upgrade_and_never_extends_it() {
+        let now = Instant::now();
+        let mut deadline = None;
+        assert_eq!(
+            drain_timeout(&mut deadline, Phase::Draining, false, now),
+            Ok(INFINITE)
+        );
+        let aborted = now + Duration::from_secs(30);
+        assert_eq!(
+            drain_timeout(&mut deadline, Phase::Draining, true, aborted),
+            Ok(5000)
+        );
+        assert_eq!(
+            drain_timeout(
+                &mut deadline,
+                Phase::Draining,
+                true,
+                aborted + Duration::from_secs(4)
+            ),
+            Ok(1000)
+        );
+        assert_eq!(
+            drain_timeout(&mut deadline, Phase::Draining, true, aborted + DRAIN_LIMIT),
+            Err(failure(InputFailureKind::DrainTimeout, 0))
+        );
+        assert_eq!(deadline, Some(aborted + DRAIN_LIMIT));
+    }
 }
 
 struct ContextGuard;
