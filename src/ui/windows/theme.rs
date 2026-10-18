@@ -28,6 +28,7 @@ use crate::platform::windows::icon::WindowIcons;
 const CANVAS: COLORREF = rgb(0xf5f7fa);
 const PANEL: COLORREF = rgb(0xffffff);
 const BORDER: COLORREF = rgb(0xe2e8f0);
+pub(super) const FIELD: COLORREF = rgb(0xf5f6f8);
 const INK: COLORREF = rgb(0x172033);
 const MUTED: COLORREF = rgb(0x64748b);
 const ACCENT: COLORREF = rgb(0x2563eb);
@@ -60,6 +61,7 @@ impl Tone {
 pub(super) struct Theme {
     canvas: OwnedBrush,
     panel: OwnedBrush,
+    field: OwnedBrush,
     // The window owner calls DestroyWindow before dropping its Theme.
     icons: RefCell<Option<WindowIcons>>,
     // A borrowed control DC may retain a WM_GETFONT font after RestoreDC fails.
@@ -71,9 +73,11 @@ impl Theme {
     pub(super) fn new() -> Result<Self> {
         let canvas = OwnedBrush::solid(CANVAS)?;
         let panel = OwnedBrush::solid(PANEL)?;
+        let field = OwnedBrush::solid(FIELD)?;
         Ok(Self {
             canvas,
             panel,
+            field,
             icons: RefCell::new(None),
             font_restore_failed: Cell::new(false),
         })
@@ -113,6 +117,17 @@ impl Theme {
         } else {
             self.canvas.raw().0
         } as isize)
+    }
+
+    pub(super) fn field_color(&self, hdc: HDC) -> LRESULT {
+        // SAFETY: The native control-color callback supplies this borrowed DC;
+        // the owning window retains the field brush until child teardown.
+        unsafe {
+            SetTextColor(hdc, INK);
+            SetBkColor(hdc, FIELD);
+            SetBkMode(hdc, TRANSPARENT);
+        }
+        LRESULT(self.field.raw().0 as isize)
     }
 
     pub(super) fn paint(&self, hwnd: HWND, panels: &[RECT]) -> LRESULT {
@@ -222,7 +237,7 @@ pub(super) fn custom_draw(
     draw_button(theme, draw, primary_id, false)
 }
 
-/// Borderless neutral buttons for the result's plain white value list.
+/// Borderless neutral buttons for the result's softly filled value fields.
 pub(super) fn custom_draw_minimal(
     theme: &Theme,
     draw: &NMCUSTOMDRAW,
@@ -252,6 +267,7 @@ fn draw_button(
     let pressed = draw.uItemState.contains(CDIS_SELECTED);
     let hot = draw.uItemState.contains(CDIS_HOT);
     let primary = header.idFrom == primary_id;
+    let field_copy = minimal && (100..104).contains(&header.idFrom);
     let (fill, border, text) = if disabled {
         (rgb(0xe9edf3), BORDER, rgb(0x94a3b8))
     } else if minimal {
@@ -266,9 +282,11 @@ fn draw_button(
             (fill, fill, PANEL)
         } else {
             let fill = if pressed {
-                rgb(0xe9edf2)
+                rgb(0xe3e7ed)
             } else if hot {
-                rgb(0xf4f6f8)
+                rgb(0xebedf1)
+            } else if field_copy {
+                FIELD
             } else {
                 PANEL
             };
@@ -305,10 +323,12 @@ fn draw_button(
     unsafe {
         SelectObject(hdc, GetStockObject(DC_BRUSH));
         SelectObject(hdc, GetStockObject(DC_PEN));
-        // Row copy / key-capture buttons sit on white cards; footer on canvas.
+        // Match each button's surrounding surface, including rounded corners.
         SetDCBrushColor(
             hdc,
-            if minimal || (100..=104).contains(&header.idFrom) {
+            if field_copy {
+                FIELD
+            } else if minimal || (100..=104).contains(&header.idFrom) {
                 PANEL
             } else {
                 CANVAS

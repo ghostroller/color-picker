@@ -3,7 +3,7 @@
 
 use super::messages;
 use super::window_lifetime::{WindowInit, WindowLifetime, WindowRole};
-use crate::platform::windows::gdi::{OwnedPen, PaintSession, SavedDc};
+use crate::platform::windows::gdi::{OwnedPen, PaintSession, SavedDc, WindowDc};
 
 use std::{
     cell::{Cell, RefCell},
@@ -30,12 +30,13 @@ use windows::{
         },
         System::{
             LibraryLoader::GetModuleHandleW,
-            SystemServices::{SS_NOPREFIX, SS_OWNERDRAW},
+            SystemServices::{SS_CENTERIMAGE, SS_NOPREFIX, SS_OWNERDRAW},
+            Threading::GetCurrentThreadId,
         },
         UI::{
             Controls::{
                 CDDS_PREPAINT, CDIS_DISABLED, CDIS_FOCUS, CDIS_HOT, CDIS_SELECTED,
-                CDRF_SKIPDEFAULT, DRAWITEMSTRUCT, NMCUSTOMDRAW, SetScrollInfo,
+                CDRF_SKIPDEFAULT, DRAWITEMSTRUCT, EM_SETSEL, NMCUSTOMDRAW, SetScrollInfo,
             },
             HiDpi::GetDpiForWindow,
             Input::KeyboardAndMouse::{GetFocus, SetFocus},
@@ -125,6 +126,7 @@ struct CallbackState {
     viewport_height: Cell<i32>,
     header_height: Cell<i32>,
     wheel_remainder: Cell<i32>,
+    fields: Cell<[RECT; 4]>,
 }
 
 impl CallbackState {
@@ -195,6 +197,7 @@ impl Controls {
 #[derive(Default)]
 struct Resources {
     dpi: u32,
+    value_line_height: i32,
     _font: Option<Font>,
     _small_font: Option<Font>,
     _value_font: Option<Font>,
@@ -361,6 +364,7 @@ impl ResultWindow {
             viewport_height: Cell::new(0),
             header_height: Cell::new(0),
             wheel_remainder: Cell::new(0),
+            fields: Cell::new([RECT::default(); 4]),
         });
         let pointer = callback.as_ref() as *const CallbackState;
         let init = WindowInit {
@@ -651,14 +655,14 @@ impl ResultWindow {
                     w!("STATIC"),
                     format.label(),
                     20 + index,
-                    WINDOW_STYLE(SS_NOPREFIX.0),
+                    WINDOW_STYLE(SS_NOPREFIX.0 | SS_CENTERIMAGE.0),
                     WINDOW_EX_STYLE::default(),
                 )?,
                 edit: self.control(
                     w!("EDIT"),
                     &format_color(self.picked.rgb, format),
                     30 + index,
-                    WS_TABSTOP | WINDOW_STYLE((ES_READONLY | ES_AUTOHSCROLL | ES_NOHIDESEL) as u32),
+                    WS_TABSTOP | WINDOW_STYLE((ES_READONLY | ES_AUTOHSCROLL) as u32),
                     WINDOW_EX_STYLE::default(),
                 )?,
                 copy: self.control(
@@ -733,22 +737,26 @@ impl ResultWindow {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             )?
         };
-        for row in self.controls.rows {
-            for control in [row.edit, row.copy] {
-                // SAFETY: Each row control belongs to this root tree. The stable callback Box outlives
-                // all child subclass termination; WM_NCDESTROY removes each subclass first.
-                if !unsafe {
-                    SetWindowSubclass(
-                        control,
-                        Some(scroll_control_proc),
-                        1,
-                        self.callback.as_ref() as *const CallbackState as usize,
-                    )
-                }
-                .as_bool()
-                {
-                    return Err(Error::from_thread());
-                }
+        for control in self
+            .controls
+            .rows
+            .iter()
+            .flat_map(|row| [row.edit, row.copy])
+            .chain([self.controls.status])
+        {
+            // SAFETY: Each row control belongs to this root tree. The stable callback Box outlives
+            // all child subclass termination; WM_NCDESTROY removes each subclass first.
+            if !unsafe {
+                SetWindowSubclass(
+                    control,
+                    Some(scroll_control_proc),
+                    1,
+                    self.callback.as_ref() as *const CallbackState as usize,
+                )
+            }
+            .as_bool()
+            {
+                return Err(Error::from_thread());
             }
         }
         Ok(())
@@ -964,37 +972,18 @@ impl ResultWindow {
         let viewport_height = panes.viewport.bottom - panes.viewport.top;
         self.callback.viewport_height.set(viewport_height);
         self.callback.header_height.set(header);
+        let viewport_width = client.right
+            - border_thickness(
+                client.right,
+                client.bottom,
+                dpi,
+                self.callback.border_width_dip,
+            );
         // SAFETY: The live owner retains these HWNDs on their creating thread. Geometry is
         // passed by value and no callback-state RefMut spans synchronous layout reentry.
         unsafe {
-            MoveWindow(
-                self.controls.swatch,
-                0,
-                0,
-                client.right
-                    - border_thickness(
-                        client.right,
-                        client.bottom,
-                        dpi,
-                        self.callback.border_width_dip,
-                    ),
-                header,
-                true,
-            )?;
-            MoveWindow(
-                viewport,
-                0,
-                header,
-                client.right
-                    - border_thickness(
-                        client.right,
-                        client.bottom,
-                        dpi,
-                        self.callback.border_width_dip,
-                    ),
-                viewport_height,
-                true,
-            )?;
+            MoveWindow(self.controls.swatch, 0, 0, viewport_width, header, true)?;
+            MoveWindow(viewport, 0, header, viewport_width, viewport_height, true)?;
         }
         for (id, button) in [
             (CAPTION_MINIMIZE, self.controls.minimize),
@@ -1016,7 +1005,14 @@ impl ResultWindow {
         }
         // Reserve scrollbar width before choosing a row layout. This avoids
         // oscillating between wide and narrow layouts as the bar appears.
-        let content_width = ((i64::from(client.right) * 96) / i64::from(dpi)) as i32 - 20;
+        let full_width = ((i64::from(viewport_width) * 96) / i64::from(dpi)) as i32;
+        let reserved_width = full_width - 20;
+        let content_width =
+            if dip(result_content_layout(reserved_width).height, dpi) > viewport_height {
+                reserved_width
+            } else {
+                full_width
+            };
         let geometry = result_content_layout(content_width);
         let content_height = dip(geometry.height, dpi);
         self.callback.content_height.set(content_height);
@@ -1026,6 +1022,12 @@ impl ResultWindow {
             .get()
             .clamp(0, (content_height - viewport_height).max(0));
         self.callback.scroll_offset.set(offset);
+        self.callback.fields.set(geometry.fields.map(|r| RECT {
+            left: dip(r.left, dpi),
+            top: dip(r.top, dpi) - offset,
+            right: dip(r.right, dpi),
+            bottom: dip(r.bottom, dpi) - offset,
+        }));
         let scroll = SCROLLINFO {
             cbSize: size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
@@ -1053,9 +1055,31 @@ impl ResultWindow {
             )
         };
         place_content(self.controls.source, geometry.source)?;
-        for (row, rects) in self.controls.rows.iter().zip(geometry.rows) {
-            for (hwnd, r) in [row.label, row.edit, row.copy].into_iter().zip(rects) {
-                place_content(hwnd, r)?;
+        let value_line_height = self.resources.borrow().value_line_height;
+        for ((row, rects), field) in self
+            .controls
+            .rows
+            .iter()
+            .zip(geometry.rows)
+            .zip(self.callback.fields.get())
+        {
+            place_content(row.label, rects[0])?;
+            place_content(row.copy, rects[2])?;
+            // Single-line EDIT text starts at the top of its line box. Center
+            // the measured font line, rather than a taller control rectangle.
+            let height = value_line_height.min(field.bottom - field.top).max(1);
+            let y = field.top + (field.bottom - field.top - height) / 2;
+            // SAFETY: This owner retains the EDIT and its font; layout values
+            // are copied, with no Resources borrow held across native reentry.
+            unsafe {
+                MoveWindow(
+                    row.edit,
+                    dip(rects[1].left, dpi),
+                    y,
+                    dip(rects[1].right - rects[1].left, dpi),
+                    height,
+                    true,
+                )?;
             }
         }
         let margin = dip(16, dpi);
@@ -1158,6 +1182,7 @@ impl ResultWindow {
         let font = Font::new(13, dpi, 400, false)?;
         let small_font = Font::new(11, dpi, 400, false)?;
         let value_font = Font::new(14, dpi, 400, true)?;
+        let value_line_height = font_line_height(self.hwnd, &value_font, dpi);
         let set_font = |hwnd, font: &Font| {
             // SAFETY: The new font owner stays live, and all controls receive replacement fonts
             // before the old FontState is replaced; SendMessage copies the handle only.
@@ -1185,6 +1210,7 @@ impl ResultWindow {
         // be released without retaining a RefCell borrow across window messages.
         let old = self.resources.replace(Resources {
             dpi,
+            value_line_height,
             _font: Some(font),
             _small_font: Some(small_font),
             _value_font: Some(value_font),
@@ -1414,6 +1440,7 @@ impl Drop for ResultWindow {
 struct ResultContentLayout {
     source: RECT,
     rows: [[RECT; 3]; 4],
+    fields: [RECT; 4],
     height: i32,
 }
 
@@ -1433,19 +1460,57 @@ fn result_content_layout(width: i32) -> ResultContentLayout {
             let y = row_top + index as i32 * row_height;
             if narrow {
                 [
-                    rect(16, y + 4, 68, 18),
-                    rect(16, y + 28, width - 32, 24),
-                    rect(width - 64, y, 48, 26),
+                    rect(16, y, width - 32, 18),
+                    rect(24, y + 27, width - 104, 22),
+                    rect(width - 68, y + 24, 48, 28),
                 ]
             } else {
                 [
-                    rect(16, y + 9, 60, 18),
-                    rect(84, y + 7, width - 160, 22),
-                    rect(width - 64, y + 4, 48, 28),
+                    rect(16, y + 2, 60, 32),
+                    rect(88, y + 7, width - 168, 22),
+                    rect(width - 68, y + 4, 48, 28),
                 ]
             }
         }),
+        fields: std::array::from_fn(|index| {
+            let y = row_top + index as i32 * row_height;
+            if narrow {
+                rect(16, y + 22, width - 32, 32)
+            } else {
+                rect(76, y + 2, width - 92, 32)
+            }
+        }),
         height: row_top + 4 * row_height + 8,
+    }
+}
+
+fn font_line_height(hwnd: HWND, font: &Font, dpi: u32) -> i32 {
+    let fallback = dip(16, dpi).max(1);
+    // SAFETY: The result owner keeps this HWND alive throughout measurement.
+    let Ok(dc) = (unsafe { WindowDc::new(hwnd) }) else {
+        return fallback;
+    };
+    // SAFETY: The DC and owned font outlive this saved selection scope.
+    let Ok(saved) = (unsafe { SavedDc::new(dc.raw()) }) else {
+        return fallback;
+    };
+    // SAFETY: The live font owner retains its handle through restoration.
+    if crate::platform::windows::gdi::invalid_selection(unsafe {
+        SelectObject(dc.raw(), font.raw().into())
+    }) {
+        return fallback;
+    }
+    let mut metric = TEXTMETRICW::default();
+    // SAFETY: The local output has the native layout and stays writable here.
+    let measured = unsafe { GetTextMetricsW(dc.raw(), &mut metric) }.as_bool();
+    if saved.restore().is_err() {
+        font.retain();
+        return fallback;
+    }
+    if measured {
+        metric.tmHeight.max(1)
+    } else {
+        fallback
     }
 }
 
@@ -1465,6 +1530,10 @@ unsafe extern "system" fn scroll_control_proc(
         // SAFETY: The installed subclass reference points to this root's stable callback
         // Box. Root teardown keeps it alive until every child/subclass callback returns.
         let state = unsafe { &*(reference as *const CallbackState) };
+        // SAFETY: This callback is installed only on live controls owned by
+        // this result tree; the query returns a scalar control identifier.
+        let id = unsafe { GetDlgCtrlID(hwnd) } as usize;
+        let selectable = id == 12 || (30..34).contains(&id);
         match message {
             WM_SETFOCUS => state.queue(|pending| pending.reveal = Some(hwnd)),
             WM_NCDESTROY => {
@@ -1476,7 +1545,34 @@ unsafe extern "system" fn scroll_control_proc(
         }
         // SAFETY: The original subclass message and any native payload remain valid until
         // this callback returns; all temporary mutable state borrows have ended.
-        unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+        let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+        if selectable {
+            if message == WM_KILLFOCUS {
+                // Clear the actual range as well as its highlight, so
+                // returning to this field cannot restore an old selection.
+                // SAFETY: The live EDIT synchronously consumes scalar
+                // selection endpoints; -1 collapses its current range.
+                unsafe { SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(usize::MAX)), Some(LPARAM(0))) };
+            }
+            // EDIT can recreate its caret on focus, font or geometry changes.
+            // Hide only a visible caret owned by this field: HideCaret counts
+            // calls, so unconditional hiding would unbalance native updates.
+            let mut info = GUITHREADINFO {
+                cbSize: size_of::<GUITHREADINFO>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: Query this callback's UI thread into a correctly sized
+            // local output. The API does not retain its address.
+            if unsafe { GetGUIThreadInfo(GetCurrentThreadId(), &mut info) }.is_ok()
+                && info.hwndCaret == hwnd
+                && info.flags.contains(GUI_CARETBLINKING)
+            {
+                // SAFETY: The native query identifies this still-live EDIT as
+                // the owner of the visible caret on the current UI thread.
+                let _ = unsafe { HideCaret(Some(hwnd)) };
+            }
+        }
+        result
     }))
     .unwrap_or_else(|_| std::process::abort())
 }
@@ -1673,7 +1769,7 @@ fn draw_swatch(draw: &DRAWITEMSTRUCT, color: COLORREF) -> LRESULT {
     LRESULT(1)
 }
 
-fn paint_result(hwnd: HWND, border_width_dip: u8) -> LRESULT {
+fn paint_result(hwnd: HWND, border_width_dip: u8, fields: &[RECT]) -> LRESULT {
     // SAFETY: native WM_PAINT supplies this live window; no mutable state borrow exists.
     if let Ok(paint) = unsafe { PaintSession::begin(hwnd) } {
         let hdc = paint.dc;
@@ -1689,6 +1785,24 @@ fn paint_result(hwnd: HWND, border_width_dip: u8) -> LRESULT {
             // SAFETY: The current callback or window owner retains this HWND through the scalar
             // DPI query; no native handle ownership is transferred.
             let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+            // SAFETY: SavedDc scopes stock-object selections and colors; each
+            // field is a copied layout rectangle inside this live paint DC.
+            unsafe {
+                SelectObject(hdc, GetStockObject(DC_BRUSH));
+                SelectObject(hdc, GetStockObject(NULL_PEN));
+                SetDCBrushColor(hdc, theme::FIELD);
+                for field in fields {
+                    let _ = RoundRect(
+                        hdc,
+                        field.left,
+                        field.top,
+                        field.right,
+                        field.bottom,
+                        dip(12, dpi),
+                        dip(12, dpi),
+                    );
+                }
+            }
             let _ =
                 draw_bottom_right_border(hdc, client.right, client.bottom, dpi, border_width_dip);
             if let Err(error) = saved.restore() {
@@ -1763,18 +1877,20 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         WM_NCLBUTTONDBLCLK if wparam.0 == HTCAPTION as usize => LRESULT(0),
         WM_SYSCOMMAND if matches!((wparam.0 & 0xfff0) as u32, SC_MAXIMIZE | SC_SIZE) => LRESULT(0),
         WM_ERASEBKGND => LRESULT(1),
-        WM_PAINT => paint_result(
-            hwnd,
+        WM_PAINT => {
             if hwnd == state.viewport.get() {
-                0
+                paint_result(hwnd, 0, &state.fields.get())
             } else {
-                state.border_width_dip
-            },
-        ),
+                paint_result(hwnd, state.border_width_dip, &[])
+            }
+        }
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {
             // SAFETY: This message supplies a child-control HWND (not a payload pointer); USER32
             // queries its numeric ID without taking ownership or retaining Rust references.
             let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut _)) } as usize;
+            if (30..34).contains(&id) {
+                return state.theme.field_color(HDC(wparam.0 as *mut _));
+            }
             let tone = if id == 12 {
                 state.status_tone.get()
             } else if id == 11 || (20..24).contains(&id) {
@@ -2135,6 +2251,37 @@ mod tests {
                 assert!(r.top >= 0 && r.bottom <= content.height);
                 let offset = reveal_offset(0, r.top, r.bottom, 64, content.height, 8);
                 assert!(r.top - offset >= 0 && r.bottom - offset <= 64);
+            }
+            for (index, field) in content.fields.into_iter().enumerate() {
+                assert!(field.left >= 0 && field.right <= width);
+                assert!(field.top >= 0 && field.bottom <= content.height);
+                assert!(field.right > field.left && field.bottom > field.top);
+                for dpi in [96, 120, 144, 168, 192, 240, 288] {
+                    let pixels = RECT {
+                        left: dip(field.left, dpi),
+                        top: dip(field.top, dpi),
+                        right: dip(field.right, dpi),
+                        bottom: dip(field.bottom, dpi),
+                    };
+                    for control in content.rows[index].into_iter().skip(1) {
+                        // MoveWindow scales the origin and size separately.
+                        // Text and buttons must stay inside the filled field
+                        // after physical-pixel rounding at every supported DPI.
+                        let control = RECT {
+                            left: dip(control.left, dpi),
+                            top: dip(control.top, dpi),
+                            right: dip(control.left, dpi) + dip(control.right - control.left, dpi),
+                            bottom: dip(control.top, dpi) + dip(control.bottom - control.top, dpi),
+                        };
+                        assert!(
+                            pixels.left <= control.left
+                                && pixels.top <= control.top
+                                && pixels.right >= control.right
+                                && pixels.bottom >= control.bottom,
+                            "control {control:?} escapes field {pixels:?} at width {width}, DPI {dpi}"
+                        );
+                    }
+                }
             }
         }
     }

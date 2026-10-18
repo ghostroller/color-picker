@@ -936,6 +936,274 @@ fn cached_selection_and_native_result_controls_smoke() {
 }
 
 #[test]
+#[ignore = "requires an interactive Windows desktop; selects only fixture result text without system input or clipboard access"]
+fn result_text_selection_is_exclusive_and_never_displays_a_caret() {
+    use std::mem::size_of;
+    use windows::Win32::{
+        System::{SystemServices::MK_LBUTTON, Threading::GetCurrentThreadId},
+        UI::{
+            Controls::{EM_GETSEL, EM_POSFROMCHAR, EM_SETSEL},
+            Input::KeyboardAndMouse::{
+                GetFocus, GetKeyboardState, SetFocus, SetKeyboardState, VK_CONTROL, VK_LCONTROL,
+                VK_LEFT, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RIGHT, VK_RMENU, VK_RSHIFT,
+                VK_SHIFT,
+            },
+            WindowsAndMessaging::{
+                ES_NOHIDESEL, GUI_CARETBLINKING, GUITHREADINFO, GetGUIThreadInfo, SWP_NOMOVE,
+                WM_GETFONT, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+                WM_SETFONT,
+            },
+        },
+    };
+
+    struct ThreadKeyboardState([u8; 256]);
+
+    impl ThreadKeyboardState {
+        fn save() -> Self {
+            let mut state = [0; 256];
+            // SAFETY: The local array supplies the complete writable keyboard-state buffer.
+            unsafe { GetKeyboardState(&mut state) }.unwrap();
+            Self(state)
+        }
+
+        fn set_shift(&self, pressed: bool) {
+            let mut state = self.0;
+            for key in [
+                VK_SHIFT,
+                VK_LSHIFT,
+                VK_RSHIFT,
+                VK_CONTROL,
+                VK_LCONTROL,
+                VK_RCONTROL,
+                VK_MENU,
+                VK_LMENU,
+                VK_RMENU,
+            ] {
+                state[key.0 as usize] &= 0x7f;
+            }
+            if pressed {
+                state[VK_SHIFT.0 as usize] |= 0x80;
+                state[VK_LSHIFT.0 as usize] |= 0x80;
+            }
+            // SAFETY: SetKeyboardState changes only this test thread's queue state, not
+            // physical/system input; the guard restores all original bytes on drop.
+            unsafe { SetKeyboardState(&state) }.unwrap();
+        }
+    }
+
+    impl Drop for ThreadKeyboardState {
+        fn drop(&mut self) {
+            // SAFETY: Restore the exact state saved on this same test thread; no input is sent.
+            let _ = unsafe { SetKeyboardState(&self.0) };
+        }
+    }
+
+    fn selection(edit: HWND) -> (u32, u32) {
+        let (mut start, mut end) = (0_u32, 0_u32);
+        // SAFETY: The fixture owns this EDIT and both local outputs remain uniquely
+        // writable through synchronous EM_GETSEL processing; no pointer is retained.
+        unsafe {
+            SendMessageW(
+                edit,
+                EM_GETSEL,
+                Some(WPARAM((&raw mut start) as usize)),
+                Some(LPARAM((&raw mut end) as isize)),
+            );
+        }
+        (start, end)
+    }
+
+    fn set_selection(edit: HWND, start: usize, end: isize) {
+        // SAFETY: The fixture retains its EDIT; EM_SETSEL carries character positions only.
+        unsafe { SendMessageW(edit, EM_SETSEL, Some(WPARAM(start)), Some(LPARAM(end))) };
+    }
+
+    #[track_caller]
+    fn assert_no_caret(edit: HWND) {
+        let mut info = GUITHREADINFO {
+            cbSize: size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: Query this test thread, rather than the user's foreground thread, into
+        // a correctly sized local structure that the API never retains.
+        unsafe { GetGUIThreadInfo(GetCurrentThreadId(), &mut info) }.unwrap();
+        assert_eq!(info.hwndFocus, edit, "the value must retain keyboard focus");
+        assert!(
+            !info.flags.contains(GUI_CARETBLINKING),
+            "read-only result text must never display an insertion caret: {edit:?}"
+        );
+    }
+
+    fn character_point(edit: HWND, index: usize) -> LPARAM {
+        // SAFETY: The live EDIT processes a scalar character-index query synchronously.
+        let position = unsafe { SendMessageW(edit, EM_POSFROMCHAR, Some(WPARAM(index)), None) };
+        assert_ne!(position.0, -1, "the fixture character must be visible");
+        let x = (position.0 as u16 as i16) as i32 + 1;
+        let mut bounds = RECT::default();
+        // SAFETY: The fixture retains this EDIT and bounds is a writable local output.
+        unsafe { GetClientRect(edit, &mut bounds) }.unwrap();
+        let y = (bounds.bottom - bounds.top) / 2;
+        LPARAM(((x as u16 as u32) | ((y as u16 as u32) << 16)) as isize)
+    }
+
+    fn drag_selection(edit: HWND, start: usize, end: usize) {
+        let first = character_point(edit, start);
+        let last = character_point(edit, end);
+        for (message, buttons, point) in [
+            (WM_LBUTTONDOWN, MK_LBUTTON.0 as usize, first),
+            (WM_MOUSEMOVE, MK_LBUTTON.0 as usize, last),
+            (WM_LBUTTONUP, 0, last),
+        ] {
+            // SAFETY: These scalar mouse messages target only the live fixture EDIT;
+            // they send no system input and the normal button-up releases its capture.
+            unsafe { SendMessageW(edit, message, Some(WPARAM(buttons)), Some(point)) };
+            assert_no_caret(edit);
+        }
+        let (start, end) = selection(edit);
+        assert!(end > start, "native mouse dragging must still select text");
+    }
+
+    let _dpi = ScopedPmv2::enter().unwrap();
+    let keyboard = ThreadKeyboardState::save();
+    keyboard.set_shift(false);
+    let result = ResultWindow::new_after_copy_failure(
+        color_picker::core::state::PickedColor {
+            rgb: Rgb8::new(224, 0, 0),
+            source: cursor_position().unwrap(),
+            kind: SampleKind::Live,
+        },
+        HWND::default(),
+        ColorFormat::Hex,
+        Default::default(),
+        "Synthetic copy failure for read-only selection testing",
+    )
+    .unwrap();
+    assert_eq!(result.process_pending().unwrap(), None);
+    let child = |parent, id| {
+        // SAFETY: Each parent belongs to this test-owned live result tree.
+        unsafe { GetDlgItem(Some(parent), id) }.unwrap()
+    };
+    let content = child(result.hwnd(), 300);
+    let edits = std::array::from_fn::<_, 4, _>(|index| child(content, 30 + index as i32));
+    let status = child(result.hwnd(), 12);
+
+    // Each focus transfer must collapse the previous real selection; hiding its
+    // highlight alone would allow stale text to reappear when that field is revisited.
+    let mut previous = None;
+    for edit in [status].into_iter().chain(edits) {
+        // SAFETY: Query scalar style bits on the fixture-owned EDIT.
+        assert_eq!(unsafe { GetWindowLongW(edit, GWL_STYLE) } & ES_NOHIDESEL, 0);
+        // SAFETY: Focus moves only among this fixture's controls on their owning thread.
+        unsafe { SetFocus(Some(edit)) }.unwrap();
+        assert_no_caret(edit);
+        if let Some(previous) = previous {
+            let (start, end) = selection(previous);
+            assert_eq!(start, end, "the previous field must be deselected");
+        }
+        set_selection(edit, 0, -1);
+        let (start, end) = selection(edit);
+        assert!(end > start);
+        assert_no_caret(edit);
+        previous = Some(edit);
+    }
+    // SAFETY: Focus moves to the first fixture EDIT, which previously had a selection.
+    unsafe { SetFocus(Some(edits[0])) }.unwrap();
+    let (start, end) = selection(edits[0]);
+    assert_eq!(start, end, "returning must not restore the old selection");
+    assert_no_caret(edits[0]);
+
+    set_selection(edits[0], 0, -1);
+    // Let native EDIT mouse handling perform the next cross-field focus transfer.
+    drag_selection(edits[1], 0, 3);
+    let (start, end) = selection(edits[0]);
+    assert_eq!(
+        start, end,
+        "mouse selection must deselect the previous field"
+    );
+
+    let point = character_point(edits[2], 1);
+    for (message, buttons) in [
+        (WM_LBUTTONDOWN, MK_LBUTTON.0 as usize),
+        (WM_LBUTTONUP, 0),
+        (WM_LBUTTONDBLCLK, MK_LBUTTON.0 as usize),
+        (WM_LBUTTONUP, 0),
+    ] {
+        // SAFETY: The complete native double-click sequence targets this fixture's
+        // CSS RGB EDIT only and generates no system mouse input.
+        unsafe { SendMessageW(edits[2], message, Some(WPARAM(buttons)), Some(point)) };
+        assert_no_caret(edits[2]);
+    }
+    let (start, end) = selection(edits[2]);
+    assert!(
+        end > start,
+        "native double-click word selection must remain available"
+    );
+    let (start, end) = selection(edits[1]);
+    assert_eq!(start, end);
+    let old = selection(edits[2]);
+    drag_selection(edits[2], 4, 7);
+    assert_ne!(
+        selection(edits[2]),
+        old,
+        "a new drag must replace the same-field selection"
+    );
+
+    // Shift extends the native selection even though its insertion caret is hidden.
+    // SAFETY: Focus moves only to the fixture HSL EDIT on its creating thread.
+    unsafe { SetFocus(Some(edits[3])) }.unwrap();
+    set_selection(edits[3], 0, 0);
+    keyboard.set_shift(true);
+    press_key(edits[3], VK_RIGHT.0 as usize, false);
+    assert_eq!(selection(edits[3]), (0, 1));
+    assert_no_caret(edits[3]);
+    press_key(edits[3], VK_RIGHT.0 as usize, false);
+    assert_eq!(selection(edits[3]), (0, 2));
+    assert_no_caret(edits[3]);
+    keyboard.set_shift(false);
+    press_key(edits[3], VK_LEFT.0 as usize, false);
+    let (start, end) = selection(edits[3]);
+    assert_eq!(start, end);
+    assert_no_caret(edits[3]);
+
+    // Font and geometry updates can recreate the native insertion caret even
+    // while focus stays in the same control.
+    // SAFETY: These messages borrow the fixture EDIT's existing font and copy
+    // scalar layout values; the fixture retains every handle throughout.
+    unsafe {
+        let font = SendMessageW(edits[3], WM_GETFONT, None, None);
+        SendMessageW(
+            edits[3],
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+        assert_no_caret(edits[3]);
+        let mut bounds = RECT::default();
+        GetClientRect(edits[3], &mut bounds).unwrap();
+        SetWindowPos(
+            edits[3],
+            None,
+            0,
+            0,
+            bounds.right + 1,
+            bounds.bottom,
+            SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+        .unwrap();
+        assert_no_caret(edits[3]);
+    }
+
+    let copy = child(content, 103);
+    // SAFETY: Focus the row button only; no BM_CLICK is sent and no copy is queued.
+    unsafe { SetFocus(Some(copy)) }.unwrap();
+    // SAFETY: GetFocus is a scalar query on this test thread.
+    assert_eq!(unsafe { GetFocus() }, copy);
+    let (start, end) = selection(edits[3]);
+    assert_eq!(start, end);
+    assert_eq!(result.process_pending().unwrap(), None);
+}
+
+#[test]
 #[ignore = "requires an interactive Windows desktop; briefly displays synthetic magnifier windows without input or desktop sampling"]
 fn edge_freeze_preserves_initial_source_and_standard_window_size() {
     let _dpi = ScopedPmv2::enter().unwrap();
