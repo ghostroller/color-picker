@@ -236,6 +236,13 @@ fn cached_selection_and_native_result_controls_smoke() {
     // SAFETY: The live fixture HWND is queried with a writable local POINT; its address is
     // not retained.
     assert!(unsafe { ClientToScreen(result_hwnd, &mut caption_point) }.as_bool());
+    assert_eq!(hit_test(caption_point), HTCLIENT as isize);
+    let mut caption_point = POINT {
+        x: client.right * 5 / 8,
+        y: caption_inset,
+    };
+    // SAFETY: The writable local point refers to the retained result window's right preview.
+    assert!(unsafe { ClientToScreen(result_hwnd, &mut caption_point) }.as_bool());
     assert_eq!(hit_test(caption_point), HTCAPTION as isize);
     // SAFETY: The parent belongs to this test-owned live window tree; the returned child
     // handle is borrowed only while its owner survives.

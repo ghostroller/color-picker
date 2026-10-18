@@ -41,7 +41,11 @@ Starting again during an active pick does not create another session. The tray m
 
 ## Copy the format you need
 
-Every result includes the color swatch, original coordinates, and whether it came from live or frozen picking. Values are selectable, and each row has its own **Copy** button.
+The left half of the top swatch always shows the original picked color; the right half shows the current adjusted color, without visible labels. Directly below, a gapless 3 × 7 color grid offers lightness, neighboring hues, and saturation in its three rows, from top to bottom.
+
+Click the original-color half to restore the first picked RGB, reset all three candidate rows and their scroll positions, and restore all four format values without copying; the right half still lets you drag the window.
+
+Hover over a row and use the mouse wheel to browse candidates without changing the current color or clipboard. Click a color to select it: that row centers on the selection, and the other two regenerate from the new color. All four formats and **Copy** buttons use the adjusted color. Original coordinates and the live or frozen source remain visible. Values are selectable, and each format row has its own **Copy** button.
 
 | Format | Example |
 | --- | --- |

@@ -2,6 +2,8 @@
 //! calls `process_pending` after dispatch and owns the window until it is dropped.
 
 use super::messages;
+#[path = "result_palette.rs"]
+mod palette_ui;
 use super::window_lifetime::{WindowInit, WindowLifetime, WindowRole};
 use crate::platform::windows::gdi::{OwnedPen, PaintSession, SavedDc, WindowDc};
 
@@ -56,7 +58,9 @@ use crate::{
     app::config::AppearanceConfig,
     app::i18n::tr,
     core::{
+        color::Rgb8,
         format::{ColorFormat, format_color},
+        palette::{CENTER, COLUMNS, Palette, ROWS},
         state::{PickedColor, SampleKind},
     },
     platform::windows::clipboard::{Clipboard, ClipboardError},
@@ -72,13 +76,16 @@ const PICK_AGAIN: usize = 200;
 const COPY_ROW: usize = 100;
 const CAPTION_MINIMIZE: usize = 40;
 const CAPTION_CLOSE: usize = 41;
+const RESTORE_ORIGINAL: usize = 42;
+const PALETTE_CELL: usize = 400;
 const RETRY_MS: u32 = 50;
 const COPIED_FEEDBACK_MS: u32 = 1600;
 const MAX_RETRIES: u8 = 3;
 const CLIENT_WIDTH: i32 = 420;
-const CLIENT_HEIGHT: i32 = 364;
-const CLIENT_HEIGHT_WITH_STATUS: i32 = 390;
-const SWATCH_HEIGHT: i32 = 112;
+const SWATCH_HEIGHT: i32 = 56;
+const PALETTE_HEIGHT: i32 = 84;
+const CLIENT_HEIGHT: i32 = 364 - 112 + SWATCH_HEIGHT + PALETTE_HEIGHT;
+const CLIENT_HEIGHT_WITH_STATUS: i32 = CLIENT_HEIGHT + 26;
 const STYLE: WINDOW_STYLE =
     WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0);
 const EX_STYLE: WINDOW_EX_STYLE = WINDOW_EX_STYLE(WS_EX_APPWINDOW.0 | WS_EX_CONTROLPARENT.0);
@@ -94,6 +101,9 @@ pub enum ResultAction {
 struct Pending {
     action: Option<ResultAction>,
     copy: Option<CopyTarget>,
+    copy_color: Option<Rgb8>,
+    palette_changed: bool,
+    selection_changed: bool,
     timer: Option<usize>,
     feedback_timer: Option<usize>,
     dpi_rect: Option<RECT>,
@@ -110,7 +120,13 @@ struct CallbackState {
     notify_hwnd: HWND,
     default_format: ColorFormat,
     theme: Theme,
-    swatch_color: COLORREF,
+    original_color: Rgb8,
+    restore_hover: Cell<bool>,
+    palette: RefCell<Palette>,
+    palette_hover: Cell<Option<usize>>,
+    palette_selected: Cell<Option<usize>>,
+    palette_wheel_remainders: Cell<[i32; ROWS]>,
+    palette_rect: Cell<RECT>,
     border_width_dip: u8,
     status_tone: Cell<Tone>,
     pending: Cell<Pending>,
@@ -130,6 +146,55 @@ struct CallbackState {
 }
 
 impl CallbackState {
+    fn select_palette(&self, index: usize) {
+        if self.closing.get() || index >= ROWS * COLUMNS {
+            return;
+        }
+        let row = index / COLUMNS;
+        let selected = self.palette.borrow_mut().select(row, index % COLUMNS);
+        if selected.is_some() {
+            self.queue_palette_selection(Some(row * COLUMNS + CENTER));
+        }
+    }
+
+    fn restore_original(&self) {
+        if self.closing.get() {
+            return;
+        }
+        self.palette.borrow_mut().reset(self.original_color);
+        self.queue_palette_selection(None);
+    }
+
+    fn queue_palette_selection(&self, selected: Option<usize>) {
+        self.palette_selected.set(selected);
+        self.palette_hover.set(None);
+        self.palette_wheel_remainders.set([0; ROWS]);
+        self.queue(|pending| {
+            pending.palette_changed = true;
+            pending.selection_changed = true;
+            // A selection supersedes an earlier copy intention that has not run yet.
+            pending.copy = None;
+            pending.copy_color = None;
+        });
+    }
+
+    fn scroll_palette(&self, row: usize, delta: i32) {
+        if self.closing.get() || row >= ROWS {
+            return;
+        }
+        let mut remainders = self.palette_wheel_remainders.get();
+        let total = remainders[row] + delta;
+        remainders[row] = total % 120;
+        self.palette_wheel_remainders.set(remainders);
+        if total / 120 == 0 {
+            return;
+        }
+        let changed = self.palette.borrow_mut().scroll(row, total / 120);
+        if changed {
+            self.queue(|pending| pending.palette_changed = true);
+        }
+    }
+
     fn defer(&self, update: impl FnOnce(&mut Pending)) {
         let mut pending = self.pending.get();
         update(&mut pending);
@@ -163,6 +228,8 @@ struct Row {
 #[derive(Default)]
 struct Controls {
     swatch: HWND,
+    restore: HWND,
+    palette: [HWND; ROWS * COLUMNS],
     minimize: HWND,
     caption_close: HWND,
     source: HWND,
@@ -177,6 +244,7 @@ impl Controls {
     fn handles(&self) -> impl Iterator<Item = HWND> + '_ {
         [
             self.swatch,
+            self.restore,
             self.minimize,
             self.caption_close,
             self.source,
@@ -186,6 +254,7 @@ impl Controls {
             self.status,
         ]
         .into_iter()
+        .chain(self.palette)
         .chain(
             self.rows
                 .iter()
@@ -224,6 +293,7 @@ struct CopyTarget {
 struct CopyRequest {
     token: usize,
     target: CopyTarget,
+    color: Rgb8,
     retries_left: u8,
 }
 
@@ -231,10 +301,11 @@ struct CopyRequest {
 struct CopyState(Option<CopyRequest>);
 
 impl CopyState {
-    fn replace(&mut self, token: usize, target: CopyTarget) {
+    fn replace(&mut self, token: usize, target: CopyTarget, color: Rgb8) {
         self.0 = Some(CopyRequest {
             token,
             target,
+            color,
             retries_left: MAX_RETRIES,
         });
     }
@@ -344,11 +415,13 @@ impl ResultWindow {
             notify_hwnd,
             default_format,
             theme: Theme::new()?,
-            swatch_color: COLORREF(
-                u32::from(picked.rgb.r)
-                    | (u32::from(picked.rgb.g) << 8)
-                    | (u32::from(picked.rgb.b) << 16),
-            ),
+            original_color: picked.rgb,
+            restore_hover: Cell::new(false),
+            palette: RefCell::new(Palette::new(picked.rgb)),
+            palette_hover: Cell::new(None),
+            palette_selected: Cell::new(None),
+            palette_wheel_remainders: Cell::new([0; ROWS]),
+            palette_rect: Cell::new(RECT::default()),
             border_width_dip: appearance.border_width_dip,
             status_tone: Cell::new(Tone::Muted),
             pending: Cell::new(Pending::default()),
@@ -498,7 +571,8 @@ impl ResultWindow {
                 pending.copy = Some(CopyTarget {
                     format: default_format,
                     button_id: COPY_DEFAULT,
-                })
+                });
+                pending.copy_color = Some(picked.rgb);
             });
         }
         Ok(window)
@@ -549,6 +623,9 @@ impl ResultWindow {
             self.cancel_copy();
             self.clear_copy_feedback()?;
             return Ok(Some(action));
+        }
+        if pending.palette_changed {
+            self.update_palette(pending.selection_changed)?;
         }
         // Icon coordinates and the minimized client area cannot be laid out. Retain
         // geometry until restoration while allowing copies and feedback timers
@@ -608,7 +685,10 @@ impl ResultWindow {
             self.cancel_copy();
             self.clear_copy_feedback()?;
             let token = next_copy_token()?;
-            self.copy.borrow_mut().replace(token, target);
+            let color = pending
+                .copy_color
+                .unwrap_or_else(|| self.callback.palette.borrow().current());
+            self.copy.borrow_mut().replace(token, target, color);
             self.attempt_copy(token)?;
         } else if let Some(token) = pending.timer
             && self.callback.active_timer.get() == token
@@ -630,11 +710,55 @@ impl ResultWindow {
     fn create_controls(&mut self) -> Result<()> {
         self.controls.swatch = self.control(
             w!("STATIC"),
-            tr("已选颜色色块", "Selected color swatch"),
+            tr("原始颜色与调整后颜色", "Original and adjusted colors"),
             10,
             WINDOW_STYLE(SS_OWNERDRAW.0) | WS_CLIPSIBLINGS,
             WINDOW_EX_STYLE::default(),
         )?;
+        self.controls.restore = self.control(
+            w!("BUTTON"),
+            tr("恢复首次取色颜色", "Restore original sampled color"),
+            RESTORE_ORIGINAL,
+            WS_TABSTOP | WS_CLIPSIBLINGS | WINDOW_STYLE(BS_OWNERDRAW as u32),
+            WINDOW_EX_STYLE::default(),
+        )?;
+        // SAFETY: The root owns this button and retains its callback Box until
+        // the exact installed subclass has been removed during native teardown.
+        if !unsafe {
+            SetWindowSubclass(
+                self.controls.restore,
+                Some(palette_ui::restore_proc),
+                1,
+                self.callback.as_ref() as *const CallbackState as usize,
+            )
+        }
+        .as_bool()
+        {
+            return Err(Error::from_thread());
+        }
+        for index in 0..ROWS * COLUMNS {
+            self.controls.palette[index] = self.control(
+                w!("BUTTON"),
+                "",
+                PALETTE_CELL + index,
+                WS_TABSTOP | WS_CLIPSIBLINGS | WINDOW_STYLE(BS_OWNERDRAW as u32),
+                WINDOW_EX_STYLE::default(),
+            )?;
+            // SAFETY: Each button is owned by this root; its stable callback Box outlives
+            // all subclass callbacks, including WM_NCDESTROY.
+            if !unsafe {
+                SetWindowSubclass(
+                    self.controls.palette[index],
+                    Some(palette_ui::cell_proc),
+                    1,
+                    self.callback.as_ref() as *const CallbackState as usize,
+                )
+            }
+            .as_bool()
+            {
+                return Err(Error::from_thread());
+            }
+        }
         let source = match self.picked.kind {
             SampleKind::Live => tr("实时屏幕", "Live screen"),
             SampleKind::Frozen => tr("冻结画面", "Frozen screen"),
@@ -757,6 +881,80 @@ impl ResultWindow {
             .as_bool()
             {
                 return Err(Error::from_thread());
+            }
+        }
+        self.update_palette(false)
+    }
+
+    fn update_palette(&self, selection_changed: bool) -> Result<()> {
+        let (current, candidates) = {
+            let palette = self.callback.palette.borrow();
+            (palette.current(), *palette.candidates())
+        };
+        if selection_changed {
+            self.cancel_copy();
+            self.clear_copy_feedback()?;
+            // Recentring the clicked color also keeps keyboard focus on that color,
+            // so a second Enter cannot accidentally pick the old column's new value.
+            // SAFETY: All queried and focused HWNDs belong to this UI-thread owner.
+            let focused = unsafe { GetFocus() };
+            if self.controls.palette.contains(&focused)
+                && let Some(index) = self.callback.palette_selected.get()
+            {
+                // SAFETY: The selected center is an owned sibling, with no model borrow held.
+                let _ = unsafe { SetFocus(Some(self.controls.palette[index])) };
+            }
+            for (row, format) in self.controls.rows.iter().zip(ColorFormat::ALL) {
+                let value = wide(&format_color(current, format));
+                // SAFETY: The owned EDIT copies this terminated local string synchronously.
+                unsafe { SetWindowTextW(row.edit, PCWSTR(value.as_ptr()))? };
+            }
+            for control in [
+                self.controls.swatch,
+                self.controls.restore,
+                self.controls.minimize,
+                self.controls.caption_close,
+            ] {
+                // SAFETY: These controls remain owned by this live result tree.
+                let _ = unsafe { InvalidateRect(Some(control), None, false) };
+            }
+            // A restore click can leave the pointer stationary over the swatch.
+            // Refresh its cursor together with the hover outline's actionable state.
+            let mut pointer = POINT::default();
+            // SAFETY: Query the screen pointer into a local output; only the live button
+            // beneath it receives the scalar hit-test message, with no model borrow held.
+            unsafe {
+                if GetCursorPos(&mut pointer).is_ok()
+                    && WindowFromPoint(pointer) == self.controls.restore
+                {
+                    SendMessageW(
+                        self.controls.restore,
+                        WM_SETCURSOR,
+                        Some(WPARAM(self.controls.restore.0 as usize)),
+                        Some(LPARAM(HTCLIENT as isize)),
+                    );
+                }
+            }
+        }
+        for (index, control) in self.controls.palette.iter().copied().enumerate() {
+            let row = index / COLUMNS;
+            let name = [
+                tr("明暗", "Lightness"),
+                tr("色相", "Hue"),
+                tr("浓淡", "Chroma"),
+            ][row];
+            // Owner-drawn buttons expose their color and row to accessibility without
+            // drawing any text or adding space between the cells.
+            let name = wide(&format!(
+                "{name} {}: {}",
+                index % COLUMNS + 1,
+                format_color(candidates[row][index % COLUMNS], ColorFormat::Hex)
+            ));
+            // SAFETY: The owned BUTTON copies this terminated local name; invalidation
+            // paints later, after all temporary model borrows have ended.
+            unsafe {
+                SetWindowTextW(control, PCWSTR(name.as_ptr()))?;
+                let _ = InvalidateRect(Some(control), None, false);
             }
         }
         Ok(())
@@ -899,7 +1097,7 @@ impl ResultWindow {
         let dpi = self.dpi()?;
         Ok((
             dip(240, dpi),
-            dip(if self.status_visible.get() { 262 } else { 206 }, dpi),
+            dip(if self.status_visible.get() { 298 } else { 242 }, dpi),
         ))
     }
 
@@ -963,15 +1161,19 @@ impl ResultWindow {
             if narrow { 94 } else { 54 } + if self.status_visible.get() { 56 } else { 0 },
             dpi,
         );
-        let header = dip(SWATCH_HEIGHT, dpi).min(client.bottom - footer - dip(64, dpi));
-        if header < dip(48, dpi) || client.right < dip(240, dpi) {
+        let header =
+            dip(SWATCH_HEIGHT + PALETTE_HEIGHT, dpi).min(client.bottom - footer - dip(64, dpi));
+        if header < dip(84, dpi) || client.right < dip(240, dpi) {
             return Err(layout::unavailable());
         }
+        // The preview stays half its previous height. Only exceptionally small work
+        // areas compress it and the palette, while retaining usable caption buttons.
+        let preview_height = dip(SWATCH_HEIGHT, dpi).min(header - dip(48, dpi));
         let panes = SheetLayout::new(client.right, client.bottom, header, footer, dip(64, dpi))?;
         let viewport = self.callback.viewport.get();
         let viewport_height = panes.viewport.bottom - panes.viewport.top;
         self.callback.viewport_height.set(viewport_height);
-        self.callback.header_height.set(header);
+        self.callback.header_height.set(preview_height);
         let viewport_width = client.right
             - border_thickness(
                 client.right,
@@ -979,11 +1181,52 @@ impl ResultWindow {
                 dpi,
                 self.callback.border_width_dip,
             );
+        self.callback.palette_rect.set(RECT {
+            left: 0,
+            top: preview_height,
+            right: viewport_width,
+            bottom: header,
+        });
         // SAFETY: The live owner retains these HWNDs on their creating thread. Geometry is
         // passed by value and no callback-state RefMut spans synchronous layout reentry.
         unsafe {
-            MoveWindow(self.controls.swatch, 0, 0, viewport_width, header, true)?;
+            MoveWindow(
+                self.controls.swatch,
+                0,
+                0,
+                viewport_width,
+                preview_height,
+                true,
+            )?;
+            MoveWindow(
+                self.controls.restore,
+                0,
+                0,
+                viewport_width / 2,
+                preview_height,
+                true,
+            )?;
             MoveWindow(viewport, 0, header, viewport_width, viewport_height, true)?;
+        }
+        for (index, control) in self.controls.palette.iter().copied().enumerate() {
+            let rect = palette_ui::cell_rect(
+                index,
+                viewport_width,
+                preview_height,
+                header - preview_height,
+            );
+            // SAFETY: The button belongs to this owner. Adjacent rectangles share the
+            // same integer-pixel boundary; no native frame or separate rounding adds gaps.
+            unsafe {
+                MoveWindow(
+                    control,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    true,
+                )?;
+            }
         }
         for (id, button) in [
             (CAPTION_MINIMIZE, self.controls.minimize),
@@ -1354,7 +1597,7 @@ impl ResultWindow {
         let Some(request) = self.copy.borrow().matching(token) else {
             return Ok(());
         };
-        let text = format_color(self.picked.rgb, request.target.format);
+        let text = format_color(request.color, request.target.format);
         let outcome = Clipboard::copy_text(self.hwnd, &text);
         self.finish_copy_attempt(request, outcome)
     }
@@ -1600,7 +1843,7 @@ fn caption_button_rect(id: usize, width: i32, dpi: u32) -> RECT {
     }
 }
 
-fn caption_hit_test(hwnd: HWND, lparam: LPARAM, header_height: i32) -> LRESULT {
+fn caption_hit_test(hwnd: HWND, lparam: LPARAM, header_height: i32, preview_width: i32) -> LRESULT {
     // Screen coordinates can be negative on monitors left/above the primary.
     let mut point = POINT {
         x: (lparam.0 as u16 as i16) as i32,
@@ -1629,7 +1872,12 @@ fn caption_hit_test(hwnd: HWND, lparam: LPARAM, header_height: i32) -> LRESULT {
         return LRESULT(HTCLIENT as isize);
     }
     if inside(client) && point.y < header_height {
-        LRESULT(HTCAPTION as isize)
+        // The left half activates Restore; the adjusted half remains a drag area.
+        LRESULT(if point.x < preview_width / 2 {
+            HTCLIENT
+        } else {
+            HTCAPTION
+        } as isize)
     } else {
         LRESULT(HTCLIENT as isize)
     }
@@ -1751,7 +1999,11 @@ fn draw_caption_button(draw: &NMCUSTOMDRAW, background: COLORREF) -> Option<LRES
     Some(LRESULT(CDRF_SKIPDEFAULT as isize))
 }
 
-fn draw_swatch(draw: &DRAWITEMSTRUCT, color: COLORREF) -> LRESULT {
+fn colorref(color: Rgb8) -> COLORREF {
+    COLORREF(u32::from(color.r) | (u32::from(color.g) << 8) | (u32::from(color.b) << 16))
+}
+
+fn draw_swatch(draw: &DRAWITEMSTRUCT, original: COLORREF, adjusted: COLORREF) -> LRESULT {
     let hdc = draw.hDC;
     // SAFETY: the owner-draw callback keeps hdc alive; only stock brushes are used.
     let Ok(saved) = (unsafe { SavedDc::new(hdc) }) else {
@@ -1760,8 +2012,19 @@ fn draw_swatch(draw: &DRAWITEMSTRUCT, color: COLORREF) -> LRESULT {
     // SAFETY: The owner-draw record lends a live DC and RECT for this callback. The stock
     // DC brush is borrowed, and SavedDc restores the changed drawing attributes.
     unsafe {
-        SetDCBrushColor(hdc, color);
-        FillRect(hdc, &draw.rcItem, HBRUSH(GetStockObject(DC_BRUSH).0));
+        let middle = draw.rcItem.left + (draw.rcItem.right - draw.rcItem.left) / 2;
+        let left = RECT {
+            right: middle,
+            ..draw.rcItem
+        };
+        let right = RECT {
+            left: middle,
+            ..draw.rcItem
+        };
+        SetDCBrushColor(hdc, original);
+        FillRect(hdc, &left, HBRUSH(GetStockObject(DC_BRUSH).0));
+        SetDCBrushColor(hdc, adjusted);
+        FillRect(hdc, &right, HBRUSH(GetStockObject(DC_BRUSH).0));
     }
     if saved.restore().is_err() {
         return LRESULT(0);
@@ -1869,9 +2132,12 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         // classic caption/frame over our client area, including on activation.
         WM_NCPAINT if hwnd != state.viewport.get() => LRESULT(0),
         WM_NCACTIVATE if hwnd != state.viewport.get() => LRESULT(1),
-        WM_NCHITTEST if hwnd != state.viewport.get() => {
-            caption_hit_test(hwnd, lparam, state.header_height.get())
-        }
+        WM_NCHITTEST if hwnd != state.viewport.get() => caption_hit_test(
+            hwnd,
+            lparam,
+            state.header_height.get(),
+            state.palette_rect.get().right,
+        ),
         // A fixed-size results sheet has no maximize/resize mode, even when
         // invoked through the system menu or a double click on its color field.
         WM_NCLBUTTONDBLCLK if wparam.0 == HTCAPTION as usize => LRESULT(0),
@@ -1907,7 +2173,8 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             // the sender and code before borrowing a typed custom-draw payload.
             unsafe {
                 messages::with_button_custom_draw(hwnd, lparam, |draw| {
-                    draw_caption_button(draw, state.swatch_color)
+                    let color = colorref(state.palette.borrow().current());
+                    draw_caption_button(draw, color)
                         .or_else(|| theme::custom_draw_minimal(&state.theme, draw, COPY_DEFAULT))
                 })
             }
@@ -1922,12 +2189,23 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             // SAFETY: native WM_DRAWITEM is decoded once and validated as our static control.
             unsafe {
                 messages::with_static_draw(hwnd, lparam, 10, |draw| {
-                    draw_swatch(draw, state.swatch_color)
+                    let color = colorref(state.palette.borrow().current());
+                    draw_swatch(draw, colorref(state.original_color), color)
                 })
             }
             // SAFETY: Forward the unchanged native message while its payload remains valid for
             // this callback; the default procedure does not gain Rust-state ownership.
             .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) })
+        }
+        WM_DRAWITEM if (PALETTE_CELL..PALETTE_CELL + ROWS * COLUMNS).contains(&wparam.0) => {
+            // SAFETY: WM_DRAWITEM supplies native synchronous payload storage;
+            // the decoder validates its type, control ID and owning parent.
+            unsafe { palette_ui::draw(hwnd, lparam, state) }.unwrap_or(LRESULT(0))
+        }
+        WM_DRAWITEM if wparam.0 == RESTORE_ORIGINAL => {
+            // SAFETY: This native synchronous owner-draw payload is validated
+            // against the original-color button's type, ID and parent.
+            unsafe { palette_ui::draw_restore(hwnd, lparam, state) }.unwrap_or(LRESULT(0))
         }
         WM_CLOSE => {
             state.queue(|pending| pending.action = Some(ResultAction::Close));
@@ -1939,19 +2217,25 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                     state.queue(|pending| pending.action = Some(ResultAction::Close))
                 }
                 CAPTION_MINIMIZE => state.queue(|pending| pending.minimize = true),
+                RESTORE_ORIGINAL => state.restore_original(),
                 PICK_AGAIN => state.queue(|pending| pending.action = Some(ResultAction::PickAgain)),
                 COPY_DEFAULT => state.queue(|pending| {
                     pending.copy = Some(CopyTarget {
                         format: state.default_format,
                         button_id: COPY_DEFAULT,
-                    })
+                    });
+                    pending.copy_color = Some(state.palette.borrow().current());
                 }),
                 id if (COPY_ROW..COPY_ROW + 4).contains(&id) => state.queue(|pending| {
                     pending.copy = Some(CopyTarget {
                         format: ColorFormat::ALL[id - COPY_ROW],
                         button_id: id,
-                    })
+                    });
+                    pending.copy_color = Some(state.palette.borrow().current());
                 }),
+                id if (PALETTE_CELL..PALETTE_CELL + ROWS * COLUMNS).contains(&id) => {
+                    state.select_palette(id - PALETTE_CELL);
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -2016,6 +2300,17 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
+            // A wheel message may be forwarded by a focused format control. Route
+            // according to the pointer position, never that control's focus or row.
+            let root = if hwnd == state.viewport.get() {
+                // SAFETY: The viewport is this live root's owned child.
+                unsafe { GetParent(hwnd) }.unwrap_or(hwnd)
+            } else {
+                hwnd
+            };
+            if palette_ui::wheel(root, state, wparam, lparam) {
+                return LRESULT(0);
+            }
             let total = state.wheel_remainder.get() + ((wparam.0 >> 16) as u16 as i16) as i32;
             state.wheel_remainder.set(total % 120);
             let current = state
@@ -2056,6 +2351,178 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn control_text(hwnd: HWND) -> String {
+        let mut text = [0_u16; 256];
+        // SAFETY: The test owns the control; the binding bounds writes to this local buffer.
+        let length = unsafe { GetWindowTextW(hwnd, &mut text) } as usize;
+        String::from_utf16_lossy(&text[..length])
+    }
+
+    #[test]
+    fn original_swatch_restores_first_sample_after_repeated_adjustments_and_browsing() {
+        let result = quick_result();
+        result.callback.pending.take();
+        let original = result.picked.rgb;
+        result.callback.select_palette(0);
+        result.process_pending().unwrap();
+        result.callback.select_palette(0);
+        result.process_pending().unwrap();
+        assert_ne!(result.callback.palette.borrow().current(), original);
+        for row in 0..ROWS {
+            result.callback.scroll_palette(row, 180);
+        }
+        result.process_pending().unwrap();
+        let token = next_copy_token().unwrap();
+        let target = target(ColorFormat::Hex, COPY_DEFAULT);
+        let adjusted = result.callback.palette.borrow().current();
+        result.copy.borrow_mut().replace(token, target, adjusted);
+        let request = result.copy.borrow().matching(token).unwrap();
+        result
+            .finish_copy_attempt(request, Err(ClipboardError::Busy))
+            .unwrap();
+        result.show_copy_feedback(target).unwrap();
+        assert_ne!(result.callback.active_timer.get(), 0);
+        assert_ne!(result.callback.feedback_timer.get(), 0);
+
+        // Exercise the actual native left-preview button without system input
+        // or clipboard writes, rather than calling the model reset directly.
+        // SAFETY: BM_CLICK targets this fixture's owned native BUTTON synchronously.
+        unsafe { SendMessageW(result.controls.restore, BM_CLICK, None, None) };
+        result.process_pending().unwrap();
+        assert_eq!(result.picked.rgb, original);
+        assert_eq!(result.callback.palette.borrow().current(), original);
+        assert_eq!(result.callback.palette.borrow().offsets(), [0; ROWS]);
+        assert_eq!(result.callback.palette_wheel_remainders.get(), [0; ROWS]);
+        assert_eq!(result.callback.palette_selected.get(), None);
+        assert_eq!(result.callback.palette_hover.get(), None);
+        assert_eq!(
+            result.callback.palette.borrow().candidates(),
+            Palette::new(original).candidates()
+        );
+        for (row, format) in result.controls.rows.iter().zip(ColorFormat::ALL) {
+            assert_eq!(control_text(row.edit), format_color(original, format));
+        }
+        assert!(result.copy.borrow().0.is_none());
+        assert!(result.callback.pending.get().copy.is_none());
+        assert_eq!(result.callback.active_timer.get(), 0);
+        assert_eq!(result.callback.feedback_timer.get(), 0);
+    }
+
+    #[test]
+    fn palette_wheel_browses_only_hovered_row_and_click_rebases_values_without_copying() {
+        let result = quick_result();
+        result.callback.pending.take();
+        let initial = *result.callback.palette.borrow().candidates();
+        let values = result.controls.rows.map(|row| control_text(row.edit));
+        let color = result.picked.rgb;
+        let cells = result.callback.palette_rect.get();
+        let mut point = POINT {
+            x: cells.right / 2,
+            y: cells.top + 2,
+        };
+        // SAFETY: The fixture retains its root and provides a writable local POINT.
+        unsafe { ClientToScreen(result.hwnd, &mut point) }
+            .ok()
+            .unwrap();
+        let position = LPARAM(((point.y as u16 as u32) << 16 | point.x as u16 as u32) as isize);
+        assert!(palette_ui::wheel(
+            result.hwnd,
+            &result.callback,
+            WPARAM(120 << 16),
+            position
+        ));
+        result.process_pending().unwrap();
+        assert_eq!(result.callback.palette.borrow().current(), color);
+        assert_eq!(
+            result.controls.rows.map(|row| control_text(row.edit)),
+            values
+        );
+        assert_eq!(result.callback.scroll_offset.get(), 0);
+        assert_eq!(
+            result.callback.palette.borrow().candidates()[1..],
+            initial[1..]
+        );
+        assert_ne!(result.callback.palette.borrow().candidates()[0], initial[0]);
+        assert!(result.copy.borrow().0.is_none());
+
+        // Each row owns its partial wheel delta: moving between rows must not
+        // turn two half-notch messages on different rows into one full step.
+        let offsets = result.callback.palette.borrow().offsets();
+        result.callback.scroll_palette(0, 60);
+        result.callback.scroll_palette(1, 60);
+        assert_eq!(result.callback.palette.borrow().offsets(), offsets);
+
+        let chosen = result.callback.palette.borrow().candidate(0, 0).unwrap();
+        result.callback.select_palette(0);
+        result.process_pending().unwrap();
+        assert_eq!(result.picked.rgb, color);
+        assert_eq!(result.callback.palette.borrow().current(), chosen);
+        for row in result.callback.palette.borrow().candidates() {
+            assert_eq!(row[CENTER], chosen);
+        }
+        for (row, format) in result.controls.rows.iter().zip(ColorFormat::ALL) {
+            assert_eq!(control_text(row.edit), format_color(chosen, format));
+        }
+        assert_eq!(result.callback.palette_selected.get(), Some(CENTER));
+        assert!(result.copy.borrow().0.is_none());
+        assert_eq!(result.callback.feedback_timer.get(), 0);
+    }
+
+    #[test]
+    fn palette_selection_cancels_old_copy_retry_and_copy_intentions_snapshot_adjusted_rgb() {
+        let result = quick_result();
+        result.callback.pending.take();
+        let copy_target = target(ColorFormat::Hex, COPY_DEFAULT);
+        let token = next_copy_token().unwrap();
+        result
+            .copy
+            .borrow_mut()
+            .replace(token, copy_target, result.picked.rgb);
+        let request = result.copy.borrow().matching(token).unwrap();
+        result
+            .finish_copy_attempt(request, Err(ClipboardError::Busy))
+            .unwrap();
+        let old_timer = result.callback.active_timer.get();
+        assert_ne!(old_timer, 0);
+        result.callback.select_palette(0);
+        result.process_pending().unwrap();
+        assert!(result.copy.borrow().0.is_none());
+        assert_eq!(result.callback.active_timer.get(), 0);
+        // SAFETY: The fixture root receives only a scalar stale timer ID. No system
+        // input or clipboard operation occurs because selection canceled that request.
+        unsafe { SendMessageW(result.hwnd, WM_TIMER, Some(WPARAM(old_timer)), None) };
+        result.process_pending().unwrap();
+        assert!(result.copy.borrow().0.is_none());
+
+        let adjusted = result.callback.palette.borrow().current();
+        assert_ne!(adjusted, result.picked.rgb);
+        // Inspect the queued copy intention, without dispatching an actual clipboard write.
+        // SAFETY: Native scalar-only button notification with this owned button as sender.
+        unsafe {
+            SendMessageW(
+                result.hwnd,
+                WM_COMMAND,
+                Some(WPARAM(COPY_DEFAULT)),
+                Some(LPARAM(result.controls.default_copy.0 as isize)),
+            );
+        }
+        let pending = result.callback.pending.take();
+        assert_eq!(pending.copy_color, Some(adjusted));
+        result
+            .copy
+            .borrow_mut()
+            .replace(token + 1, copy_target, adjusted);
+        result
+            .callback
+            .palette
+            .borrow_mut()
+            .reset(result.picked.rgb);
+        assert_eq!(
+            result.copy.borrow().matching(token + 1).unwrap().color,
+            adjusted
+        );
+    }
 
     #[test]
     fn minimized_result_defer_broadcast_geometry_but_keep_feedback_and_restore_layout() {
@@ -2114,6 +2581,7 @@ mod tests {
                     CopyRequest {
                         token: next_copy_token().unwrap(),
                         target,
+                        color: result.picked.rgb,
                         retries_left: MAX_RETRIES,
                     },
                     Ok(()),
@@ -2448,7 +2916,11 @@ mod tests {
     #[test]
     fn clipboard_contention_has_three_retries_and_then_goes_idle() {
         let mut copy = CopyState::default();
-        copy.replace(1, target(ColorFormat::Hex, COPY_DEFAULT));
+        copy.replace(
+            1,
+            target(ColorFormat::Hex, COPY_DEFAULT),
+            Rgb8::new(1, 2, 3),
+        );
         for _ in 0..3 {
             assert!(copy.reserve_retry(1));
         }
@@ -2459,9 +2931,17 @@ mod tests {
     #[test]
     fn replacing_or_canceling_copy_rejects_queued_old_timer() {
         let mut copy = CopyState::default();
-        copy.replace(1, target(ColorFormat::Hex, COPY_DEFAULT));
+        copy.replace(
+            1,
+            target(ColorFormat::Hex, COPY_DEFAULT),
+            Rgb8::new(1, 2, 3),
+        );
         assert!(copy.reserve_retry(1));
-        copy.replace(2, target(ColorFormat::Hsl, COPY_ROW + 3));
+        copy.replace(
+            2,
+            target(ColorFormat::Hsl, COPY_ROW + 3),
+            Rgb8::new(4, 5, 6),
+        );
         assert!(copy.matching(1).is_none());
         assert!(!copy.reserve_retry(1));
         assert_eq!(copy.matching(2).unwrap().retries_left, 3);
@@ -2500,7 +2980,10 @@ mod tests {
         let target = result.callback.pending.take().copy.unwrap();
         assert_eq!(target.format, ColorFormat::CssRgb);
         let token = next_copy_token().unwrap();
-        result.copy.borrow_mut().replace(token, target);
+        result
+            .copy
+            .borrow_mut()
+            .replace(token, target, result.picked.rgb);
         result.copy.borrow().matching(token).unwrap()
     }
 
@@ -2527,10 +3010,11 @@ mod tests {
         // this scalar query neither activates nor changes that window.
         assert!(unsafe { IsWindowVisible(result.hwnd) }.as_bool());
         let token = next_copy_token().unwrap();
-        result
-            .copy
-            .borrow_mut()
-            .replace(token, target(ColorFormat::CssRgb, COPY_DEFAULT));
+        result.copy.borrow_mut().replace(
+            token,
+            target(ColorFormat::CssRgb, COPY_DEFAULT),
+            result.picked.rgb,
+        );
         let request = result.copy.borrow().matching(token).unwrap();
         result.finish_copy_attempt(request, Ok(())).unwrap();
         // SAFETY: The test retains the owning result/control tree while querying visibility;
@@ -2724,7 +3208,7 @@ mod tests {
             String::from_utf16_lossy(&text[..length])
         };
         assert_eq!(text(result.hwnd), "Picked color — Color Picker");
-        assert_eq!(text(result.controls.swatch), "Selected color swatch");
+        assert_eq!(text(result.controls.swatch), "Original and adjusted colors");
         assert_eq!(text(result.controls.source), "Frozen screen  ·  X 0  Y 0");
         assert_eq!(text(result.controls.pick_again), "Pick again");
         assert_eq!(text(result.controls.close), "Close");
