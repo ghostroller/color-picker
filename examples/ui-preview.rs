@@ -8,6 +8,7 @@
 //! --border=N / --transparency=N override appearance for this fixture only.
 //! --language=en / --language=zh-CN select the interface language without saving.
 //! --output=path.bmp exports this fixture's client area, then exits.
+//! --settings-size=500x320 forces a short settings viewport, in DIP, for scrolling QA.
 //! frozen-edge uses a focus near the work area's top-left corner.
 
 #[cfg(not(windows))]
@@ -46,7 +47,10 @@ mod fixture {
             Foundation::{COLORREF, E_FAIL, HWND, LPARAM, LRESULT, RECT, WPARAM},
             Graphics::{Dwm::DwmFlush, Gdi::*},
             System::LibraryLoader::GetModuleHandleW,
-            UI::{HiDpi::GetDpiForWindow, WindowsAndMessaging::*},
+            UI::{
+                HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
+                WindowsAndMessaging::*,
+            },
         },
         core::{BOOL, Error, Result, w},
     };
@@ -262,6 +266,49 @@ mod fixture {
                 ));
             }
         };
+        if let Some(size) =
+            std::env::args().find_map(|arg| arg.strip_prefix("--settings-size=").map(str::to_owned))
+        {
+            let dimensions = size.split_once('x').and_then(|(width, height)| {
+                Some((width.parse::<i32>().ok()?, height.parse::<i32>().ok()?))
+            });
+            let Some((width, height)) = dimensions.filter(|(width, height)| {
+                mode == "settings" && (280..=1200).contains(width) && (212..=1400).contains(height)
+            }) else {
+                return Err(Error::new(
+                    windows::Win32::Foundation::E_INVALIDARG,
+                    "--settings-size requires settings mode and WIDTHxHEIGHT in DIP (280–1200 by 212–1400)",
+                ));
+            };
+            // SAFETY: Only the fixture's own settings root is resized. These scalar style,
+            // DPI and RECT queries retain no references; the ordinary loop processes WM_SIZE.
+            unsafe {
+                let hwnd = scene.hwnd();
+                let dpi = GetDpiForWindow(hwnd);
+                let px = |dip: i32| ((i64::from(dip) * i64::from(dpi) + 48) / 96) as i32;
+                let mut bounds = RECT {
+                    right: px(width),
+                    bottom: px(height),
+                    ..Default::default()
+                };
+                AdjustWindowRectExForDpi(
+                    &mut bounds,
+                    WINDOW_STYLE(GetWindowLongW(hwnd, GWL_STYLE) as u32),
+                    false,
+                    WINDOW_EX_STYLE(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32),
+                    dpi,
+                )?;
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    bounds.right - bounds.left,
+                    bounds.bottom - bounds.top,
+                    SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
+                )?;
+            }
+        }
         scene.process()?;
         // SAFETY: Only this live fixture HWND is synchronously rendered into its owned
         // DIB; GdiFlush completes GDI access before CPU reads.

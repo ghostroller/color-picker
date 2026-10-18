@@ -34,12 +34,13 @@ use windows::{
         UI::WindowsAndMessaging::{
             BM_CLICK, BM_SETCHECK, CB_GETCOUNT, CB_SETCURSEL, CreateWindowExW, DestroyWindow,
             ES_READONLY, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetDlgItem, GetNextDlgTabItem,
-            GetWindowLongW, GetWindowRect, GetWindowTextW, HTCAPTION, HTCLIENT, IsDialogMessageW,
-            IsIconic, IsWindow, IsWindowVisible, MSG, SB_BOTTOM, SB_TOP, SW_RESTORE,
-            SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
-            WM_CLOSE, WM_COMMAND, WM_GETDLGCODE, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_NCHITTEST,
-            WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_VSCROLL, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
-            WS_OVERLAPPED, WS_TABSTOP,
+            GetScrollInfo, GetWindowLongW, GetWindowRect, GetWindowTextW, HTCAPTION, HTCLIENT,
+            IsDialogMessageW, IsIconic, IsWindow, IsWindowVisible, MSG, SB_BOTTOM, SB_TOP, SB_VERT,
+            SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER,
+            SendMessageW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND,
+            WM_GETDLGCODE, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_NCHITTEST, WM_SYSKEYDOWN,
+            WM_SYSKEYUP, WM_USER, WM_VSCROLL, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_OVERLAPPED,
+            WS_TABSTOP,
         },
     },
     core::w,
@@ -311,7 +312,10 @@ fn cached_selection_and_native_result_controls_smoke() {
     let settings_hwnd = settings.hwnd();
     // SAFETY: The parent belongs to this test-owned live window tree; the returned child
     // handle is borrowed only while its owner survives.
-    let settings_content = unsafe { GetDlgItem(Some(settings_hwnd), 200) }.unwrap();
+    let settings_viewport = unsafe { GetDlgItem(Some(settings_hwnd), 200) }.unwrap();
+    // SAFETY: The fixture retains the viewport and its owned scrolling document
+    // while these child handles are borrowed.
+    let settings_content = unsafe { GetDlgItem(Some(settings_viewport), 201) }.unwrap();
     assert_eq!(settings.process_pending().unwrap(), None);
     // SAFETY: The parent belongs to this test-owned live window tree; the returned child
     // handle is borrowed only while its owner survives.
@@ -436,7 +440,7 @@ fn cached_selection_and_native_result_controls_smoke() {
     // SAFETY: The fixture window remains alive on this thread and each RECT output is valid
     // writable stack storage.
     unsafe {
-        GetWindowRect(settings_content, &mut viewport_bounds).unwrap();
+        GetWindowRect(settings_viewport, &mut viewport_bounds).unwrap();
         GetWindowRect(apply, &mut footer_before).unwrap();
     }
     for id in [110, 101, 102, 103, 104, 105, 106, 107, 108, 109] {
@@ -468,7 +472,7 @@ fn cached_selection_and_native_result_controls_smoke() {
     // are scalar and the calls complete before owner teardown.
     unsafe {
         SendMessageW(
-            settings_content,
+            settings_viewport,
             WM_VSCROLL,
             Some(WPARAM(SB_BOTTOM.0 as usize)),
             None,
@@ -536,7 +540,7 @@ fn cached_selection_and_native_result_controls_smoke() {
     // are scalar and the calls complete before owner teardown.
     unsafe {
         SendMessageW(
-            settings_content,
+            settings_viewport,
             WM_VSCROLL,
             Some(WPARAM(SB_TOP.0 as usize)),
             None,
@@ -664,17 +668,21 @@ fn cached_selection_and_native_result_controls_smoke() {
     // are scalar and the calls complete before owner teardown.
     unsafe {
         SendMessageW(
-            settings_content,
+            settings_viewport,
             WM_VSCROLL,
             Some(WPARAM(SB_BOTTOM.0 as usize)),
             None,
         );
     }
     settings.process_pending().unwrap();
-    let mut before_language_switch = RECT::default();
-    // SAFETY: The fixture window remains alive on this thread and each RECT output is valid
-    // writable stack storage.
-    unsafe { GetWindowRect(border, &mut before_language_switch).unwrap() };
+    let mut before_language_switch = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_POS,
+        ..Default::default()
+    };
+    // SAFETY: The test-owned viewport writes a correctly sized scroll output.
+    unsafe { GetScrollInfo(settings_viewport, SB_VERT, &mut before_language_switch).unwrap() };
+    assert!(before_language_switch.nPos > 0);
     i18n::set_language(Language::English);
     settings.refresh_language().unwrap();
     assert_eq!(window_text(settings_hwnd), "Settings — Color Picker");
@@ -687,11 +695,23 @@ fn cached_selection_and_native_result_controls_smoke() {
         "Preferences"
     );
     assert!(window_text(appearance_preview).contains("border 3 DIP, transparency 80%"));
-    let mut after_language_switch = RECT::default();
-    // SAFETY: The fixture window remains alive on this thread and each RECT output is valid
-    // writable stack storage.
-    unsafe { GetWindowRect(border, &mut after_language_switch).unwrap() };
-    assert_eq!(before_language_switch, after_language_switch);
+    let mut after_language_switch = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+        ..Default::default()
+    };
+    // SAFETY: The test-owned viewport writes a correctly sized scroll output.
+    unsafe { GetScrollInfo(settings_viewport, SB_VERT, &mut after_language_switch).unwrap() };
+    let new_maximum = (after_language_switch.nMax - after_language_switch.nPage as i32 + 1)
+        .max(after_language_switch.nMin);
+    assert_eq!(
+        after_language_switch.nPos,
+        before_language_switch
+            .nPos
+            .clamp(after_language_switch.nMin, new_maximum),
+        "language changes preserve native scrolling, clamping only if the measured document shrinks"
+    );
+    assert!(after_language_switch.nPos > 0);
     // SAFETY: These messages target live controls in this test-owned tree; control values
     // are scalar and the calls complete before owner teardown.
     unsafe { SendMessageW(settings_hwnd, WM_COMMAND, Some(WPARAM(1)), None) };
@@ -716,7 +736,7 @@ fn cached_selection_and_native_result_controls_smoke() {
     // are scalar and the calls complete before owner teardown.
     unsafe {
         SendMessageW(
-            settings_content,
+            settings_viewport,
             WM_VSCROLL,
             Some(WPARAM(SB_TOP.0 as usize)),
             None,

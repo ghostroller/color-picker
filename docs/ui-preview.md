@@ -15,6 +15,9 @@ Windows 10 不支持的圆角 / 边框颜色属性按可选项处理。
 不显示输入光标。标签保持在字段外，色值与复制按钮共享浅灰底色，用留白区分行；
 窄窗口将标签放在字段上方。不显示横纵网格线；无滚动条时列表保持左右等边距。
 设置继续使用浅灰背景、白色卡片与蓝色主操作。
+语言、快捷键、复制行为和取色外观分成四张卡片；语言、主键与格式共用编辑器列，
+空间不足时改为上下排列。滑块标题与数值同行，轨道放在下一行。
+说明与复选框按实际控件字体测量换行，下拉框按实际收起高度居中。
 设置页按内容区实际宽度保持左右等边距，仅需要滚动时占用原生滚动条空间；
 语言标签与下拉框按实际控件高度居中对齐。底部简短提示使用不可选中的静态文字，
 长诊断信息仍可通过滚动详情完整阅读。
@@ -46,6 +49,10 @@ Windows 10 不支持的圆角 / 边框颜色属性按可选项处理。
 0 DIP 隐藏边框，0% 使用不透明背景。滑动只修改草稿；“应用”成功后下次取色生效并在重启后保留，
 关闭会放弃未应用更改。设置窗口高度按显示器工作区限制，内容支持滚动和 Tab 自动定位，
 底部状态、关闭和应用按钮固定可见。
+滚动区域分成固定视口和整块内容窗口，控件、卡片背景共享内容坐标；
+滚轮或拖动滚动条只移动内容窗口，不重排控件、重设字体或重建预览。
+原生滚动条跟踪在窗口回调中同步更新，不依赖退出 Windows 内部拖动消息循环后才处理。
+视口使用后代双缓冲，布局时批量调整控件，再使完整子树失效。
 旧配置缺少外观字段时使用默认值，无需手动修改配置文件。
 
 实时浮窗默认 168×38 DIP，左侧色块贴边铺满高度，HEX / 坐标使用 13 / 10 DIP 字号。
@@ -119,6 +126,7 @@ Windows 10 不支持的圆角 / 边框颜色属性按可选项处理。
 cargo run --release --example ui-preview -- result
 cargo run --release --example ui-preview -- settings
 cargo run --release --example ui-preview -- settings --language=en
+cargo run --release --example ui-preview -- settings 600 --settings-size=500x320
 cargo run --release --example ui-preview -- result --language=zh-CN
 cargo run --release --example ui-preview -- live
 cargo run --release --example ui-preview -- frozen
@@ -135,6 +143,44 @@ cargo run --example ui-preview -- result --color=F4F2F2 --output=target/result-p
 `--backdrop` 会显示一个合成棋盘背景，方便检查磨砂；下方取色浮窗截图使用此背景。
 `--output=<文件.bmp>` 将预览窗口自身绘制到位图后退出，便于复查布局和更新文档图片；
 该导出不读取其他窗口，也不新增图像库依赖。`--border=0` / `--border=6` 可检查边框极值。
+`--settings-size=宽x高` 仅调整设置预览的客户区 DIP 大小，用于强制内容溢出；
+不会改变正式程序的默认窗口尺寸或用户配置。
+
+### 连续滚动验证
+
+2026-10-18 先保留旧排版，把测试窗口压到 500×320 DIP，确认旧内容也必然需要滚动。
+默认桌面回归发送测试窗口内部的连续滚轮消息，独立线程同时以单次屏幕 BitBlt 采样；
+录制期间不调用 PrintWindow、强制重画或 DwmFlush。
+每帧必须对应预先建立的完整内容图的一段，允许显示上一位置的完整帧，拒绝背景与控件混合的位置。
+同时检查 28 个控件的内容坐标、字体及窗口位置消息保持不变。
+旧排版自动检查全宽通过；真实原生滚动条拖动录制 2,059 帧、14 个位置，
+8 次 thumb tracking 回调内得到 4 个不同位置，检查范围内无坏帧。
+恢复新排版后，Release 全宽回归连续往返滚动 128 次，采样 159 帧、
+126 次实际画面位置变化、9 个画面位置，无坏帧。
+用户慢速往返拖动并确认目视无原先异常；连续采样 2,448 帧，检查范围内无坏帧。
+其中 710 帧处于 USER32 原生拖动循环内，实际画面变化 572 次、覆盖 239 个位置，
+确认内容会在按住滑块拖动期间持续更新。该手动录制明确排除右侧 180 物理像素的指针反馈区域。
+完整验证脚本（含 176 项默认测试、Clippy、Release 与嵌入 DPI 清单）通过；
+本机 175% 的中英宽窄原生控件检查，与其他 DPI 的离屏实际字体检查分别通过。
+
+真实输入工具的蓝色指针光晕会进入屏幕采样，窗口激活也会改变原生复选框的颜色。
+因此手动录制先提供激活准备时间，并可明确裁掉右侧指针反馈区域；
+该范围记录在报告中，不等同于全宽检查。默认自动回归始终检查全宽。
+这些记录验证本机采样到的连续画面，不替代其他 Windows 版本及显示器的体验检查。
+
+```powershell
+# 全宽自动回归：测试内部滚轮消息，真实屏幕连续采样。
+cargo test --test windows_settings_scroll --locked -- --ignored --test-threads=1 --nocapture
+
+# 真实鼠标拖动：ARM_READY 后激活，RECORD_READY 后拖动原生滚动条。
+$env:COLOR_PICKER_SCROLL_ARM_MS = '30000'
+$env:COLOR_PICKER_SCROLL_RECORD_MS = '60000'
+$env:COLOR_PICKER_SCROLL_POINTER_MARGIN_PX = '180'
+$env:COLOR_PICKER_SCROLL_CAPTURE_DIR = 'target/scroll-recordings'
+cargo test --test windows_settings_scroll --locked -- --ignored --test-threads=1 --nocapture
+```
+
+录制结束生成逐帧 CSV、BMP、HTML 联系表及带检查范围的统计 JSON。
 
 ### 取色结果
 

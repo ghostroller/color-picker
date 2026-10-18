@@ -58,7 +58,9 @@ fn language_choices_are_visible_on_the_first_open_after_applying() {
     settings.process_pending().unwrap();
     // SAFETY: The parent belongs to this test-owned live window tree; the returned child
     // handle is borrowed only while its owner survives.
-    let content = unsafe { GetDlgItem(Some(settings.hwnd()), 200) }.unwrap();
+    let viewport = unsafe { GetDlgItem(Some(settings.hwnd()), 200) }.unwrap();
+    // SAFETY: The root retains both container levels and their native children.
+    let content = unsafe { GetDlgItem(Some(viewport), 201) }.unwrap();
     // SAFETY: The parent belongs to this test-owned live window tree; the returned child
     // handle is borrowed only while its owner survives.
     let combo = unsafe { GetDlgItem(Some(content), 110) }.unwrap();

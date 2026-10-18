@@ -56,7 +56,10 @@ fn unchanged_language_refresh_preserves_fonts_and_leaves_content_untouched() {
     settings.process_pending().unwrap();
     // SAFETY: The parent belongs to this test-owned live window tree; the returned child
     // handle is borrowed only while its owner survives.
-    let content = unsafe { GetDlgItem(Some(settings.hwnd()), 200) }.unwrap();
+    let viewport = unsafe { GetDlgItem(Some(settings.hwnd()), 200) }.unwrap();
+    // SAFETY: The fixture retains the viewport and its owned scrolling document
+    // while these child handles are borrowed.
+    let content = unsafe { GetDlgItem(Some(viewport), 201) }.unwrap();
     // SAFETY: The parent belongs to this test-owned live window tree; the returned child
     // handle is borrowed only while its owner survives.
     let title = unsafe { GetDlgItem(Some(content), 15) }.unwrap();

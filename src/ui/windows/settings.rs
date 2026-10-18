@@ -25,7 +25,7 @@ use windows::{
         },
         System::{
             LibraryLoader::GetModuleHandleW,
-            SystemServices::{SS_CENTERIMAGE, SS_NOPREFIX, SS_OWNERDRAW},
+            SystemServices::{SS_CENTERIMAGE, SS_NOPREFIX, SS_OWNERDRAW, SS_RIGHT},
         },
         UI::{
             Controls::{
@@ -66,8 +66,10 @@ use settings_preview::AppearancePreview;
 
 pub const WM_SETTINGS_WAKE: u32 = WM_APP + 12;
 const CLASS: PCWSTR = w!("ColorPicker.Settings.v1");
+const VIEWPORT_CLASS: PCWSTR = w!("ColorPicker.SettingsViewport.v1");
 const CONTENT_CLASS: PCWSTR = w!("ColorPicker.SettingsContent.v1");
 const CONTENT: usize = 200;
+const FORM: usize = 201;
 const APPLY: usize = 1;
 const CLOSE: usize = 2;
 const CTRL: usize = 101;
@@ -121,7 +123,6 @@ struct Pending {
     capture: bool,
     focus_key: bool,
     appearance: bool,
-    scroll: Option<i32>,
     reveal: Option<HWND>,
     fit_work_area: bool,
     copy_behavior: bool,
@@ -150,16 +151,62 @@ struct CallbackState {
     recording: Cell<bool>,
     capture_hint: Cell<CaptureHint>,
     suppressed_keys: Cell<[u64; 4]>,
+    root: Cell<HWND>,
     viewport: Cell<HWND>,
+    content: Cell<HWND>,
     scroll_offset: Cell<i32>,
     viewport_height: Cell<i32>,
     content_height: Cell<i32>,
-    content_width_dip: Cell<i32>,
+    content_panels: RefCell<Vec<RECT>>,
     wheel_remainder: Cell<i32>,
     preview: RefCell<Option<AppearancePreview>>,
 }
 
 impl CallbackState {
+    /// Pure scrolling never remeasures or moves individual controls. Run synchronously
+    /// so native scrollbar tracking also works inside USER32's modal tracking loop.
+    fn scroll_to(&self, offset: i32) -> Result<()> {
+        let offset = offset.clamp(
+            0,
+            (self.content_height.get() - self.viewport_height.get()).max(0),
+        );
+        if self.scroll_offset.get() == offset {
+            return Ok(());
+        }
+        // SAFETY: The root retains this content HWND and its callback on this UI thread.
+        // Its children retain stable content-local coordinates; no Rust borrow spans dispatch.
+        unsafe {
+            SetWindowPos(
+                self.content.get(),
+                None,
+                0,
+                -offset,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+            )?;
+        }
+        self.scroll_offset.set(offset);
+        let info = SCROLLINFO {
+            cbSize: size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_POS,
+            nPos: offset,
+            ..Default::default()
+        };
+        // SAFETY: This owned viewport's range was established by layout. USER32 copies
+        // the scalar scroll state and paints the clipped, composited content subtree.
+        unsafe {
+            SetScrollInfo(self.viewport.get(), SB_VERT, &info, true);
+            let _ = RedrawWindow(
+                Some(self.viewport.get()),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+            );
+        }
+        Ok(())
+    }
+
     fn defer(&self, update: impl FnOnce(&mut Pending)) {
         let mut pending = self.pending.get();
         update(&mut pending);
@@ -352,7 +399,7 @@ impl SettingsWindow {
             lpszClassName: CLASS,
             ..Default::default()
         };
-        for name in [CLASS, CONTENT_CLASS] {
+        for name in [CLASS, VIEWPORT_CLASS, CONTENT_CLASS] {
             let class = WNDCLASSW {
                 lpszClassName: name,
                 ..class
@@ -381,11 +428,13 @@ impl SettingsWindow {
             recording: Cell::new(false),
             capture_hint: Cell::new(CaptureHint::Ready),
             suppressed_keys: Cell::new([0; 4]),
+            root: Cell::new(HWND::default()),
             viewport: Cell::new(HWND::default()),
+            content: Cell::new(HWND::default()),
             scroll_offset: Cell::new(0),
             viewport_height: Cell::new(0),
             content_height: Cell::new(0),
-            content_width_dip: Cell::new(480),
+            content_panels: RefCell::new(Vec::new()),
             wheel_remainder: Cell::new(0),
             preview: RefCell::new(None),
         });
@@ -418,6 +467,7 @@ impl SettingsWindow {
             })
         };
         let hwnd = callback.lifetime.creation_result("settings", hwnd)?;
+        callback.root.set(hwnd);
         let mut window = Self {
             hwnd,
             callback,
@@ -450,8 +500,8 @@ impl SettingsWindow {
         let viewport = unsafe {
             super::window_lifetime::create_window(|| {
                 CreateWindowExW(
-                    WS_EX_CONTROLPARENT,
-                    CONTENT_CLASS,
+                    WS_EX_CONTROLPARENT | WS_EX_COMPOSITED,
+                    VIEWPORT_CLASS,
                     PCWSTR(wide(tr("设置内容", "Settings content")).as_ptr()),
                     WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL,
                     0,
@@ -466,6 +516,27 @@ impl SettingsWindow {
             })?
         };
         window.callback.viewport.set(viewport);
+        // SAFETY: The root owns both container levels. The same stable callback allocation
+        // is retained through descendant destruction; WindowInit is copied synchronously.
+        let content = unsafe {
+            super::window_lifetime::create_window(|| {
+                CreateWindowExW(
+                    WS_EX_CONTROLPARENT,
+                    CONTENT_CLASS,
+                    PCWSTR(wide(tr("设置表单", "Settings form")).as_ptr()),
+                    WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                    0,
+                    0,
+                    1,
+                    1,
+                    Some(viewport),
+                    Some(HMENU(FORM as *mut _)),
+                    Some(instance),
+                    Some((&init as *const WindowInit).cast()),
+                )
+            })?
+        };
+        window.callback.content.set(content);
         window.create_controls(config)?;
         window.place_initially(cursor)?;
         window.refresh_language()?;
@@ -530,6 +601,7 @@ impl SettingsWindow {
                 self.callback.viewport.get(),
                 tr("设置内容", "Settings content"),
             ),
+            (self.callback.content.get(), tr("设置表单", "Settings form")),
             (self.controls.title, tr("偏好设置", "Preferences")),
             (
                 self.controls.subtitle,
@@ -686,7 +758,6 @@ impl SettingsWindow {
             self.callback.defer(|deferred| {
                 deferred.fit_work_area |= std::mem::take(&mut pending.fit_work_area) || dpi_changed;
                 deferred.layout |= std::mem::take(&mut pending.layout);
-                deferred.scroll = pending.scroll.take().or(deferred.scroll);
                 deferred.reveal = pending.reveal.take().or(deferred.reveal);
             });
         }
@@ -726,16 +797,11 @@ impl SettingsWindow {
                 )?;
             }
         }
-        if let Some(offset) = pending.scroll {
-            self.callback.scroll_offset.set(offset);
-        }
-        if pending.layout || pending.scroll.is_some() || pending.fit_work_area {
+        if pending.layout || pending.fit_work_area {
             self.layout()?;
-            if pending.scroll.is_none() {
-                // SAFETY: This queries a borrowed HWND from the current UI thread; reveal_control
-                // checks membership in the owned viewport before using its geometry.
-                self.reveal_control(unsafe { GetFocus() })?;
-            }
+            // SAFETY: This queries a borrowed HWND from the current UI thread; reveal_control
+            // checks membership in the owned viewport before using its geometry.
+            self.reveal_control(unsafe { GetFocus() })?;
         }
         if let Some(hwnd) = pending.reveal {
             self.reveal_control(hwnd)?;
@@ -745,6 +811,7 @@ impl SettingsWindow {
         }
         if pending.capture {
             self.update_capture_text()?;
+            self.layout()?;
         }
         if pending.focus_key && self.callback.recording.get() {
             // SAFETY: The window/control belongs to the live UI-thread owner. These synchronous
@@ -848,13 +915,22 @@ impl SettingsWindow {
             self.control(w!("STATIC"), "", APPEARANCE_HEADING, label)?;
         self.controls.border_label = self.control(w!("STATIC"), "", BORDER_LABEL, label)?;
         self.controls.border_width = self.control(TRACKBAR_CLASSW, "", BORDER_WIDTH, slider)?;
-        self.controls.border_value = self.control(w!("STATIC"), "", BORDER_VALUE, label)?;
+        self.controls.border_value = self.control(
+            w!("STATIC"),
+            "",
+            BORDER_VALUE,
+            label | WINDOW_STYLE(SS_RIGHT.0),
+        )?;
         self.controls.transparency_label =
             self.control(w!("STATIC"), "", TRANSPARENCY_LABEL, label)?;
         self.controls.background_transparency =
             self.control(TRACKBAR_CLASSW, "", BACKGROUND_TRANSPARENCY, slider)?;
-        self.controls.transparency_value =
-            self.control(w!("STATIC"), "", TRANSPARENCY_VALUE, label)?;
+        self.controls.transparency_value = self.control(
+            w!("STATIC"),
+            "",
+            TRANSPARENCY_VALUE,
+            label | WINDOW_STYLE(SS_RIGHT.0),
+        )?;
         self.controls.preview_heading = self.control(w!("STATIC"), "", PREVIEW_HEADING, label)?;
         self.controls.preview = self.control(
             w!("STATIC"),
@@ -934,7 +1010,7 @@ impl SettingsWindow {
                     Some(if footer {
                         self.hwnd
                     } else {
-                        self.callback.viewport.get()
+                        self.callback.content.get()
                     }),
                     Some(HMENU(id as *mut _)),
                     Some(GetModuleHandleW(None)?.into()),
@@ -1223,6 +1299,24 @@ impl SettingsWindow {
     }
 
     fn layout(&self) -> Result<()> {
+        let result = self.layout_content();
+        // Native placement can fail after part of a SWP_NOREDRAW batch has been
+        // applied. Always invalidate the complete tree, including error paths,
+        // so suppressed painting never leaves an incomplete frame on screen.
+        // SAFETY: This owner retains the complete window tree on its UI thread;
+        // invalidation borrows no Rust storage and requests painting after return.
+        let _ = unsafe {
+            RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME,
+            )
+        };
+        result
+    }
+
+    fn layout_content(&self) -> Result<()> {
         // refresh_language can request layout outside process_pending, including
         // when an Apply was queued just before minimizing the settings window.
         // SAFETY: this UI-thread owner retains the root throughout this query.
@@ -1331,11 +1425,32 @@ impl SettingsWindow {
         // passed by value and no callback-state RefMut spans synchronous layout reentry.
         unsafe { MoveWindow(viewport, 0, 0, client.right, viewport_height, true)? };
         self.callback.viewport_height.set(viewport_height);
+        for combo in [self.controls.language, self.controls.format] {
+            // SAFETY: These owned COMBOBOX controls synchronously copy scalar item heights.
+            // Set the selection height before measuring and arranging their form rows.
+            unsafe {
+                SendMessageW(
+                    combo,
+                    CB_SETITEMHEIGHT,
+                    Some(WPARAM(usize::MAX)),
+                    Some(LPARAM(dip(24, dpi) as isize)),
+                );
+                SendMessageW(
+                    combo,
+                    CB_SETITEMHEIGHT,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(dip(24, dpi) as isize)),
+                );
+            }
+        }
         // Start at the full width so a previously visible scrollbar cannot keep
         // itself alive through the narrower responsive layout. Reserve space
         // only when content actually needs scrolling, using the native client.
         let full_width = ((i64::from(client.right) * 96) / i64::from(dpi)) as i32;
-        let needs_scroll = dip(settings_content_layout(full_width).height, dpi) > viewport_height;
+        let fields = self.field_metrics(dpi)?;
+        let mut measure = |id, width, wrap| self.measure_text(id, width, wrap, dpi);
+        let full_geometry = settings_content_layout(full_width, fields, &mut measure)?;
+        let needs_scroll = dip(full_geometry.height, dpi) > viewport_height;
         let mut viewport_client = RECT::default();
         // SAFETY: The owner retains the viewport during scrollbar reentry. viewport_client
         // is local writable RECT storage; no callback-state mutable borrow spans calls.
@@ -1344,16 +1459,35 @@ impl SettingsWindow {
             GetClientRect(viewport, &mut viewport_client)?;
         }
         let content_width = ((i64::from(viewport_client.right) * 96) / i64::from(dpi)) as i32;
-        self.callback.content_width_dip.set(content_width);
-        let geometry = settings_content_layout(content_width);
+        let geometry = if content_width == full_width {
+            full_geometry
+        } else {
+            // The native scrollbar removes actual client pixels. Remeasure wrapping
+            // against that width instead of subtracting an assumed scrollbar metric.
+            settings_content_layout(content_width, fields, &mut measure)?
+        };
         let content_height = dip(geometry.height, dpi);
         self.callback.content_height.set(content_height);
+        self.callback.content_panels.replace(geometry.panels);
         let offset = self
             .callback
             .scroll_offset
             .get()
             .clamp(0, (content_height - viewport_height).max(0));
         self.callback.scroll_offset.set(offset);
+        // SAFETY: The form is the viewport's only child; its stable local coordinates
+        // include every control and card. Suppress intermediate painting during layout.
+        unsafe {
+            SetWindowPos(
+                self.callback.content.get(),
+                None,
+                0,
+                -offset,
+                viewport_client.right,
+                content_height.max(viewport_height),
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOCOPYBITS,
+            )?;
+        }
         let scroll = SCROLLINFO {
             cbSize: size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
@@ -1368,28 +1502,42 @@ impl SettingsWindow {
         unsafe {
             SetScrollInfo(viewport, SB_VERT, &scroll, true);
         }
+        let mut positions = Vec::with_capacity(geometry.controls.len());
         for (id, rect) in geometry.controls {
             // SAFETY: The live owner retains the parent and child tree. This query borrows an
             // existing child HWND and transfers no ownership.
-            let control = unsafe { GetDlgItem(Some(viewport), id as i32)? };
+            let control = unsafe { GetDlgItem(Some(self.callback.content.get()), id as i32)? };
             // COMBOBOX uses the requested height for its opened dropdown.
             let height = if matches!(id, LANGUAGE | FORMAT) {
                 160
             } else {
                 rect.bottom - rect.top
             };
-            // SAFETY: The live owner retains these HWNDs on their creating thread. Geometry is
-            // passed by value and no callback-state RefMut spans synchronous layout reentry.
-            unsafe {
-                MoveWindow(
-                    control,
-                    dip(rect.left, dpi),
-                    dip(rect.top, dpi) - offset,
-                    dip(rect.right - rect.left, dpi),
-                    dip(height, dpi),
-                    true,
+            positions.push((
+                control,
+                dip(rect.left, dpi),
+                dip(rect.top, dpi),
+                dip(rect.right - rect.left, dpi),
+                dip(height, dpi),
+            ));
+        }
+        // SAFETY: Every HWND is an owned sibling in the content window. USER32 owns
+        // the batch, discarding it on DeferWindowPos failure; no Rust borrow spans calls.
+        unsafe {
+            let mut batch = BeginDeferWindowPos(positions.len() as i32)?;
+            for (hwnd, x, y, width, height) in positions {
+                batch = DeferWindowPos(
+                    batch,
+                    hwnd,
+                    None,
+                    x,
+                    y,
+                    width,
+                    height,
+                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOCOPYBITS,
                 )?;
             }
+            EndDeferWindowPos(batch)?;
         }
         let footer_top = panes.actions.top + dip(8, dpi);
         let button_width = dip(92, dpi);
@@ -1436,64 +1584,109 @@ impl SettingsWindow {
                 true,
             )?;
         }
-        for combo in [self.controls.language, self.controls.format] {
-            // SAFETY: These are this owner's COMBOBOX controls. Item-height messages use scalar
-            // indices/heights only and no mutable state borrow spans synchronous dispatch.
-            unsafe {
-                SendMessageW(
-                    combo,
-                    CB_SETITEMHEIGHT,
-                    Some(WPARAM(usize::MAX)),
-                    Some(LPARAM(dip(24, dpi) as isize)),
-                );
-                SendMessageW(
-                    combo,
-                    CB_SETITEMHEIGHT,
-                    Some(WPARAM(0)),
-                    Some(LPARAM(dip(24, dpi) as isize)),
-                );
-            }
-        }
-        if content_width >= 460 {
-            // The collapsed height belongs to COMBOBOX (including its native
-            // border), not the dropdown height passed to MoveWindow.
-            let mut combo = RECT::default();
-            let mut label = RECT::default();
-            // SAFETY: Both controls belong to this tree. combo/label are initialized local RECT
-            // outputs and the APIs do not retain pointers after return.
-            unsafe {
-                GetWindowRect(self.controls.language, &mut combo)?;
-                GetWindowRect(self.controls.language_label, &mut label)?;
-            }
-            let mut origin = POINT {
-                x: label.left,
-                y: combo.top,
-            };
-            // SAFETY: The live viewport maps a local POINT; the associated owned label is moved
-            // synchronously after successful conversion, with no state RefMut held.
-            unsafe {
-                if !ScreenToClient(viewport, &mut origin).as_bool() {
-                    return Err(Error::from_thread());
-                }
-                MoveWindow(
-                    self.controls.language_label,
-                    origin.x,
-                    origin.y,
-                    label.right - label.left,
-                    combo.bottom - combo.top,
-                    true,
-                )?;
-            }
-        }
         self.update_status_scrollbar()?;
         self.update_appearance_preview()?;
-        // SAFETY: The owner retains this window on its UI thread; None invalidates its client
-        // area without lending any RECT pointer or triggering immediate drawing here.
-        let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
-        // SAFETY: The owner retains this window on its UI thread; None invalidates its client
-        // area without lending any RECT pointer or triggering immediate drawing here.
-        let _ = unsafe { InvalidateRect(Some(viewport), None, false) };
         Ok(())
+    }
+
+    fn field_metrics(&self, dpi: u32) -> Result<FieldMetrics> {
+        let height = |control: HWND| -> Result<i32> {
+            let mut bounds = RECT::default();
+            // A dropdown-list combo recomputes its collapsed height when USER32
+            // applies the requested dropdown size. CB_SETITEMHEIGHT alone can
+            // therefore report an intermediate height that arranging replaces.
+            // Prepare the same dropdown size used by the final placement before
+            // asking for the native collapsed height; suppress intermediate paint.
+            // SAFETY: This owner retains the native COMBOBOX on its UI thread.
+            // Only value geometry is passed and no Rust borrow spans dispatch.
+            unsafe {
+                SetWindowPos(
+                    control,
+                    None,
+                    0,
+                    0,
+                    dip(180, dpi),
+                    dip(160, dpi),
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS,
+                )?;
+                GetWindowRect(control, &mut bounds)?;
+            }
+            let pixels = (bounds.bottom - bounds.top).max(1);
+            Ok(((i64::from(pixels) * 96 + i64::from(dpi) - 1) / i64::from(dpi)) as i32)
+        };
+        Ok(FieldMetrics {
+            language_height: height(self.controls.language)?,
+            format_height: height(self.controls.format)?,
+        })
+    }
+
+    fn measure_text(&self, id: usize, width: i32, wrap: bool, dpi: u32) -> Result<TextExtent> {
+        // SAFETY: The root owns this content tree and its controls on this UI thread.
+        // The borrowed HWND and its currently assigned font remain live throughout measurement.
+        let control = unsafe { GetDlgItem(Some(self.callback.content.get()), id as i32)? };
+        // SAFETY: This live owned HWND supplies its scalar text length and font handle.
+        let length = unsafe { GetWindowTextLengthW(control) }.max(0) as usize;
+        let mut text = vec![0_u16; length + 1];
+        // SAFETY: The writable UTF-16 slice advertises its full capacity; USER32 retains no pointer.
+        let copied = unsafe { GetWindowTextW(control, &mut text) }.max(0) as usize;
+        text.truncate(copied);
+        // SAFETY: The control is retained by self until after this scoped DC lease ends.
+        let dc = unsafe { WindowDc::new(control)? };
+        // SAFETY: The DC lease and control's assigned font outlive the saved-state guard.
+        let saved = unsafe { SavedDc::new(dc.raw())? };
+        let measured = (|| {
+            // SAFETY: The scalar WM_GETFONT response borrows the live control's assigned font;
+            // SaveDC restores its selection before the DC or any font owner can be released.
+            let font = unsafe { SendMessageW(control, WM_GETFONT, None, None) };
+            if font.0 != 0 {
+                // SAFETY: The control owns the font reference and this method keeps self alive.
+                let previous = unsafe { SelectObject(dc.raw(), HGDIOBJ(font.0 as *mut _)) };
+                if crate::platform::windows::gdi::invalid_selection(previous) {
+                    return Err(Error::new(
+                        E_FAIL,
+                        "Could not select the settings text font",
+                    ));
+                }
+            }
+            let mut metrics = TEXTMETRICW::default();
+            // SAFETY: metrics is initialized writable output for the scoped live window DC.
+            if !unsafe { GetTextMetricsW(dc.raw(), &mut metrics) }.as_bool() {
+                return Err(Error::new(
+                    E_FAIL,
+                    "Could not measure settings text metrics",
+                ));
+            }
+            let mut bounds = RECT {
+                right: dip(width.max(1), dpi),
+                ..Default::default()
+            };
+            if !text.is_empty() {
+                let flags =
+                    DT_CALCRECT | DT_NOPREFIX | if wrap { DT_WORDBREAK } else { DT_SINGLELINE };
+                // SAFETY: DrawText only reads this mutable UTF-16 slice without DT_MODIFYSTRING;
+                // bounds is writable local storage and the selected font remains retained.
+                if unsafe { DrawTextW(dc.raw(), &mut text, &mut bounds, flags) } == 0 {
+                    return Err(Error::new(E_FAIL, "Could not measure settings text"));
+                }
+            }
+            let to_dip = |pixels: i32| {
+                ((i64::from(pixels.max(0)) * 96 + i64::from(dpi) - 1) / i64::from(dpi)) as i32
+            };
+            Ok(TextExtent {
+                width: to_dip(bounds.right - bounds.left),
+                height: to_dip((bounds.bottom - bounds.top).max(metrics.tmHeight)) + 2,
+            })
+        })();
+        if let Err(error) = saved.restore() {
+            // A failed RestoreDC leaves the borrowed font's selection uncertain. Keep every
+            // possible owner alive, including after a later language or DPI replacement.
+            self.font.borrow().retain_fonts();
+            if let Some((_, font)) = self.language_font.borrow().as_ref() {
+                font.retain();
+            }
+            return Err(error);
+        }
+        measured
     }
 
     fn reveal_control(&self, hwnd: HWND) -> Result<()> {
@@ -1521,9 +1714,7 @@ impl SettingsWindow {
             self.callback.content_height.get(),
             dip(8, self.dpi()?),
         );
-        if self.callback.scroll_offset.replace(offset) != offset {
-            self.layout()?;
-        }
+        self.callback.scroll_to(offset)?;
         Ok(())
     }
 
@@ -1607,117 +1798,286 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
+#[derive(Default)]
 struct SettingsContentLayout {
     controls: Vec<(usize, RECT)>,
-    panels: [RECT; 3],
+    panels: Vec<RECT>,
     height: i32,
 }
 
-fn settings_content_layout(width: i32) -> SettingsContentLayout {
-    let rect = |x, y, w, h| RECT {
+#[derive(Clone, Copy)]
+struct TextExtent {
+    width: i32,
+    height: i32,
+}
+
+#[derive(Clone, Copy)]
+struct FieldMetrics {
+    language_height: i32,
+    format_height: i32,
+}
+
+fn content_rect(x: i32, y: i32, width: i32, height: i32) -> RECT {
+    RECT {
         left: x,
         top: y,
-        right: x + w,
-        bottom: y + h,
-    };
-    if width >= 460 {
-        let rows = [
-            (TITLE, 24, 22, 220.min(width - 264), 30),
-            (LANGUAGE_LABEL, width - 228, 22, 72, 28),
-            (LANGUAGE, width - 154, 22, 130, 28),
-            (SUBTITLE, 24, 58, width - 48, 20),
-            (10, 40, 100, width - 80, 24),
-            (CTRL, 40, 128, 88, 26),
-            (ALT, 140, 128, 88, 26),
-            (SHIFT, 240, 128, 100, 26),
-            (11, 40, 171, 48, 24),
-            (KEY, 88, 164, 132, 36),
-            (12, 228, 164, 212, 40),
-            (COPY_HEADING, 40, 244, width - 80, 24),
-            (13, 40, 279, 108, 24),
-            (FORMAT, 156, 272, 180, 28),
-            (QUICK_PICK, 40, 304, width - 80, 26),
-            (AUTO_COPY, 40, 334, width - 80, 26),
-            (APPEARANCE_HEADING, 40, 392, width - 80, 24),
-            (BORDER_LABEL, 40, 427, 112, 24),
-            (BORDER_WIDTH, 156, 420, width - 260, 30),
-            (BORDER_VALUE, width - 92, 427, 56, 24),
-            (TRANSPARENCY_LABEL, 40, 463, 112, 24),
-            (BACKGROUND_TRANSPARENCY, 156, 456, width - 260, 30),
-            (TRANSPARENCY_VALUE, width - 92, 463, 56, 24),
-            (PREVIEW_HEADING, 40, 494, width - 80, 20),
-            (
-                APPEARANCE_PREVIEW,
-                40,
-                518,
-                width - 80,
-                settings_preview::HEIGHT,
-            ),
-            (PREVIEW_HINT, 40, 594, width - 80, 20),
-            (USAGE_HEADING, 24, 640, 64, 20),
-            (USAGE_HINT, 96, 640, width - 120, 40),
-        ];
-        SettingsContentLayout {
-            controls: rows
-                .into_iter()
-                .map(|(id, x, y, w, h)| (id, rect(x, y, w, h)))
-                .collect(),
-            panels: [
-                rect(24, 88, width - 48, 132),
-                rect(24, 232, width - 48, 136),
-                rect(24, 380, width - 48, 248),
-            ],
-            height: 686,
-        }
-    } else {
-        let inner = width - 56;
-        let full = width - 32;
-        let rows = [
-            (TITLE, 16, 22, full, 30),
-            (SUBTITLE, 16, 58, full, 40),
-            (LANGUAGE_LABEL, 16, 104, full, 24),
-            (LANGUAGE, 16, 132, 180.min(full), 28),
-            (10, 28, 188, inner, 24),
-            (CTRL, 28, 220, 76, 26),
-            (ALT, 112, 220, 72, 26),
-            (SHIFT, 28, 252, 100, 26),
-            (11, 28, 288, inner, 24),
-            (KEY, 28, 316, 132, 36),
-            (12, 28, 360, inner, 64),
-            (COPY_HEADING, 28, 460, inner, 24),
-            (13, 28, 492, inner, 24),
-            (FORMAT, 28, 524, 180.min(inner), 28),
-            (QUICK_PICK, 28, 560, inner, 52),
-            (AUTO_COPY, 28, 620, inner, 52),
-            (APPEARANCE_HEADING, 28, 708, inner, 24),
-            (BORDER_LABEL, 28, 740, inner - 68, 24),
-            (BORDER_VALUE, width - 84, 740, 56, 24),
-            (BORDER_WIDTH, 28, 772, inner, 30),
-            (TRANSPARENCY_LABEL, 28, 812, inner - 68, 24),
-            (TRANSPARENCY_VALUE, width - 84, 812, 56, 24),
-            (BACKGROUND_TRANSPARENCY, 28, 844, inner, 30),
-            (PREVIEW_HEADING, 28, 884, inner, 40),
-            (APPEARANCE_PREVIEW, 28, 930, inner, 72),
-            (PREVIEW_HINT, 28, 1010, inner, 40),
-            (USAGE_HEADING, 16, 1076, full, 24),
-            (USAGE_HINT, 16, 1108, full, 88),
-        ];
-        SettingsContentLayout {
-            controls: rows
-                .into_iter()
-                .map(|(id, x, y, w, h)| (id, rect(x, y, w, h)))
-                .collect(),
-            panels: [
-                rect(16, 176, full, 260),
-                rect(16, 448, full, 236),
-                rect(16, 696, full, 366),
-            ],
-            height: 1212,
-        }
+        right: x + width,
+        bottom: y + height,
     }
 }
 
-fn paint_content(hwnd: HWND, offset: i32, width: i32) -> LRESULT {
+/// All rectangles use content-local DIPs. Measuring is injected so tests use real
+/// fonts at each DPI while painting consumes only the completed cached geometry.
+fn settings_content_layout(
+    width: i32,
+    fields: FieldMetrics,
+    measure: &mut impl FnMut(usize, i32, bool) -> Result<TextExtent>,
+) -> Result<SettingsContentLayout> {
+    let margin = if width >= 460 { 24 } else { 16 };
+    let card_width = width - 2 * margin;
+    let left = margin + 16;
+    let inner = card_width - 32;
+    if inner <= 0 {
+        return Err(layout::unavailable());
+    }
+    let editor_width = 180.min(inner);
+    let label_width = [LANGUAGE_LABEL, 11, 13]
+        .into_iter()
+        .map(|id| measure(id, inner, false).map(|text| text.width))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let inline_fields = inner >= label_width + 12 + editor_width;
+    let mut form = SettingsContentLayout::default();
+    let mut y = 22;
+    y += place_text(&mut form, measure, TITLE, margin, y, card_width, 30)?;
+    y += 8;
+    y += place_text(&mut form, measure, SUBTITLE, margin, y, card_width, 18)?;
+    y += 20;
+
+    let top = y;
+    y += 16;
+    y += place_field(
+        &mut form,
+        measure,
+        LANGUAGE_LABEL,
+        LANGUAGE,
+        left,
+        y,
+        inner,
+        editor_width,
+        fields.language_height,
+        inline_fields,
+    )?;
+    y += 16;
+    form.panels
+        .push(content_rect(margin, top, card_width, y - top));
+    y += 12;
+
+    let top = y;
+    y += 16;
+    y += place_text(&mut form, measure, 10, left, y, inner, 22)?;
+    y += 12;
+    let mut check_x = left;
+    let mut check_y = y;
+    let mut check_height = 0;
+    for id in [CTRL, ALT, SHIFT] {
+        let natural = measure(id, inner, false)?;
+        let check_width = (natural.width + 28).min(inner);
+        if check_x > left && check_x + check_width > left + inner {
+            check_y += check_height + 8;
+            check_x = left;
+            check_height = 0;
+        }
+        let height = place_checkbox(&mut form, measure, id, check_x, check_y, check_width)?;
+        check_height = check_height.max(height);
+        check_x += check_width + 20;
+    }
+    y = check_y + check_height + 16;
+    y += place_field(
+        &mut form,
+        measure,
+        11,
+        KEY,
+        left,
+        y,
+        inner,
+        editor_width,
+        32,
+        inline_fields,
+    )?;
+    y += 12;
+    y += place_text(&mut form, measure, 12, left, y, inner, 32)?;
+    y += 16;
+    form.panels
+        .push(content_rect(margin, top, card_width, y - top));
+    y += 12;
+
+    let top = y;
+    y += 16;
+    y += place_text(&mut form, measure, COPY_HEADING, left, y, inner, 22)?;
+    y += 12;
+    y += place_field(
+        &mut form,
+        measure,
+        13,
+        FORMAT,
+        left,
+        y,
+        inner,
+        editor_width,
+        fields.format_height,
+        inline_fields,
+    )?;
+    y += 16;
+    y += place_checkbox(&mut form, measure, QUICK_PICK, left, y, inner)?;
+    y += 12;
+    y += place_checkbox(&mut form, measure, AUTO_COPY, left, y, inner)?;
+    y += 16;
+    form.panels
+        .push(content_rect(margin, top, card_width, y - top));
+    y += 12;
+
+    let top = y;
+    y += 16;
+    y += place_text(&mut form, measure, APPEARANCE_HEADING, left, y, inner, 22)?;
+    y += 16;
+    // Keep enough space for every value in the slider ranges, so changing a
+    // slider never needs to remeasure or rearrange the form.
+    let value_width = 64.min(inner / 2);
+    for (label, value, slider) in [
+        (BORDER_LABEL, BORDER_VALUE, BORDER_WIDTH),
+        (
+            TRANSPARENCY_LABEL,
+            TRANSPARENCY_VALUE,
+            BACKGROUND_TRANSPARENCY,
+        ),
+    ] {
+        let label_width = inner - value_width - 12;
+        let label_height = measure(label, label_width, true)?.height.max(24);
+        let value_height = measure(value, value_width, false)?.height.max(24);
+        let row_height = label_height.max(value_height);
+        form.controls.push((
+            label,
+            content_rect(
+                left,
+                y + (row_height - label_height) / 2,
+                label_width,
+                label_height,
+            ),
+        ));
+        form.controls.push((
+            value,
+            content_rect(
+                left + inner - value_width,
+                y + (row_height - value_height) / 2,
+                value_width,
+                value_height,
+            ),
+        ));
+        y += row_height + 4;
+        form.controls
+            .push((slider, content_rect(left, y, inner, 30)));
+        y += 42;
+    }
+    y += 4;
+    y += place_text(&mut form, measure, PREVIEW_HEADING, left, y, inner, 18)?;
+    y += 8;
+    form.controls.push((
+        APPEARANCE_PREVIEW,
+        content_rect(left, y, inner, settings_preview::HEIGHT),
+    ));
+    y += settings_preview::HEIGHT + 8;
+    y += place_text(&mut form, measure, PREVIEW_HINT, left, y, inner, 18)?;
+    y += 16;
+    form.panels
+        .push(content_rect(margin, top, card_width, y - top));
+    y += 20;
+
+    y += place_text(&mut form, measure, USAGE_HEADING, margin, y, card_width, 18)?;
+    y += 8;
+    y += place_text(&mut form, measure, USAGE_HINT, margin, y, card_width, 32)?;
+    form.height = y + 24;
+    Ok(form)
+}
+
+fn place_text(
+    form: &mut SettingsContentLayout,
+    measure: &mut impl FnMut(usize, i32, bool) -> Result<TextExtent>,
+    id: usize,
+    x: i32,
+    y: i32,
+    width: i32,
+    minimum_height: i32,
+) -> Result<i32> {
+    let height = measure(id, width, true)?.height.max(minimum_height);
+    form.controls.push((id, content_rect(x, y, width, height)));
+    Ok(height)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn place_field(
+    form: &mut SettingsContentLayout,
+    measure: &mut impl FnMut(usize, i32, bool) -> Result<TextExtent>,
+    label: usize,
+    editor: usize,
+    x: i32,
+    y: i32,
+    width: i32,
+    editor_width: i32,
+    editor_height: i32,
+    inline: bool,
+) -> Result<i32> {
+    // COMBOBOX dropdowns receive a separate requested window height in layout;
+    // only their collapsed selection field participates in the row.
+    if inline {
+        let label_width = width - editor_width - 12;
+        let label_height = measure(label, label_width, true)?.height.max(20);
+        let row_height = label_height.max(editor_height).max(32);
+        form.controls.push((
+            label,
+            content_rect(
+                x,
+                y + (row_height - label_height) / 2,
+                label_width,
+                label_height,
+            ),
+        ));
+        form.controls.push((
+            editor,
+            content_rect(
+                x + width - editor_width,
+                y + (row_height - editor_height) / 2,
+                editor_width,
+                editor_height,
+            ),
+        ));
+        Ok(row_height)
+    } else {
+        let label_height = place_text(form, measure, label, x, y, width, 20)?;
+        form.controls.push((
+            editor,
+            content_rect(x, y + label_height + 8, editor_width, editor_height),
+        ));
+        Ok(label_height + 8 + editor_height)
+    }
+}
+
+fn place_checkbox(
+    form: &mut SettingsContentLayout,
+    measure: &mut impl FnMut(usize, i32, bool) -> Result<TextExtent>,
+    id: usize,
+    x: i32,
+    y: i32,
+    width: i32,
+) -> Result<i32> {
+    let height = (measure(id, (width - 24).max(1), true)?.height + 4).max(28);
+    form.controls.push((id, content_rect(x, y, width, height)));
+    Ok(height)
+}
+
+fn paint_content(hwnd: HWND, panels: &[RECT]) -> LRESULT {
     // SAFETY: native WM_PAINT; establish its DC before any mutable state borrow.
     if let Ok(paint) = unsafe { PaintSession::begin(hwnd) } {
         let dc = paint.dc;
@@ -1737,13 +2097,13 @@ fn paint_content(hwnd: HWND, offset: i32, width: i32) -> LRESULT {
                 FillRect(dc, &client, HBRUSH(GetStockObject(DC_BRUSH).0));
                 SetDCBrushColor(dc, COLORREF(0xffffff));
                 SetDCPenColor(dc, COLORREF(0xf0e8e2));
-                for panel in settings_content_layout(width).panels {
+                for panel in panels {
                     let _ = RoundRect(
                         dc,
                         dip(panel.left, dpi),
-                        dip(panel.top, dpi) - offset,
+                        dip(panel.top, dpi),
                         dip(panel.right, dpi),
-                        dip(panel.bottom, dpi) - offset,
+                        dip(panel.bottom, dpi),
                         dip(16, dpi),
                         dip(16, dpi),
                     );
@@ -2074,11 +2434,12 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     };
     match message {
-        WM_PAINT if hwnd == state.viewport.get() => paint_content(
-            hwnd,
-            state.scroll_offset.get(),
-            state.content_width_dip.get(),
-        ),
+        WM_PAINT if hwnd == state.content.get() => {
+            // Snapshot the completed layout before GDI calls; paint never measures
+            // text or changes geometry while the window tree is being scrolled.
+            let panels = state.content_panels.borrow().clone();
+            paint_content(hwnd, &panels)
+        }
         WM_PAINT => state.theme.paint(hwnd, &[]),
         WM_ERASEBKGND => LRESULT(1),
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
@@ -2087,8 +2448,8 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut _)) } as usize;
             let (panel, tone) = match id {
                 TITLE => (false, Tone::Text),
-                SUBTITLE | LANGUAGE_LABEL => (false, Tone::Muted),
-                LANGUAGE => (false, Tone::Text),
+                SUBTITLE => (false, Tone::Muted),
+                LANGUAGE_LABEL | LANGUAGE => (true, Tone::Text),
                 STATUS | STATUS_DETAILS => (false, state.status_tone.get()),
                 10 => (true, Tone::Accent),
                 12 => (
@@ -2176,11 +2537,7 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                 // SAFETY: The current callback or window owner retains this HWND through the scalar
                 // DPI query; no native handle ownership is transferred.
                 let line = dip(28, unsafe { GetDpiForWindow(hwnd) }.max(96));
-                let current = state
-                    .pending
-                    .get()
-                    .scroll
-                    .unwrap_or(state.scroll_offset.get());
+                let current = state.scroll_offset.get();
                 let next = match SCROLLBAR_COMMAND((wparam.0 & 0xffff) as i32) {
                     SB_LINEUP => current - line,
                     SB_LINEDOWN => current + line,
@@ -2191,7 +2548,9 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                     SB_BOTTOM => info.nMax,
                     _ => current,
                 };
-                state.queue(|pending| pending.scroll = Some(next));
+                if let Err(error) = state.scroll_to(next) {
+                    crate::app::diagnostics::event(format_args!("settings.scroll_failed {error}"));
+                }
             }
             LRESULT(0)
         }
@@ -2201,15 +2560,13 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             state.wheel_remainder.set(total % 120);
             let steps = total / 120;
             if steps != 0 {
-                let current = state
-                    .pending
-                    .get()
-                    .scroll
-                    .unwrap_or(state.scroll_offset.get());
+                let current = state.scroll_offset.get();
                 // SAFETY: The current callback or window owner retains this HWND through the scalar
                 // DPI query; no native handle ownership is transferred.
                 let next = current - steps * dip(72, unsafe { GetDpiForWindow(hwnd) }.max(96));
-                state.queue(|pending| pending.scroll = Some(next));
+                if let Err(error) = state.scroll_to(next) {
+                    crate::app::diagnostics::event(format_args!("settings.scroll_failed {error}"));
+                }
             }
             LRESULT(0)
         }
@@ -2219,7 +2576,7 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             // this callback; the default procedure does not gain Rust-state ownership.
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
-        WM_DPICHANGED => {
+        WM_DPICHANGED if hwnd == state.root.get() => {
             // SAFETY: dispatch is handling native WM_DPICHANGED.
             if let Some(rect) = unsafe { messages::dpi_rect(lparam) } {
                 state.queue(|pending| {
@@ -2229,11 +2586,11 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             }
             LRESULT(0)
         }
-        WM_SIZE if hwnd != state.viewport.get() && wparam.0 != SIZE_MINIMIZED as usize => {
+        WM_SIZE if hwnd == state.root.get() && wparam.0 != SIZE_MINIMIZED as usize => {
             state.queue(|pending| pending.layout = true);
             LRESULT(0)
         }
-        WM_DISPLAYCHANGE | WM_SETTINGCHANGE if hwnd != state.viewport.get() => {
+        WM_DISPLAYCHANGE | WM_SETTINGCHANGE if hwnd == state.root.get() => {
             state.queue(|pending| pending.fit_work_area = true);
             LRESULT(0)
         }
@@ -2400,38 +2757,182 @@ mod responsive_layout_tests {
 
     #[test]
     fn settings_content_reflows_without_horizontal_clipping_or_hidden_focus() {
-        for width in [260, 300, 364, 430, 459, 460, 480, 500] {
-            let geometry = settings_content_layout(width);
-            assert_eq!(geometry.controls.len(), 28);
-            for (id, r) in geometry.controls {
-                assert!(
-                    r.left >= 0 && r.right <= width && r.right > r.left,
-                    "{id} at {width}: {r:?}"
-                );
-                assert!(r.top >= 0 && r.bottom <= geometry.height);
-                if matches!(
-                    id,
-                    CTRL | ALT
-                        | SHIFT
-                        | KEY
-                        | FORMAT
-                        | LANGUAGE
-                        | QUICK_PICK
-                        | AUTO_COPY
-                        | BORDER_WIDTH
-                        | BACKGROUND_TRANSPARENCY
-                ) {
-                    let offset = reveal_offset(0, r.top, r.bottom, 80, geometry.height, 8);
-                    assert!(
-                        r.top - offset >= 0 && r.bottom - offset <= 80,
-                        "{id} at {width}"
-                    );
+        // This is a deterministic geometry check; the following test separately
+        // measures actual native fonts for both languages and every supported DPI.
+        for width in [260, 280, 300, 364, 430, 459, 460, 480, 500] {
+            let mut measure = |_: usize, width: i32, _: bool| {
+                Ok(TextExtent {
+                    width: width.min(84),
+                    height: 20,
+                })
+            };
+            let geometry = settings_content_layout(
+                width,
+                FieldMetrics {
+                    language_height: 28,
+                    format_height: 28,
+                },
+                &mut measure,
+            )
+            .unwrap();
+            assert_geometry_fits(&geometry, width);
+        }
+    }
+
+    #[test]
+    fn settings_text_fits_native_fonts_at_each_supported_dpi_and_language() {
+        use super::super::window_lifetime::with_hidden_windows;
+        use crate::app::i18n::set_language;
+        let previous_language = language();
+        with_hidden_windows(|| {
+            for language in [Language::SimplifiedChinese, Language::English] {
+                set_language(language);
+                for dpi in [96, 120, 144, 168, 192, 240, 288] {
+                    let window =
+                        SettingsWindow::new(&Config::default(), HWND::default(), None, true)
+                            .unwrap();
+                    let body = Font::for_language(14, dpi, 400, false, language).unwrap();
+                    let title = Font::for_language(20, dpi, 600, false, language).unwrap();
+                    let heading = Font::for_language(14, dpi, 600, false, language).unwrap();
+                    let small = Font::for_language(12, dpi, 400, false, language).unwrap();
+                    let selector =
+                        Font::for_language(14, dpi, 400, false, Language::SimplifiedChinese)
+                            .unwrap();
+                    for hwnd in window.controls.handles() {
+                        // SAFETY: The owned control is queried synchronously for its scalar ID.
+                        let id = unsafe { GetDlgCtrlID(hwnd) } as usize;
+                        let font = match id {
+                            TITLE => &title,
+                            10 | COPY_HEADING | APPEARANCE_HEADING => &heading,
+                            SUBTITLE | 12 | USAGE_HEADING | USAGE_HINT | STATUS
+                            | STATUS_DETAILS | PREVIEW_HEADING | PREVIEW_HINT => &small,
+                            LANGUAGE => &selector,
+                            _ => &body,
+                        };
+                        // SAFETY: Each local font owner lives until the complete hidden
+                        // window tree is destroyed at the end of this DPI case.
+                        unsafe {
+                            SendMessageW(
+                                hwnd,
+                                WM_SETFONT,
+                                Some(WPARAM(font.raw().0 as usize)),
+                                Some(LPARAM(0)),
+                            );
+                        }
+                    }
+                    // This case measures actual rasterized fonts at the requested
+                    // DPI; it does not change the hidden window's monitor DPI.
+                    // Supply font-sized field slots instead of treating native
+                    // chrome from that monitor as chrome at the requested DPI.
+                    // The interactive integration test checks real collapsed
+                    // COMBOBOX heights and alignment at the monitor's actual DPI.
+                    let fields = FieldMetrics {
+                        language_height: window
+                            .measure_text(LANGUAGE, 180, false, dpi)
+                            .unwrap()
+                            .height
+                            + 6,
+                        format_height: window.measure_text(FORMAT, 180, false, dpi).unwrap().height
+                            + 6,
+                    };
+                    for hint in [
+                        CaptureHint::Ready,
+                        CaptureHint::Listening,
+                        CaptureHint::Invalid,
+                        CaptureHint::Accepted,
+                        CaptureHint::Cancelled,
+                    ] {
+                        window.callback.capture_hint.set(hint);
+                        window.update_capture_text().unwrap();
+                        for width in [260, 280, 300, 364, 430, 459, 460, 480, 500] {
+                            let mut measure =
+                                |id, width, wrap| window.measure_text(id, width, wrap, dpi);
+                            let geometry =
+                                settings_content_layout(width, fields, &mut measure).unwrap();
+                            assert_geometry_fits(&geometry, width);
+                            for &(id, r) in &geometry.controls {
+                                if matches!(
+                                    id,
+                                    APPEARANCE_PREVIEW | BORDER_WIDTH | BACKGROUND_TRANSPARENCY
+                                ) {
+                                    continue;
+                                }
+                                let check =
+                                    matches!(id, CTRL | ALT | SHIFT | QUICK_PICK | AUTO_COPY);
+                                let available = r.right - r.left - if check { 24 } else { 0 };
+                                let wrap = !matches!(
+                                    id,
+                                    KEY | LANGUAGE | FORMAT | BORDER_VALUE | TRANSPARENCY_VALUE
+                                );
+                                let text = window.measure_text(id, available, wrap, dpi).unwrap();
+                                assert!(
+                                    text.height <= r.bottom - r.top,
+                                    "{language:?} at {dpi} DPI, width {width}, control {id}: {} > {}",
+                                    text.height,
+                                    r.bottom - r.top,
+                                );
+                                if !wrap {
+                                    assert!(
+                                        text.width <= available,
+                                        "{language:?} at {dpi} DPI, width {width}, control {id}: {} > {available}",
+                                        text.width,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // The locally assigned fonts must outlive the control tree, even
+                    // though this offscreen test intentionally differs from monitor DPI.
+                    drop(window);
                 }
             }
-            for r in geometry.panels {
-                assert!(r.left >= 0 && r.right <= width && r.bottom <= geometry.height);
-                assert_eq!(r.left, width - r.right, "panel margins must be symmetric");
+        });
+        set_language(previous_language);
+    }
+
+    fn assert_geometry_fits(geometry: &SettingsContentLayout, width: i32) {
+        assert_eq!(geometry.controls.len(), 28);
+        assert_eq!(geometry.panels.len(), 4);
+        for &(id, r) in &geometry.controls {
+            assert!(
+                r.left >= 0 && r.right <= width && r.right > r.left,
+                "{id} at {width}: {r:?}",
+            );
+            assert!(r.top >= 0 && r.bottom <= geometry.height);
+            if matches!(
+                id,
+                CTRL | ALT
+                    | SHIFT
+                    | KEY
+                    | FORMAT
+                    | LANGUAGE
+                    | QUICK_PICK
+                    | AUTO_COPY
+                    | BORDER_WIDTH
+                    | BACKGROUND_TRANSPARENCY
+            ) {
+                let offset = reveal_offset(0, r.top, r.bottom, 80, geometry.height, 8);
+                assert!(
+                    r.top - offset >= 0 && r.bottom - offset <= 80,
+                    "{id} at {width}: {r:?}",
+                );
             }
+        }
+        for (index, &(_, first)) in geometry.controls.iter().enumerate() {
+            for &(other_id, second) in &geometry.controls[index + 1..] {
+                let intersect = first.left < second.right
+                    && second.left < first.right
+                    && first.top < second.bottom
+                    && second.top < first.bottom;
+                assert!(
+                    !intersect,
+                    "overlapping control {other_id} at {width}: {first:?}, {second:?}"
+                );
+            }
+        }
+        for r in &geometry.panels {
+            assert!(r.left >= 0 && r.right <= width && r.bottom <= geometry.height);
+            assert_eq!(r.left, width - r.right, "panel margins must be symmetric");
         }
     }
 }
