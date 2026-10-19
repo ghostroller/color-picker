@@ -361,6 +361,7 @@ fn message_loop(
                         update_tray_shortcut(tray, settings);
                         drop(old_hotkey);
                         window.refresh_language()?;
+                        window.refresh_theme()?;
                         window.show_status(
                             tr(
                                 "设置已保存，关闭此窗口后即可取色。",

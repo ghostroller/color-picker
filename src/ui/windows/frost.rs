@@ -10,8 +10,12 @@ use windows::{
     core::{Error, Result},
 };
 
+use super::{drawing::bgr, theme::active_palette};
 use crate::{
-    app::config::MAX_BACKGROUND_TRANSPARENCY_PERCENT,
+    app::{
+        appearance::{ThemeMode, theme_mode},
+        config::MAX_BACKGROUND_TRANSPARENCY_PERCENT,
+    },
     core::geometry::ScreenPointPx,
     platform::windows::{
         dib::{Dib32Layout, Dib32Surface},
@@ -32,6 +36,7 @@ struct BackdropState {
     surface: Dib32Surface,
     scratch: Vec<u8>,
     origin: Option<ScreenPointPx>,
+    theme_mode: Option<ThemeMode>,
 }
 
 impl FrostedPanel {
@@ -52,6 +57,7 @@ impl FrostedPanel {
                 surface,
                 scratch,
                 origin: None,
+                theme_mode: None,
             }),
             screen,
             layout,
@@ -76,7 +82,8 @@ impl FrostedPanel {
             ));
         };
         let origin = ScreenPointPx { x, y };
-        if state.origin != Some(origin) {
+        let mode = theme_mode();
+        if state.origin != Some(origin) || state.theme_mode != Some(mode) {
             state.origin = None;
             let BackdropState {
                 surface, scratch, ..
@@ -91,10 +98,12 @@ impl FrostedPanel {
                         self.layout.height() as usize,
                         self.radius,
                         self.transparency_percent,
+                        bgr(active_palette().panel),
                     )
                 })?
                 .map_err(|_| Error::new(E_INVALIDARG, "Invalid backdrop effect parameters"))?;
             state.origin = Some(origin);
+            state.theme_mode = Some(mode);
         }
         // SAFETY: the caller supplies its live paint/backbuffer DC, distinct from
         // the private backdrop DC. The exclusive state borrow prevents CPU aliases.
@@ -105,6 +114,7 @@ impl FrostedPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::appearance::set_theme_mode;
     use crate::platform::windows::{
         dib::test_support::{Failure, fail_next},
         gdi::BitmapDc,
@@ -142,6 +152,36 @@ mod tests {
             assert_eq!(panel.state.borrow().origin, None);
             panel.paint(target_dc, rect, origin).unwrap();
         });
+    }
+
+    #[test]
+    fn changing_theme_refreshes_the_cached_backdrop_without_moving() {
+        let original = theme_mode();
+        set_theme_mode(ThemeMode::Light);
+        let panel = FrostedPanel::new(2, 2, 3, 35).unwrap();
+        let target = BitmapDc::compatible(panel.screen.raw(), 2, 2).unwrap();
+        let source = BitmapDc::compatible(panel.screen.raw(), 2, 2).unwrap();
+        // SAFETY: the private target has no CPU view or escaped bitmap selection.
+        let target_dc = unsafe { target.raw().unwrap() };
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 2,
+            bottom: 2,
+        };
+        let origin = ScreenPointPx { x: 0, y: 0 };
+        crate::platform::windows::dib::test_support::with_source(&source, || {
+            panel.paint(target_dc, rect, origin).unwrap();
+            assert_eq!(panel.state.borrow().theme_mode, Some(ThemeMode::Light));
+            set_theme_mode(ThemeMode::Dark);
+            fail_next(Failure::BitBlt);
+            assert!(panel.paint(target_dc, rect, origin).is_err());
+            assert_eq!(panel.state.borrow().origin, None);
+            panel.paint(target_dc, rect, origin).unwrap();
+            assert_eq!(panel.state.borrow().theme_mode, Some(ThemeMode::Dark));
+            assert_eq!(panel.state.borrow().origin, Some(origin));
+        });
+        set_theme_mode(original);
     }
 
     #[test]

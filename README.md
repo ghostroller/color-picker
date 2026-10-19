@@ -68,13 +68,14 @@ The main Copy button uses your default format, initially HEX. A successful copy 
 
 ## Make it yours
 
-Right-click the tray icon and open **Settings** (设置 in Chinese). The **Preferences** page groups language, picking shortcut, copying, and picker appearance in separate white cards on a light-gray background.
+Right-click the tray icon and open **Settings** (设置 in Chinese). The **Preferences** page groups language and theme, picking shortcut, copying, and picker appearance in separate cards. Choose **Light** or **Dark** under **Theme**; Light is the default.
 
 ![English Preferences page with language, shortcut, copying, and appearance controls](docs/images/ui-settings-en.png)
 
 | Setting | Options | Default |
 | --- | --- | --- |
 | Language | English / 简体中文 | Matches Windows; English fallback |
+| Theme | Light / Dark | Light |
 | Picking shortcut | Ctrl and/or Alt, optional Shift, plus A–Z, 0–9, or F1–F11 | Ctrl + Alt + C |
 | Default format | HEX, RGB, CSS RGB, HSL | HEX |
 | Automatically copy after a normal pick | On / off; unavailable while Quick pick is on | Off |
@@ -86,7 +87,7 @@ To change the shortcut, select its modifiers, click the main-key button, and pre
 
 Settings fits the monitor's available height. On a small display or at high scaling, scroll the content; the status message, **Close**, and **Apply** stay visible at the bottom. Tab navigation brings the focused control into view. The **Live preview · Sample colors** area updates immediately as you drag the border and transparency sliders. It uses synthetic colors and saves nothing until you click Apply.
 
-Click **Apply** (应用 in Chinese) to save, then close Settings before picking again. A saved language change updates Settings, the tray menu, and subsequent picking windows immediately, while preserving your scroll position. A pick request while Settings is open restores that window and explains why picking is paused, preserving your edits. Closing without applying discards your edits. If a new shortcut is unavailable or saving fails, the previous settings and language remain active. Picking previews and the result window share a right and bottom border. Transparency affects the picking previews' information backgrounds; color swatches and magnified pixels stay opaque.
+Click **Apply** (应用 in Chinese) to save, then close Settings before picking again. Language and theme choices take effect immediately only after saving succeeds, while preserving your scroll position, and remain selected after restarting. The theme applies to Settings, the result window, and the live and frozen previews; sampled colors and magnified pixels keep their original values. Some native control surfaces and popup menus may retain the Windows appearance. A pick request while Settings is open restores that window and explains why picking is paused, preserving your edits. Closing without applying discards your edits. If a new shortcut is unavailable or saving fails, the previous settings, language, and theme remain active. Picking previews and the result window share a right and bottom border. Transparency affects the picking previews' information backgrounds; color swatches and magnified pixels stay opaque.
 
 Settings are stored in `%LOCALAPPDATA%\color-picker\config.json`, including for portable use. A missing file uses defaults. If a file is invalid, unreadable, or from an unsupported version, the app preserves it, uses defaults, and disables saving. Exit the app, repair or move that file, then restart; you do not need to create a replacement manually.
 
@@ -134,6 +135,8 @@ These tests create temporary windows and app instances, exercise input-hook setu
 For automation, pass `--no-onboarding` to suppress the welcome guide without marking it as seen; the next ordinary manual launch can still show it. `--startup` also suppresses the guide and quietly exits when another instance is already running. The optional `quick_pick` setting defaults to `false`, including when loading older configuration files that omit it.
 
 The optional `language` setting accepts `"en"` and `"zh-CN"`. Older configuration files without it use the Windows language default until a choice is saved. Translation pairs and formatted messages use `tr` / `tr_format!` from `src/app/i18n.rs`; the active choice belongs to the UI thread, and both format strings are checked by the compiler. Native Windows error details may follow the operating system's language.
+
+The optional `theme` setting accepts `"light"` and `"dark"`. Missing values use `"light"`, including in older configuration files. Theme changes are saved through Settings with **Apply**.
 
 | Location | Purpose |
 | --- | --- |

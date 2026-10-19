@@ -6,8 +6,8 @@ use windows::Win32::{
     UI::{
         Controls::{DRAWITEMSTRUCT, NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, ODT_STATIC},
         WindowsAndMessaging::{
-            BS_DEFPUSHBUTTON, BS_PUSHBUTTON, BS_TYPEMASK, CREATESTRUCTW, GWL_STYLE, GetClassNameW,
-            GetParent, GetWindowLongW,
+            BS_AUTOCHECKBOX, BS_CHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, BS_TYPEMASK,
+            CREATESTRUCTW, GWL_STYLE, GetClassNameW, GetParent, GetWindowLongW,
         },
     },
 };
@@ -60,7 +60,7 @@ pub(super) unsafe fn with_static_draw<R>(
 
 /// # Safety
 /// Must be a native WM_NOTIFY delivered to this parent. Read the NMHDR first;
-/// only a push-button NM_CUSTOMDRAW has the NMCUSTOMDRAW layout consumed here.
+/// only a supported button NM_CUSTOMDRAW has the NMCUSTOMDRAW layout consumed here.
 /// The closure cannot retain a reference beyond the synchronous notification.
 pub(super) unsafe fn with_button_custom_draw<R>(
     parent: HWND,
@@ -84,7 +84,10 @@ pub(super) unsafe fn with_button_custom_draw<R>(
     }
     // SAFETY: querying the live sender's button style does not retain a pointer.
     let kind = unsafe { GetWindowLongW(header.hwndFrom, GWL_STYLE) } & BS_TYPEMASK;
-    if kind != BS_PUSHBUTTON && kind != BS_DEFPUSHBUTTON {
+    if !matches!(
+        kind,
+        BS_PUSHBUTTON | BS_DEFPUSHBUTTON | BS_CHECKBOX | BS_AUTOCHECKBOX
+    ) {
         return None;
     }
     // SAFETY: the verified sender class and notification code establish this layout.
@@ -266,5 +269,105 @@ mod tests {
         );
         // SAFETY: pair exactly the borrowed window/DC before destroying the tree.
         assert_ne!(unsafe { ReleaseDC(Some(button), dc) }, 0);
+    }
+
+    #[test]
+    fn checkbox_custom_draw_accepts_only_supported_direct_button_children() {
+        let make_parent = || {
+            // SAFETY: Built-in STATIC retains no pointers, stays hidden and is
+            // destroyed with its complete native child tree by Parent::drop.
+            Parent(
+                unsafe {
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        w!("STATIC"),
+                        w!(""),
+                        WS_OVERLAPPED,
+                        0,
+                        0,
+                        40,
+                        40,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                }
+                .unwrap(),
+            )
+        };
+        let parent = make_parent();
+        let other_parent = make_parent();
+        for (kind, supported) in [
+            (BS_CHECKBOX, true),
+            (BS_AUTOCHECKBOX, true),
+            (BS_GROUPBOX, false),
+            (BS_OWNERDRAW, false),
+            (BS_RADIOBUTTON, false),
+        ] {
+            // SAFETY: The retained hidden parent owns this built-in child and
+            // no callback or creation storage escapes this synchronous call.
+            let child = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("BUTTON"),
+                    w!("Checkbox"),
+                    WS_CHILD | WINDOW_STYLE(kind as u32),
+                    0,
+                    0,
+                    40,
+                    40,
+                    Some(parent.0),
+                    Some(HMENU(9_usize as *mut _)),
+                    None,
+                    None,
+                )
+            }
+            .unwrap();
+            let draw = NMCUSTOMDRAW {
+                hdr: NMHDR {
+                    hwndFrom: child,
+                    idFrom: 9,
+                    code: NM_CUSTOMDRAW,
+                },
+                dwDrawStage: CDDS_PREPAINT,
+                ..Default::default()
+            };
+            // SAFETY: This initialized aligned fixture has the complete native
+            // payload layout and both HWNDs outlive synchronous validation.
+            let result = unsafe {
+                with_button_custom_draw(parent.0, LPARAM(&draw as *const _ as isize), |value| {
+                    value.hdr.idFrom
+                })
+            };
+            assert_eq!(result, supported.then_some(9), "button style {kind}");
+            assert!(
+                // SAFETY: Same complete payload, but the requested parent does not
+                // own this child and must reject it before interpreting its body.
+                unsafe {
+                    with_button_custom_draw(
+                        other_parent.0,
+                        LPARAM(&draw as *const _ as isize),
+                        |_| (),
+                    )
+                }
+                .is_none()
+            );
+            if !supported {
+                let header = draw.hdr;
+                assert!(
+                    // SAFETY: The readable native header is sufficient for sender
+                    // validation; unsupported styles must never read a draw body.
+                    unsafe {
+                        with_button_custom_draw(
+                            parent.0,
+                            LPARAM(&header as *const _ as isize),
+                            |_| (),
+                        )
+                    }
+                    .is_none()
+                );
+            }
+        }
     }
 }

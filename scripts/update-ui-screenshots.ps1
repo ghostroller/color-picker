@@ -3,7 +3,7 @@
 Rebuild the documentation screenshots from the production Windows UI fixture.
 .DESCRIPTION
 Run on an interactive Windows desktop with the MSVC toolchain. The fixture uses
-default settings and synthetic sample pixels; it does not save user settings.
+synthetic sample pixels and explicit light/dark themes; it does not save user settings.
 PNG files retain the exported client area's native pixels without resizing.
 All captures and conversions must succeed before docs/images is updated.
 .EXAMPLE
@@ -43,17 +43,21 @@ $target = 'x86_64-pc-windows-msvc'
 $runDirectory = $null
 $temporaryFiles = [Collections.Generic.List[string]]::new()
 $captures = @(
-    @{ Name = 'ui-result'; Mode = 'result'; Language = 'zh-CN'; Extra = @() }
-    @{ Name = 'ui-result-en'; Mode = 'result'; Language = 'en'; Extra = @() }
-    @{ Name = 'ui-settings'; Mode = 'settings'; Language = 'zh-CN'; Extra = @() }
-    @{ Name = 'ui-settings-en'; Mode = 'settings'; Language = 'en'; Extra = @() }
-    @{ Name = 'ui-settings-compact'; Mode = 'settings'; Language = 'zh-CN'; Extra = @('--settings-size=500x320') }
-    @{ Name = 'ui-settings-compact-en'; Mode = 'settings'; Language = 'en'; Extra = @('--settings-size=500x320') }
-    @{ Name = 'ui-live'; Mode = 'live'; Language = 'zh-CN'; Extra = @('--backdrop') }
-    @{ Name = 'ui-live-en'; Mode = 'live'; Language = 'en'; Extra = @('--backdrop') }
-    @{ Name = 'ui-frozen'; Mode = 'frozen'; Language = 'zh-CN'; Extra = @('--backdrop') }
-    @{ Name = 'ui-frozen-en'; Mode = 'frozen'; Language = 'en'; Extra = @('--backdrop') }
-    @{ Name = 'ui-frozen-edge'; Mode = 'frozen-edge'; Language = 'zh-CN'; Extra = @('--backdrop') }
+    @{ Name = 'ui-result'; Mode = 'result'; Language = 'zh-CN'; Theme = 'light'; Extra = @() }
+    @{ Name = 'ui-result-en'; Mode = 'result'; Language = 'en'; Theme = 'light'; Extra = @() }
+    @{ Name = 'ui-settings'; Mode = 'settings'; Language = 'zh-CN'; Theme = 'light'; Extra = @() }
+    @{ Name = 'ui-settings-en'; Mode = 'settings'; Language = 'en'; Theme = 'light'; Extra = @() }
+    @{ Name = 'ui-settings-compact'; Mode = 'settings'; Language = 'zh-CN'; Theme = 'light'; Extra = @('--settings-size=500x320') }
+    @{ Name = 'ui-settings-compact-en'; Mode = 'settings'; Language = 'en'; Theme = 'light'; Extra = @('--settings-size=500x320') }
+    @{ Name = 'ui-live'; Mode = 'live'; Language = 'zh-CN'; Theme = 'light'; Extra = @('--backdrop') }
+    @{ Name = 'ui-live-en'; Mode = 'live'; Language = 'en'; Theme = 'light'; Extra = @('--backdrop') }
+    @{ Name = 'ui-frozen'; Mode = 'frozen'; Language = 'zh-CN'; Theme = 'light'; Extra = @('--backdrop') }
+    @{ Name = 'ui-frozen-en'; Mode = 'frozen'; Language = 'en'; Theme = 'light'; Extra = @('--backdrop') }
+    @{ Name = 'ui-frozen-edge'; Mode = 'frozen-edge'; Language = 'zh-CN'; Theme = 'light'; Extra = @('--backdrop') }
+    @{ Name = 'ui-result-dark'; Mode = 'result'; Language = 'zh-CN'; Theme = 'dark'; Extra = @() }
+    @{ Name = 'ui-settings-dark'; Mode = 'settings'; Language = 'zh-CN'; Theme = 'dark'; Extra = @() }
+    @{ Name = 'ui-live-dark'; Mode = 'live'; Language = 'zh-CN'; Theme = 'dark'; Extra = @('--backdrop') }
+    @{ Name = 'ui-frozen-dark'; Mode = 'frozen'; Language = 'zh-CN'; Theme = 'dark'; Extra = @('--backdrop') }
 )
 
 Push-Location -LiteralPath $repositoryRoot
@@ -84,7 +88,7 @@ try {
         $pngPath = Join-Path $runDirectory "$($capture.Name).png"
         $temporaryFiles.Add($bitmapPath)
         $temporaryFiles.Add($pngPath)
-        $fixtureArguments = @($capture.Mode, "--language=$($capture.Language)") +
+        $fixtureArguments = @($capture.Mode, "--language=$($capture.Language)", "--theme=$($capture.Theme)") +
             $capture.Extra + @("--output=$bitmapPath")
         Invoke-CheckedNative $executable $fixtureArguments
 
@@ -112,6 +116,7 @@ try {
         $completed.Add([pscustomobject]@{
             File = "$($capture.Name).png"
             Language = $capture.Language
+            Theme = $capture.Theme
             Pixels = "${width}x${height}"
             Source = $pngPath
         })
@@ -121,7 +126,7 @@ try {
     foreach ($image in $completed) {
         Copy-Item -LiteralPath $image.Source -Destination (Join-Path $imageDirectory $image.File) -Force
     }
-    $completed | Format-Table File, Language, Pixels -AutoSize | Out-Host
+    $completed | Format-Table File, Language, Theme, Pixels -AutoSize | Out-Host
     Write-Host "Updated $($completed.Count) screenshots in $imageDirectory"
 }
 finally {

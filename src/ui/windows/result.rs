@@ -2032,7 +2032,8 @@ fn draw_swatch(draw: &DRAWITEMSTRUCT, original: COLORREF, adjusted: COLORREF) ->
     LRESULT(1)
 }
 
-fn paint_result(hwnd: HWND, border_width_dip: u8, fields: &[RECT]) -> LRESULT {
+fn paint_result(hwnd: HWND, border_width_dip: u8, fields: &[RECT], theme: &Theme) -> LRESULT {
+    let palette = theme.palette();
     // SAFETY: native WM_PAINT supplies this live window; no mutable state borrow exists.
     if let Ok(paint) = unsafe { PaintSession::begin(hwnd) } {
         let hdc = paint.dc;
@@ -2040,9 +2041,8 @@ fn paint_result(hwnd: HWND, border_width_dip: u8, fields: &[RECT]) -> LRESULT {
         // SAFETY: The live window owner or callback retains this HWND. The initialized local
         // RECT is writable for exactly this synchronous query and is not retained.
         let _ = unsafe { GetClientRect(hwnd, &mut client) };
-        // SAFETY: The paint session retains the DC and the local rectangle is initialized;
-        // the system WHITE_BRUSH is borrowed and must not be deleted.
-        unsafe { FillRect(hdc, &client, HBRUSH(GetStockObject(WHITE_BRUSH).0)) };
+        // Clear even if SaveDC fails: WM_ERASEBKGND is intentionally suppressed.
+        theme.fill_panel(hdc, &client);
         // SAFETY: the paint session outlives this stock-object drawing scope.
         if let Ok(saved) = unsafe { SavedDc::new(hdc) } {
             // SAFETY: The current callback or window owner retains this HWND through the scalar
@@ -2053,7 +2053,7 @@ fn paint_result(hwnd: HWND, border_width_dip: u8, fields: &[RECT]) -> LRESULT {
             unsafe {
                 SelectObject(hdc, GetStockObject(DC_BRUSH));
                 SelectObject(hdc, GetStockObject(NULL_PEN));
-                SetDCBrushColor(hdc, theme::FIELD);
+                SetDCBrushColor(hdc, palette.field);
                 for field in fields {
                     let _ = RoundRect(
                         hdc,
@@ -2145,9 +2145,9 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
             if hwnd == state.viewport.get() {
-                paint_result(hwnd, 0, &state.fields.get())
+                paint_result(hwnd, 0, &state.fields.get(), &state.theme)
             } else {
-                paint_result(hwnd, state.border_width_dip, &[])
+                paint_result(hwnd, state.border_width_dip, &[], &state.theme)
             }
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {

@@ -7,6 +7,7 @@
 //! Add --backdrop after the lifetime to preview material over a synthetic pattern.
 //! --border=N / --transparency=N override appearance for this fixture only.
 //! --language=en / --language=zh-CN select the interface language without saving.
+//! --theme=light / --theme=dark select the interface theme without saving.
 //! --output=path.bmp exports this fixture's client area, then exits.
 //! --settings-size=500x320 forces a short settings viewport, in DIP, for scrolling QA.
 //! frozen-edge uses a focus near the work area's top-left corner.
@@ -25,6 +26,7 @@ fn main() -> windows::core::Result<()> {
 mod fixture {
     use color_picker::{
         app::{
+            appearance::{ThemeMode, set_theme_mode},
             config::Config,
             i18n::{self, Language, tr},
         },
@@ -79,7 +81,9 @@ mod fixture {
                     Some(SettingsAction::Close) => Ok(true),
                     Some(SettingsAction::Apply(config)) => {
                         i18n::set_language(config.language);
+                        set_theme_mode(config.theme);
                         window.refresh_language()?;
+                        window.refresh_theme()?;
                         window.show_status(
                             tr(
                                 "设置有效。当前为界面预览，未写入配置。",
@@ -113,6 +117,19 @@ mod fixture {
         let mode = std::env::args().nth(1).unwrap_or_else(|| "result".into());
         let mut config = Config::default();
         for arg in std::env::args().skip(2) {
+            if let Some(mode) = arg.strip_prefix("--theme=") {
+                config.theme = match mode {
+                    "light" => ThemeMode::Light,
+                    "dark" => ThemeMode::Dark,
+                    _ => {
+                        return Err(Error::new(
+                            windows::Win32::Foundation::E_INVALIDARG,
+                            "--theme must be light or dark",
+                        ));
+                    }
+                };
+                continue;
+            }
             if let Some(code) = arg.strip_prefix("--language=") {
                 config.language = match code {
                     "en" => Language::English,
@@ -146,6 +163,7 @@ mod fixture {
             }
         }
         i18n::set_language(config.language);
+        set_theme_mode(config.theme);
         config.validate().map_err(|error| {
             Error::new(windows::Win32::Foundation::E_INVALIDARG, error.to_string())
         })?;

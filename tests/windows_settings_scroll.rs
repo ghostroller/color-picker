@@ -29,6 +29,7 @@ use std::{
 
 use color_picker::{
     app::{
+        appearance::{ThemeMode, set_theme_mode},
         config::Config,
         i18n::{self, Language},
     },
@@ -41,7 +42,7 @@ use windows::{
         Graphics::{Dwm::DwmFlush, Gdi::*},
         UI::{
             HiDpi::GetDpiForWindow,
-            Input::KeyboardAndMouse::{GetFocus, SetFocus},
+            Input::KeyboardAndMouse::{GetCapture, GetFocus, SetFocus},
             Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::*,
         },
@@ -49,9 +50,9 @@ use windows::{
     core::w,
 };
 
-const CONTROL_IDS: [i32; 28] = [
-    15, 16, 28, 110, 10, 101, 102, 103, 11, 104, 12, 17, 13, 105, 109, 106, 20, 21, 107, 22, 23,
-    108, 24, 25, 26, 27, 18, 19,
+const CONTROL_IDS: [i32; 30] = [
+    15, 16, 28, 110, 30, 111, 10, 101, 102, 103, 11, 104, 12, 17, 13, 105, 109, 106, 20, 21, 107,
+    22, 23, 108, 24, 25, 26, 27, 18, 19,
 ];
 
 #[test]
@@ -78,7 +79,12 @@ fn settings_continuous_scroll_uses_one_document_and_complete_screen_frames() {
         )
         .unwrap()
     });
-    let settings = SettingsWindow::new(&Config::default(), owner.0, None, true).unwrap();
+    let mut config = Config::default();
+    if std::env::var("COLOR_PICKER_SCROLL_THEME").as_deref() == Ok("dark") {
+        config.theme = ThemeMode::Dark;
+    }
+    set_theme_mode(config.theme);
+    let settings = SettingsWindow::new(&config, owner.0, None, true).unwrap();
     settings.process_pending().unwrap();
     let root = settings.hwnd();
     let viewport = child(root, 200);
@@ -172,7 +178,6 @@ fn settings_continuous_scroll_uses_one_document_and_complete_screen_frames() {
     let capture_atlas = Arc::clone(&atlas);
     let capture_tracking = Arc::clone(&native_scroll.events.tracking);
     let viewport_value = viewport.0 as usize;
-    let started = Instant::now();
     let capture = thread::spawn(move || {
         record_screen(
             viewport_value,
@@ -180,7 +185,7 @@ fn settings_continuous_scroll_uses_one_document_and_complete_screen_frames() {
             capture_atlas,
             stop_capture,
             capture_tracking,
-            started,
+            config.theme,
             save_frames,
         )
     });
@@ -203,14 +208,15 @@ fn settings_continuous_scroll_uses_one_document_and_complete_screen_frames() {
             pump_for(&settings, Duration::from_millis(24));
         }
     }
+    exercise_captured_thumb(&settings, viewport, document);
+    exercise_held_scroll(viewport);
     if record_ms != 0 {
         eprintln!(
             "RECORD_READY hwnd={} sampled_rect={viewport_rect:?} excluded_right_strip_px={pointer_margin} duration_ms={record_ms}; drag the native scrollbar now",
             root.0 as usize
         );
-        // The ordinary loop calls process_pending only after DispatchMessage
-        // returns. A native scrollbar's modal tracking loop must therefore be
-        // handled by production code, not a special test owner callback.
+        // Additional manual input uses the same production capture handlers as
+        // the scripted own-window thumb messages exercised above.
         pump_for(&settings, Duration::from_millis(record_ms));
     }
     stop.store(true, Ordering::Release);
@@ -231,7 +237,7 @@ fn settings_continuous_scroll_uses_one_document_and_complete_screen_frames() {
         "continuous scroll/drag must leave child HWND layout and fonts untouched"
     );
 
-    if save_frames || report.invalid_frames != 0 {
+    if save_frames || report.invalid_frames != 0 || report.scrollbar_bad_frames != 0 {
         let root = output_root.unwrap_or_else(|| PathBuf::from("target/settings-scroll-captures"));
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -254,6 +260,14 @@ fn settings_continuous_scroll_uses_one_document_and_complete_screen_frames() {
         report.tracking_frames,
         report.tracking_changing_frames,
         report.tracking_matched_offsets.len()
+    );
+    eprintln!(
+        "SCROLLBAR_STYLE invalid_track_frames={}",
+        report.scrollbar_bad_frames
+    );
+    assert_eq!(
+        report.scrollbar_bad_frames, 0,
+        "scrolling and captured dragging must never expose the stock scrollbar track"
     );
     assert!(
         report.frames.len() >= 12,
@@ -279,16 +293,192 @@ fn settings_continuous_scroll_uses_one_document_and_complete_screen_frames() {
         report.invalid_frames, 0,
         "screen frames must match complete document slices, including while scroll/drag is active"
     );
-    if record_ms != 0 {
+    {
         assert!(
             report.thumb_messages >= 3 && report.thumb_positions.len() >= 3,
-            "external recording must include a real native scrollbar drag with continuing thumb-track position updates"
+            "recording must include captured scrollbar dragging with continuing position updates"
         );
         assert!(
             report.tracking_matched_offsets.len() >= 3 && report.tracking_changing_frames >= 2,
-            "actual screen pixels must show at least three document offsets and two visual changes while USER32's scrollbar tracking call is still active"
+            "actual screen pixels must show at least three document offsets and two visual changes while the scrollbar owns mouse capture"
         );
     }
+}
+
+fn exercise_held_scroll(viewport: HWND) {
+    const REPEAT_TIMER: usize = 0x5343; // Production scrollbar's local input timer.
+    let pack =
+        |x: i32, y: i32| LPARAM(((u32::from(y as u16) << 16) | u32::from(x as u16)) as isize);
+    let mut bar = SCROLLBARINFO {
+        cbSize: std::mem::size_of::<SCROLLBARINFO>() as u32,
+        ..Default::default()
+    };
+    scroll_command(viewport, SB_TOP);
+    // SAFETY: all messages and queries target this owned viewport only. Timer
+    // messages directly exercise production repeat logic without waiting or
+    // injecting global mouse input.
+    unsafe {
+        GetScrollBarInfo(viewport, OBJID_VSCROLL, &mut bar).unwrap();
+        let x = (bar.rcScrollBar.left + bar.rcScrollBar.right) / 2;
+        let y = bar.rcScrollBar.bottom - 2;
+        let origin = client_on_screen(viewport);
+        SendMessageW(
+            viewport,
+            WM_NCLBUTTONDOWN,
+            Some(WPARAM(HTVSCROLL as usize)),
+            Some(pack(x, y)),
+        );
+        let first = scroll_info(viewport).nPos;
+        assert!(first > 0);
+        SendMessageW(viewport, WM_TIMER, Some(WPARAM(REPEAT_TIMER)), None);
+        let repeated = scroll_info(viewport).nPos;
+        assert!(repeated > first, "held arrow must keep scrolling");
+        SendMessageW(
+            viewport,
+            WM_MOUSEMOVE,
+            Some(WPARAM(1)),
+            Some(pack(-20, y - origin.top)),
+        );
+        SendMessageW(viewport, WM_TIMER, Some(WPARAM(REPEAT_TIMER)), None);
+        assert_eq!(
+            scroll_info(viewport).nPos,
+            repeated,
+            "leaving the pressed region pauses repeat"
+        );
+        SendMessageW(
+            viewport,
+            WM_MOUSEMOVE,
+            Some(WPARAM(1)),
+            Some(pack(x - origin.left, y - origin.top)),
+        );
+        SendMessageW(viewport, WM_TIMER, Some(WPARAM(REPEAT_TIMER)), None);
+        let resumed = scroll_info(viewport).nPos;
+        assert!(
+            resumed > repeated,
+            "returning to the pressed region resumes repeat"
+        );
+        SendMessageW(
+            viewport,
+            WM_LBUTTONUP,
+            None,
+            Some(pack(x - origin.left, y - origin.top)),
+        );
+        assert_ne!(GetCapture(), viewport);
+        SendMessageW(viewport, WM_TIMER, Some(WPARAM(REPEAT_TIMER)), None);
+        assert_eq!(
+            scroll_info(viewport).nPos,
+            resumed,
+            "released buttons cannot repeat"
+        );
+
+        scroll_command(viewport, SB_TOP);
+        GetScrollBarInfo(viewport, OBJID_VSCROLL, &mut bar).unwrap();
+        let page_y = (bar.rcScrollBar.top + bar.xyThumbBottom + bar.rcScrollBar.bottom
+            - bar.dxyLineButton)
+            / 2;
+        SendMessageW(
+            viewport,
+            WM_NCLBUTTONDOWN,
+            Some(WPARAM(HTVSCROLL as usize)),
+            Some(pack(x, page_y)),
+        );
+        for _ in 0..20 {
+            SendMessageW(viewport, WM_TIMER, Some(WPARAM(REPEAT_TIMER)), None);
+        }
+        let stopped = scroll_info(viewport).nPos;
+        assert!(stopped > 0);
+        SendMessageW(viewport, WM_TIMER, Some(WPARAM(REPEAT_TIMER)), None);
+        assert_eq!(
+            scroll_info(viewport).nPos,
+            stopped,
+            "page repeat stops when the thumb reaches the pointer"
+        );
+        SendMessageW(viewport, WM_CANCELMODE, None, None);
+        assert_ne!(GetCapture(), viewport);
+        SendMessageW(viewport, WM_TIMER, Some(WPARAM(REPEAT_TIMER)), None);
+        assert_eq!(
+            scroll_info(viewport).nPos,
+            stopped,
+            "cancel stops repeat and releases capture"
+        );
+    }
+}
+
+fn exercise_captured_thumb(settings: &SettingsWindow, viewport: HWND, document: HWND) {
+    scroll_command(viewport, SB_TOP);
+    pump_for(settings, Duration::from_millis(40));
+    let mut bar = SCROLLBARINFO {
+        cbSize: std::mem::size_of::<SCROLLBARINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: query the fixture's native nonclient geometry into initialized output.
+    unsafe { GetScrollBarInfo(viewport, OBJID_VSCROLL, &mut bar).unwrap() };
+    let x = (bar.rcScrollBar.left + bar.rcScrollBar.right) / 2;
+    let start_y = bar.rcScrollBar.top + (bar.xyThumbTop + bar.xyThumbBottom) / 2;
+    let pack =
+        |x: i32, y: i32| LPARAM(((u32::from(y as u16) << 16) | u32::from(x as u16)) as isize);
+    // SAFETY: scalar mouse messages are sent only to this owned fixture. No
+    // global pointer input is injected and no USER32 modal loop is entered.
+    unsafe {
+        SendMessageW(
+            viewport,
+            WM_NCLBUTTONDOWN,
+            Some(WPARAM(HTVSCROLL as usize)),
+            Some(pack(x, start_y)),
+        );
+        assert_eq!(GetCapture(), viewport, "thumb press must own mouse capture");
+    }
+    let origin = client_on_screen(viewport);
+    let travel = bar.rcScrollBar.bottom
+        - bar.rcScrollBar.top
+        - 2 * bar.dxyLineButton
+        - (bar.xyThumbBottom - bar.xyThumbTop);
+    let mut previous_position = 0;
+    for step in 1..=8 {
+        let y = start_y + travel * step / 8;
+        let before = window_rect(document);
+        // SAFETY: captured mouse messages use viewport-client coordinates and
+        // remain scoped to this test-owned HWND.
+        unsafe {
+            SendMessageW(
+                viewport,
+                WM_MOUSEMOVE,
+                Some(WPARAM(1)),
+                Some(pack(x - origin.left, y - origin.top)),
+            );
+        }
+        let position = scroll_info(viewport).nPos;
+        assert!(position > previous_position);
+        assert!(
+            window_rect(document).top < before.top,
+            "drag must move content synchronously before process_pending"
+        );
+        previous_position = position;
+        pump_for(settings, Duration::from_millis(32));
+    }
+    let info = scroll_info(viewport);
+    assert_eq!(info.nPos, info.nMax - info.nPage as i32 + 1);
+    // SAFETY: test-local captured moves beyond both track ends verify clamping;
+    // release must finish capture using the same production message path.
+    unsafe {
+        SendMessageW(
+            viewport,
+            WM_MOUSEMOVE,
+            Some(WPARAM(1)),
+            Some(pack(0, 30_000)),
+        );
+        assert_eq!(scroll_info(viewport).nPos, info.nPos);
+        SendMessageW(
+            viewport,
+            WM_MOUSEMOVE,
+            Some(WPARAM(1)),
+            Some(pack(0, -30_000)),
+        );
+        assert_eq!(scroll_info(viewport).nPos, 0);
+        SendMessageW(viewport, WM_LBUTTONUP, None, Some(pack(0, -30_000)));
+        assert_ne!(GetCapture(), viewport);
+    }
+    pump_for(settings, Duration::from_millis(40));
 }
 
 fn pump_for(settings: &SettingsWindow, duration: Duration) {
@@ -500,6 +690,9 @@ struct Recording {
     thumb_messages: u32,
     thumb_positions: Vec<i32>,
     excluded_right_strip_px: i32,
+    scrollbar_bad_frames: usize,
+    scrollbar_first_bad: Option<Vec<u8>>,
+    scrollbar_rect: RECT,
 }
 
 fn record_screen(
@@ -508,11 +701,23 @@ fn record_screen(
     atlas: Arc<Atlas>,
     stop: Arc<AtomicBool>,
     native_tracking: Arc<AtomicBool>,
-    started: Instant,
+    theme: ThemeMode,
     save_frames: bool,
 ) -> Recording {
     let _dpi = ScopedPmv2::enter().unwrap();
     let viewport = HWND(viewport_value as *mut _);
+    let started = Instant::now();
+    let mut bar = SCROLLBARINFO {
+        cbSize: std::mem::size_of::<SCROLLBARINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the recording fixture retains this viewport across the read-only
+    // native geometry query; no drawing message is sent from this thread.
+    unsafe { GetScrollBarInfo(viewport, OBJID_VSCROLL, &mut bar).unwrap() };
+    let track_color = match theme {
+        ThemeMode::Light => [0xfa, 0xf7, 0xf5],
+        ThemeMode::Dark => [0x27, 0x18, 0x11],
+    };
     let mut report = Recording {
         frames: vec![],
         positions: HashSet::new(),
@@ -526,6 +731,9 @@ fn record_screen(
         thumb_messages: 0,
         thumb_positions: vec![],
         excluded_right_strip_px: 0,
+        scrollbar_bad_frames: 0,
+        scrollbar_first_bad: None,
+        scrollbar_rect: bar.rcScrollBar,
     };
     let mut previous = None;
     let mut previous_matched = None;
@@ -536,9 +744,20 @@ fn record_screen(
         let tracking_before = native_tracking.load(Ordering::Acquire);
         let before = scroll_info(viewport).nPos;
         let pixels = capture_viewport(rect);
+        let scrollbar_pixels = capture_viewport(bar.rcScrollBar);
+        let bar_width = (bar.rcScrollBar.right - bar.rcScrollBar.left) as usize;
+        if scrollbar_pixels
+            .chunks_exact(bar_width * 4)
+            .any(|row| row[4..7] != track_color)
+        {
+            report.scrollbar_bad_frames += 1;
+            if report.scrollbar_first_bad.is_none() {
+                report.scrollbar_first_bad = Some(scrollbar_pixels);
+            }
+        }
         let after = scroll_info(viewport).nPos;
-        // Count only samples bracketed by the native modal tracking call. The
-        // UI thread cannot run pump_for/process_pending until that call returns.
+        // Count only samples bracketed by active scrollbar capture. Production
+        // commits its document movement synchronously on each captured move.
         let during_native_tracking = tracking_before && native_tracking.load(Ordering::Acquire);
         if during_native_tracking {
             report.tracking_frames += 1;
@@ -684,6 +903,14 @@ impl Drop for ScreenSurface {
 
 fn write_recording(output: &Path, report: &Recording, width: usize, height: usize) {
     fs::create_dir_all(output).unwrap();
+    if let Some(pixels) = &report.scrollbar_first_bad {
+        write_bmp(
+            &output.join("scrollbar-first-stock-frame.bmp"),
+            (report.scrollbar_rect.right - report.scrollbar_rect.left) as usize,
+            (report.scrollbar_rect.bottom - report.scrollbar_rect.top) as usize,
+            pixels,
+        );
+    }
     let mut matched_offsets: Vec<_> = report.matched_offsets.iter().copied().collect();
     matched_offsets.sort_unstable();
     let mut tracking_matched_offsets: Vec<_> =
@@ -735,6 +962,7 @@ fn write_recording(output: &Path, report: &Recording, width: usize, height: usiz
         "source_viewport_width": width + report.excluded_right_strip_px as usize,
         "excluded_right_strip_px": report.excluded_right_strip_px,
         "full_viewport_width_verified": report.excluded_right_strip_px == 0,
+        "invalid_scrollbar_track_frames": report.scrollbar_bad_frames,
             "native_thumb_messages": report.thumb_messages,
             "native_thumb_positions": report.thumb_positions,
     })).unwrap()).unwrap();
@@ -899,25 +1127,22 @@ unsafe extern "system" fn observe_native_scroll(
     // SAFETY: The stable observer Box outlives the viewport subclass. Only the
     // atomic flag is shared with the independent screen-capture thread.
     let events = unsafe { &*(data as *const NativeScrollEvents) };
-    let previous_tracking = if message == WM_NCLBUTTONDOWN && wparam.0 == HTVSCROLL as usize {
-        Some(events.tracking.swap(true, Ordering::AcqRel))
-    } else {
-        None
-    };
-    // SAFETY: Preserve production processing first. In particular, no test
-    // process_pending call is injected into USER32's native modal drag loop.
+    // SAFETY: observe this thread's current capture before production dispatch.
+    let dragging = unsafe { GetCapture() } == hwnd;
+    // SAFETY: Preserve the production message path; the observer only records
+    // state after the real scrollbar handler has moved its document.
     let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
-    if let Some(previous) = previous_tracking {
-        events.tracking.store(previous, Ordering::Release);
-    }
-    if message == WM_VSCROLL && (wparam.0 & 0xffff) as i32 == SB_THUMBTRACK.0 {
+    // SAFETY: scalar capture query on the owning test/UI thread.
+    events
+        .tracking
+        .store(unsafe { GetCapture() } == hwnd, Ordering::Release);
+    if message == WM_MOUSEMOVE && dragging {
         // SAFETY: This Box remains alive until the observer removes this
         // subclass; cells are accessed only on the fixture's UI thread.
         events
             .thumb_messages
             .set(events.thumb_messages.get().saturating_add(1));
-        // This records the position before the native tracking callback returns,
-        // demonstrating progress during the drag rather than only on mouse-up.
+        // This records progress on each captured move, before mouse-up.
         let position = scroll_info(hwnd).nPos;
         events.thumb_positions.borrow_mut().insert(position);
     }

@@ -9,7 +9,7 @@ pub(crate) enum PixelEffectError {
     InvalidTransparency,
 }
 
-/// Apply the existing two-pass box filter and dark tint, leaving X untouched.
+/// Apply the existing two-pass box filter and a BGR tint, leaving X untouched.
 /// Both slices must exactly cover width * height BGRX pixels. Scratch is reused.
 pub(crate) fn blur_and_tint(
     pixels: &mut [u8],
@@ -18,6 +18,7 @@ pub(crate) fn blur_and_tint(
     height: usize,
     radius: usize,
     transparency_percent: u8,
+    tint_bgr: [u8; 3],
 ) -> Result<(), PixelEffectError> {
     if width == 0 || height == 0 {
         return Err(PixelEffectError::EmptyImage);
@@ -60,7 +61,7 @@ pub(crate) fn blur_and_tint(
         }
     }
     for x in 0..width {
-        for (channel, tint) in [51_u32, 32, 23].into_iter().enumerate() {
+        for (channel, tint) in tint_bgr.into_iter().map(u32::from).enumerate() {
             let at = |y: usize| scratch[(y * width + x) * 4 + channel] as u32;
             let mut sum = (radius as u32 + 1) * at(0);
             for y in 1..=radius {
@@ -175,8 +176,16 @@ mod tests {
                 for percent in [0, 1, 35, 79, 80, 100] {
                     let mut pixels = input.clone();
                     let mut scratch = vec![137; input.len()];
-                    blur_and_tint(&mut pixels, &mut scratch, width, height, radius, percent)
-                        .unwrap();
+                    blur_and_tint(
+                        &mut pixels,
+                        &mut scratch,
+                        width,
+                        height,
+                        radius,
+                        percent,
+                        [51, 32, 23],
+                    )
+                    .unwrap();
                     let mut baseline = input.clone();
                     let mut baseline_scratch = vec![137; input.len()];
                     baseline_blur_and_tint(
@@ -216,14 +225,22 @@ mod tests {
             let mut pixels = [1, 2, 3, 4];
             let mut scratch = [5, 6, 7, 8];
             assert_eq!(
-                blur_and_tint(&mut pixels, &mut scratch, width, height, radius, percent),
+                blur_and_tint(
+                    &mut pixels,
+                    &mut scratch,
+                    width,
+                    height,
+                    radius,
+                    percent,
+                    [51, 32, 23]
+                ),
                 Err(error)
             );
             assert_eq!(pixels, [1, 2, 3, 4]);
             assert_eq!(scratch, [5, 6, 7, 8]);
         }
         assert_eq!(
-            blur_and_tint(&mut [0; 4], &mut [0; 3], 1, 1, 1, 35),
+            blur_and_tint(&mut [0; 4], &mut [0; 3], 1, 1, 1, 35, [51, 32, 23]),
             Err(PixelEffectError::InvalidLength)
         );
     }
@@ -238,7 +255,16 @@ mod tests {
             for (width, height) in [(1, 1), (1, 7), (7, 1), (12, 8)] {
                 let mut pixels = vec![255; width * height * 4];
                 let mut scratch = vec![0; pixels.len()];
-                blur_and_tint(&mut pixels, &mut scratch, width, height, 9, percent).unwrap();
+                blur_and_tint(
+                    &mut pixels,
+                    &mut scratch,
+                    width,
+                    height,
+                    9,
+                    percent,
+                    [51, 32, 23],
+                )
+                .unwrap();
                 for pixel in pixels.chunks_exact(4) {
                     assert_eq!(pixel, &expected);
                 }
@@ -247,9 +273,26 @@ mod tests {
         let mut pixels = vec![0; 12 * 4];
         pixels[6 * 4..].fill(255);
         let mut scratch = vec![0; pixels.len()];
-        blur_and_tint(&mut pixels, &mut scratch, 12, 1, 3, 35).unwrap();
+        blur_and_tint(&mut pixels, &mut scratch, 12, 1, 3, 35, [51, 32, 23]).unwrap();
         assert!(pixels[5 * 4] > pixels[0]);
         assert!(pixels[6 * 4] < pixels[11 * 4]);
         assert!(pixels[5 * 4] <= pixels[6 * 4]);
+    }
+
+    #[test]
+    fn tint_selects_panel_color_without_changing_x_or_full_transparency() {
+        let input = [8, 31, 179, 17, 207, 19, 51, 83];
+        for tint in [[255, 255, 255], [51, 32, 23]] {
+            let mut opaque = input;
+            let mut scratch = [0; 8];
+            blur_and_tint(&mut opaque, &mut scratch, 2, 1, 0, 0, tint).unwrap();
+            for (actual, source) in opaque.chunks_exact(4).zip(input.chunks_exact(4)) {
+                assert_eq!(&actual[..3], &tint);
+                assert_eq!(actual[3], source[3]);
+            }
+            let mut transparent = input;
+            blur_and_tint(&mut transparent, &mut scratch, 2, 1, 0, 100, tint).unwrap();
+            assert_eq!(transparent, input);
+        }
     }
 }

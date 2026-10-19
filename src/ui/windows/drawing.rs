@@ -5,6 +5,7 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::core::{Error, PCWSTR, Result, w};
 
 use super::frost::FrostedPanel;
+use super::theme::active_palette;
 use crate::app::config::AppearanceConfig;
 use crate::app::i18n::{Language, language};
 use crate::core::color::Rgb8;
@@ -21,22 +22,9 @@ pub(super) fn live_preview_height_dip(border_width_dip: u8) -> i32 {
     38 + i32::from(border_width_dip.saturating_sub(2))
 }
 
-/// The sampling overlays deliberately stay dark, so they remain distinct from
-/// both the sampled pixels and the normal result/settings windows.
-pub(super) mod palette {
-    use windows::Win32::Foundation::COLORREF;
-
-    const fn rgb(value: u32) -> COLORREF {
-        COLORREF(((value & 0xff) << 16) | (value & 0xff00) | ((value >> 16) & 0xff))
-    }
-
-    pub const BACKGROUND: COLORREF = rgb(0x111827);
-    pub const PANEL: COLORREF = rgb(0x172033);
-    pub const BORDER: COLORREF = rgb(0x334155);
-    pub const TEXT: COLORREF = rgb(0xf8fafc);
-    pub const SECONDARY: COLORREF = rgb(0xcbd5e1);
-    pub const ACCENT: COLORREF = rgb(0x93c5fd);
-    pub const EMPTY: COLORREF = rgb(0x475569);
+/// Convert GDI's RGB byte order to the BGR channels in a backdrop bitmap.
+pub(super) fn bgr(color: COLORREF) -> [u8; 3] {
+    [(color.0 >> 16) as u8, (color.0 >> 8) as u8, color.0 as u8]
 }
 
 pub(super) struct Content {
@@ -153,6 +141,7 @@ impl Surface {
     }
 
     pub fn draw(&self, target: HDC, content: &Content, origin: ScreenPointPx) -> Result<()> {
+        let palette = active_palette();
         // SAFETY: the private compatible buffer has no CPU views or escaped DC.
         let saved = unsafe { SavedDc::new(self.dc())? };
         let rect = RECT {
@@ -170,7 +159,7 @@ impl Surface {
                 "Could not obtain the shared drawing brush",
             ));
         }
-        self.fill(swatch_brush, palette::PANEL, rect)?;
+        self.fill(swatch_brush, palette.panel, rect)?;
         if let Some(frost) = &self.frost {
             // A decorative backdrop failure keeps the opaque base below it.
             let panel = RECT {
@@ -178,10 +167,10 @@ impl Surface {
                 ..rect
             };
             if frost.paint(self.dc(), panel, origin).is_err() {
-                self.fill(swatch_brush, palette::PANEL, panel)?;
+                self.fill(swatch_brush, palette.panel, panel)?;
             }
         }
-        let color = content.rgb.map_or(palette::EMPTY, |rgb| {
+        let color = content.rgb.map_or(palette.field, |rgb| {
             COLORREF(u32::from(rgb.r) | (u32::from(rgb.g) << 8) | (u32::from(rgb.b) << 16))
         });
         // The swatch remains flush to the window edges, without inset padding.
@@ -203,7 +192,7 @@ impl Surface {
                 right: 164,
                 bottom: 21,
             },
-            palette::TEXT,
+            palette.ink,
             &content.color_text,
         )?;
         self.text(
@@ -214,7 +203,7 @@ impl Surface {
                 right: 164,
                 bottom: 37,
             },
-            palette::SECONDARY,
+            palette.muted,
             &content.coordinates,
         )?;
         draw_bottom_right_border(
@@ -299,8 +288,10 @@ pub(super) fn draw_bottom_right_border(
     let saved = unsafe { SavedDc::new(dc)? };
     // SAFETY: the stock brush is borrowed, never converted into an owner.
     let brush = HBRUSH(unsafe { GetStockObject(DC_BRUSH) }.0);
-    // SAFETY: dc stays live and SavedDc restores its brush color on exit.
-    if brush.is_invalid() || unsafe { SetDCBrushColor(dc, palette::BORDER) }.0 == CLR_INVALID {
+    if brush.is_invalid()
+        // SAFETY: dc stays live and SavedDc restores its brush color on exit.
+        || unsafe { SetDCBrushColor(dc, active_palette().border) }.0 == CLR_INVALID
+    {
         return Err(Error::new(E_FAIL, "Could not configure the overlay border"));
     }
     for edge in [
@@ -388,6 +379,42 @@ pub(super) fn draw_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::appearance::{ThemeMode, set_theme_mode, theme_mode};
+
+    #[test]
+    fn both_themes_preserve_the_sampled_swatch_and_use_their_panel_and_border() {
+        let original = theme_mode();
+        let rgb = Rgb8::new(0x49, 0xa7, 0xc6);
+        let content = Content {
+            rgb: Some(rgb),
+            color_text: "#49A7C6".encode_utf16().collect(),
+            coordinates: "X 1280  Y 720".encode_utf16().collect(),
+        };
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            set_theme_mode(mode);
+            let surface = Surface::new(
+                168,
+                38,
+                96,
+                false,
+                AppearanceConfig {
+                    background_transparency_percent: 0,
+                    ..AppearanceConfig::default()
+                },
+            )
+            .unwrap();
+            surface
+                .draw(surface.dc(), &content, ScreenPointPx { x: 0, y: 0 })
+                .unwrap();
+            // SAFETY: all coordinates are inside the test-owned offscreen bitmap.
+            unsafe {
+                assert_eq!(GetPixel(surface.dc(), 10, 10), COLORREF(0x00c6a749));
+                assert_eq!(GetPixel(surface.dc(), 40, 10), active_palette().panel);
+                assert_eq!(GetPixel(surface.dc(), 167, 10), active_palette().border);
+            }
+        }
+        set_theme_mode(original);
+    }
 
     #[test]
     fn wide_live_borders_leave_both_text_lines_intact_at_common_dpis() {
@@ -436,7 +463,7 @@ mod tests {
                     for x in dip(44, dpi)..dip(164, dpi) {
                         // SAFETY: both test surfaces own offscreen bitmaps covering x/y.
                         let expected = unsafe { GetPixel(reference.dc(), x, y) };
-                        if expected != palette::PANEL {
+                        if expected != active_palette().panel {
                             let line = usize::from(y >= dip(21, dpi));
                             text_pixels[line] += 1;
                             assert_eq!(
@@ -456,12 +483,12 @@ mod tests {
                     assert_eq!(
                         // SAFETY: right-edge coordinates are inside the owned surface.
                         unsafe { GetPixel(actual.dc(), width - 1, height / 2) },
-                        palette::BORDER
+                        active_palette().border
                     );
                     assert_eq!(
                         // SAFETY: bottom-edge coordinates are inside the owned surface.
                         unsafe { GetPixel(actual.dc(), width / 2, height - 1) },
-                        palette::BORDER
+                        active_palette().border
                     );
                 }
             }

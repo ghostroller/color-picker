@@ -7,6 +7,7 @@ use std::cell::Cell;
 
 use color_picker::{
     app::{
+        appearance::{ThemeMode, set_theme_mode, theme_mode},
         config::Config,
         i18n::{self, Language},
     },
@@ -15,14 +16,225 @@ use color_picker::{
 use pixel_fixture::ScopedPmv2;
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Graphics::{Dwm::DwmFlush, Gdi::*},
         UI::{
+            Controls::TBM_SETPOS,
+            Input::KeyboardAndMouse::SetFocus,
             Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::*,
         },
     },
     core::w,
 };
+
+#[test]
+#[ignore = "requires an interactive Windows desktop; paints only its own settings window"]
+fn theme_switch_repaints_visible_and_previously_clipped_slider_backgrounds() {
+    let _dpi = ScopedPmv2::enter().unwrap();
+    let _theme = ScopedTheme(theme_mode());
+    set_theme_mode(ThemeMode::Dark);
+    i18n::set_language(Language::SimplifiedChinese);
+    let config = Config {
+        language: Language::SimplifiedChinese,
+        theme: ThemeMode::Dark,
+        ..Config::default()
+    };
+    // This fixture never runs the application host, writes configuration, registers
+    // a hotkey, or touches the clipboard. Apply only returns an in-memory draft.
+    let settings = SettingsWindow::new(&config, HWND::default(), None, true).unwrap();
+    // SAFETY: Resize and raise only this fixture's owned root, keeping it on screen
+    // while actual WM_PAINT output is sampled from its control DCs.
+    unsafe {
+        SetWindowPos(
+            settings.hwnd(),
+            Some(HWND_TOPMOST),
+            20,
+            20,
+            700,
+            700,
+            SWP_NOACTIVATE,
+        )
+        .unwrap();
+    }
+    settings.process_pending().unwrap();
+    let viewport = child(settings.hwnd(), 200);
+    let content = child(viewport, 201);
+    let sliders = [child(content, 107), child(content, 108)];
+    let title = child(content, 15);
+    let checkbox = child(content, 101);
+    let fonts = [font(title), font(checkbox)];
+    // Keep uncommitted values distinct from startup values throughout repainting.
+    // SAFETY: These scalar messages target live controls in the fixture's own tree.
+    unsafe {
+        SendMessageW(sliders[0], TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(5)));
+        SendMessageW(sliders[1], TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(43)));
+        SendMessageW(child(content, 105), CB_SETCURSEL, Some(WPARAM(1)), None);
+    }
+    let draft = take_draft(&settings);
+    assert_eq!(draft.appearance.border_width_dip, 5);
+    assert_eq!(draft.appearance.background_transparency_percent, 43);
+
+    reveal_sliders(&settings, sliders[1]);
+    assert_slider_points_visible(viewport, &sliders);
+    assert_slider_backgrounds(&sliders, ThemeMode::Dark, "initial dark paint");
+    let offset = scroll_position(viewport);
+    assert!(offset > 0, "fixture must scroll to expose both sliders");
+
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        set_theme_mode(mode);
+        settings.refresh_theme().unwrap();
+        paint_owned_tree(&settings);
+        assert_slider_backgrounds(&sliders, mode, "switch with visible sliders");
+        assert_eq!(scroll_position(viewport), offset);
+        assert_eq!([font(title), font(checkbox)], fonts);
+        assert_eq!(take_draft(&settings), draft);
+    }
+
+    scroll(viewport, SB_TOP);
+    paint_owned_tree(&settings);
+    let viewport_rect = window_rect(viewport);
+    for slider in sliders {
+        assert!(
+            window_rect(slider).top >= viewport_rect.bottom,
+            "both sliders must be clipped out of view during the final switch"
+        );
+    }
+    set_theme_mode(ThemeMode::Light);
+    settings.refresh_theme().unwrap();
+    paint_owned_tree(&settings);
+    assert_eq!(scroll_position(viewport), 0);
+    assert_eq!([font(title), font(checkbox)], fonts);
+    assert_eq!(take_draft(&settings), draft);
+    reveal_sliders(&settings, sliders[1]);
+    assert_slider_points_visible(viewport, &sliders);
+    assert_slider_backgrounds(&sliders, ThemeMode::Light, "first paint after reveal");
+    assert_eq!(scroll_position(viewport), offset);
+}
+
+fn child(parent: HWND, id: i32) -> HWND {
+    // SAFETY: Every parent passed by the fixture belongs to its live settings tree.
+    unsafe { GetDlgItem(Some(parent), id) }.unwrap()
+}
+
+fn take_draft(settings: &SettingsWindow) -> Config {
+    // SAFETY: Apply is a scalar command to the fixture-owned root. No application
+    // host consumes the result, so it cannot persist or register anything.
+    unsafe { SendMessageW(settings.hwnd(), WM_COMMAND, Some(WPARAM(1)), None) };
+    let Some(SettingsAction::Apply(draft)) = settings.process_pending().unwrap() else {
+        panic!("Apply must return a validated settings draft");
+    };
+    draft
+}
+
+fn scroll(viewport: HWND, command: SCROLLBAR_COMMAND) {
+    // SAFETY: The fixture owns this viewport; scrolling carries only a scalar command.
+    unsafe { SendMessageW(viewport, WM_VSCROLL, Some(WPARAM(command.0 as usize)), None) };
+}
+
+fn reveal_sliders(settings: &SettingsWindow, last_slider: HWND) {
+    // SAFETY: Move focus only inside the test-owned tree. Its normal focus-scroll
+    // path reveals the lower slider without scrolling the first past the viewport.
+    unsafe {
+        let _ = SetFocus(Some(settings.hwnd()));
+        let _ = SetFocus(Some(last_slider));
+    }
+    paint_owned_tree(settings);
+}
+
+fn assert_slider_points_visible(viewport: HWND, sliders: &[HWND; 2]) {
+    let viewport = window_rect(viewport);
+    for &slider in sliders {
+        let slider = window_rect(slider);
+        assert!(
+            slider.top >= viewport.top && slider.bottom <= viewport.bottom,
+            "fixture must expose the entire slider: slider {slider:?}, viewport {viewport:?}"
+        );
+    }
+}
+
+fn scroll_position(viewport: HWND) -> i32 {
+    let mut info = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_POS,
+        ..Default::default()
+    };
+    // SAFETY: The live viewport writes only the advertised local SCROLLINFO slot.
+    unsafe { GetScrollInfo(viewport, SB_VERT, &mut info) }.unwrap();
+    info.nPos
+}
+
+fn window_rect(hwnd: HWND) -> RECT {
+    let mut rect = RECT::default();
+    // SAFETY: The fixture keeps this window alive while its bounds are queried.
+    unsafe { GetWindowRect(hwnd, &mut rect) }.unwrap();
+    rect
+}
+
+fn paint_owned_tree(settings: &SettingsWindow) {
+    let mut message = MSG::default();
+    // SAFETY: Pump only this root's messages and descendants. Every dispatched native
+    // payload remains valid through its synchronous dispatch on the owning UI thread.
+    unsafe {
+        while PeekMessageW(&mut message, Some(settings.hwnd()), 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    settings.process_pending().unwrap();
+    // SAFETY: Force actual WM_PAINT for this owned tree, rather than WM_PRINTCLIENT,
+    // which can bypass the native trackbar's stale screen-paint cache.
+    unsafe {
+        assert!(
+            RedrawWindow(
+                Some(settings.hwnd()),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            )
+            .as_bool()
+        );
+        DwmFlush().unwrap();
+    }
+}
+
+fn assert_slider_backgrounds(sliders: &[HWND; 2], mode: ThemeMode, phase: &str) {
+    let expected = match mode {
+        ThemeMode::Light => COLORREF(0xffffff),
+        ThemeMode::Dark => COLORREF(0x332017),
+    };
+    let mut samples = Vec::with_capacity(sliders.len());
+    for (index, &slider) in sliders.iter().enumerate() {
+        let mut rect = RECT::default();
+        // SAFETY: Each live trackbar remains owned by the fixture during this query.
+        unsafe { GetClientRect(slider, &mut rect) }.unwrap();
+        // Sample lower corners, clear of the centered channel and movable thumb.
+        let points = [(3, rect.bottom - 3), (rect.right - 4, rect.bottom - 3)];
+        // SAFETY: GetDC borrows only this owned live control. ReleaseDC pairs it
+        // before any assertion can unwind the window fixture.
+        let colors = unsafe {
+            let dc = GetDC(Some(slider));
+            assert!(!dc.0.is_null(), "owned slider DC must be available");
+            let colors = points.map(|(x, y)| GetPixel(dc, x, y));
+            assert_eq!(ReleaseDC(Some(slider), dc), 1);
+            colors
+        };
+        samples.push((index, rect.right, rect.bottom, points, colors));
+    }
+    assert!(
+        samples.iter().all(|sample| sample.4 == [expected; 2]),
+        "{phase}: expected {mode:?} background {expected:?}; slider samples \
+         (index, width, height, client points, colors): {samples:?}"
+    );
+}
+
+struct ScopedTheme(ThemeMode);
+
+impl Drop for ScopedTheme {
+    fn drop(&mut self) {
+        set_theme_mode(self.0);
+    }
+}
 
 #[test]
 #[ignore = "requires an interactive Windows desktop; refreshes only its own settings window"]

@@ -27,10 +27,9 @@ use windows::{
     core::{BOOL, Error, PCWSTR, Result, w},
 };
 
-use super::drawing::{
-    OwnedFont, border_thickness, dip, draw_bottom_right_border, draw_text, palette,
-};
+use super::drawing::{OwnedFont, border_thickness, dip, draw_bottom_right_border, draw_text};
 use super::frost::FrostedPanel;
+use super::theme::active_palette;
 use crate::{
     app::{config::AppearanceConfig, diagnostics, i18n::tr},
     core::{
@@ -751,7 +750,7 @@ impl Surface {
                 right: self.width,
                 bottom: self.height,
             },
-            palette::BACKGROUND,
+            active_palette().canvas,
         )?;
         let image = view.image();
         let source = view.source_view();
@@ -880,6 +879,7 @@ impl Surface {
     }
 
     fn draw_footer(&self, top: i32, footer: &Footer, bounds: ScreenRectPx) -> Result<()> {
+        let palette = active_palette();
         self.fill(
             RECT {
                 left: 0,
@@ -887,7 +887,7 @@ impl Surface {
                 right: self.width,
                 bottom: self.height,
             },
-            palette::PANEL,
+            palette.panel,
         )?;
         if let Some(frost) = &self.frost {
             let panel = RECT {
@@ -909,7 +909,7 @@ impl Surface {
             {
                 // Backdrop failure is decorative only; retain readable colors
                 // and continue sampling with the ordinary solid information bar.
-                self.fill(panel, palette::PANEL)?;
+                self.fill(panel, palette.panel)?;
             }
         }
         let border = border_thickness(
@@ -918,7 +918,7 @@ impl Surface {
             self.dpi,
             self.appearance.border_width_dip,
         );
-        let color = footer.rgb.map_or(palette::EMPTY, |rgb| {
+        let color = footer.rgb.map_or(palette.field, |rgb| {
             COLORREF(u32::from(rgb.r) | (u32::from(rgb.g) << 8) | (u32::from(rgb.b) << 16))
         });
         let side = self.footer_swatch_width(footer, border)?;
@@ -1035,19 +1035,19 @@ impl Surface {
                 FooterLabel {
                     rect: rect(left, left + hex.cx, hex.cy),
                     font: hex_font,
-                    color: palette::TEXT,
+                    color: active_palette().ink,
                     text: &footer.hex,
                 },
                 FooterLabel {
                     rect: rect(scale_left, coordinate_left - gap, scale.cy),
                     font: info_font,
-                    color: palette::ACCENT,
+                    color: active_palette().accent,
                     text: &footer.scale,
                 },
                 FooterLabel {
                     rect: rect(coordinate_left, right, position.cy),
                     font: info_font,
-                    color: palette::SECONDARY,
+                    color: active_palette().muted,
                     text: coordinates,
                 },
             ]);

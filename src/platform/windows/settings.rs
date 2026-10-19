@@ -7,6 +7,7 @@ use super::{
     hotkey::{DEFAULT_HOTKEY_ID, HotkeyGuard},
 };
 use crate::app::{
+    appearance::set_theme_mode,
     config::{Config, ConfigRevision, ConfigStore},
     diagnostics,
     i18n::{set_language, tr},
@@ -50,6 +51,7 @@ impl SettingsRuntime {
             ),
         };
         set_language(config.language);
+        set_theme_mode(config.theme);
         let mut runtime = Self {
             config,
             notice,
@@ -139,11 +141,13 @@ impl SettingsRuntime {
         self.revision = Some(revision);
         self.config = config;
         set_language(self.config.language);
+        set_theme_mode(self.config.theme);
         let old_hotkey = replacement.and_then(|guard| self.hotkey.replace(guard));
         self.notice = None;
         diagnostics::event(format_args!(
-            "config.applied hotkey={} default_format={:?} auto_copy={} border_width_dip={} background_transparency_percent={}",
+            "config.applied hotkey={} theme={:?} default_format={:?} auto_copy={} border_width_dip={} background_transparency_percent={}",
             self.config.hotkey.label(),
+            self.config.theme,
             self.config.default_format,
             self.config.auto_copy_on_pick,
             self.config.appearance.border_width_dip,
@@ -233,8 +237,10 @@ mod tests {
     #[test]
     #[ignore = "temporarily registers Ctrl+Alt+Shift+F9/F10/F11; requires those chords to be unused"]
     fn hotkey_conflict_and_save_failure_preserve_the_old_transaction() {
+        use crate::app::appearance::{ThemeMode, theme_mode};
         use crate::app::i18n::{Language, language};
         set_language(Language::SimplifiedChinese);
+        set_theme_mode(ThemeMode::Light);
         let directory = TestDirectory::new();
         let owner = TestWindow::new();
         let probe = TestWindow::new();
@@ -269,6 +275,7 @@ mod tests {
         };
         let conflicting = Config {
             language: Language::English,
+            theme: ThemeMode::Dark,
             hotkey: chord("F10"),
             ..original.clone()
         };
@@ -277,6 +284,7 @@ mod tests {
         let error = runtime.apply(owner.0, conflicting.clone()).unwrap_err();
         assert!(error.contains("快捷键"), "{error}");
         assert_eq!(language(), Language::SimplifiedChinese);
+        assert_eq!(theme_mode(), ThemeMode::Light);
         assert_eq!(runtime.config, original);
         assert_eq!(runtime.hotkey_id(), Some(101));
         assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
@@ -293,6 +301,7 @@ mod tests {
         let error = runtime.apply(owner.0, conflicting).unwrap_err();
         assert!(error.contains("保存失败"), "{error}");
         assert_eq!(language(), Language::SimplifiedChinese);
+        assert_eq!(theme_mode(), ThemeMode::Light);
         assert_eq!(runtime.config, original);
         assert_eq!(runtime.hotkey_id(), Some(101));
         assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
@@ -316,11 +325,13 @@ mod tests {
                 owner.0,
                 Config {
                     hotkey: chord("F10"),
+                    theme: ThemeMode::Dark,
                     ..original.clone()
                 },
             )
             .unwrap_err();
         assert!(error.contains("外部修改"), "{error}");
+        assert_eq!(theme_mode(), ThemeMode::Light);
         assert_eq!(runtime.config, original);
         assert_eq!(runtime.revision, accepted_revision);
         assert_eq!(runtime.hotkey_id(), Some(101));
@@ -334,6 +345,7 @@ mod tests {
 
         let updated = Config {
             language: Language::English,
+            theme: ThemeMode::Dark,
             hotkey: chord("F11"),
             default_format: ColorFormat::Hsl,
             auto_copy_on_pick: true,
@@ -345,6 +357,7 @@ mod tests {
             .expect("successful replacement returns the old registration");
         assert_eq!(runtime.config, updated);
         assert_eq!(language(), Language::English);
+        assert_eq!(theme_mode(), ThemeMode::Dark);
         assert_ne!(runtime.hotkey_id(), Some(101));
         assert_eq!(runtime.store.as_ref().unwrap().load().config, updated);
         assert_eq!(

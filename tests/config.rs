@@ -1,4 +1,5 @@
 use color_picker::{
+    app::appearance::ThemeMode,
     app::config::{AppearanceConfig, Config, ConfigError, ConfigStore, HotkeyConfig},
     app::i18n::Language,
     core::format::ColorFormat,
@@ -144,6 +145,7 @@ fn missing_config_defaults_and_valid_changes_round_trip() {
         auto_copy_on_pick: true,
         quick_pick: true,
         language: Language::English,
+        theme: ThemeMode::Dark,
         appearance: AppearanceConfig {
             border_width_dip: 4,
             background_transparency_percent: 65,
@@ -169,12 +171,14 @@ fn previous_schema_one_configs_default_missing_preferences() {
     previous.as_object_mut().unwrap().remove("appearance");
     previous.as_object_mut().unwrap().remove("quick_pick");
     previous.as_object_mut().unwrap().remove("language");
+    previous.as_object_mut().unwrap().remove("theme");
     std::fs::write(store.path(), serde_json::to_vec(&previous).unwrap()).unwrap();
     let loaded = store.load();
     assert!(loaded.save_allowed && loaded.warning.is_none());
     assert_eq!(loaded.config.appearance, AppearanceConfig::default());
     assert!(!loaded.config.quick_pick);
     assert_eq!(loaded.config.language, Language::default());
+    assert_eq!(loaded.config.theme, ThemeMode::Light);
 
     previous["appearance"] = serde_json::json!({"border_width_dip": 5});
     let partial: Config = serde_json::from_value(previous).unwrap();
@@ -285,6 +289,40 @@ fn unsupported_keys_and_strict_json_are_rejected() {
     let mut value = serde_json::to_value(Config::default()).unwrap();
     value["language"] = "fr".into();
     assert!(serde_json::from_value::<Config>(value).is_err());
+    let mut value = serde_json::to_value(Config::default()).unwrap();
+    value["theme"] = "system".into();
+    assert!(serde_json::from_value::<Config>(value).is_err());
+}
+
+#[test]
+fn both_themes_round_trip_and_unknown_themes_remain_protected() {
+    let directory = TempDirectory::new();
+    let store = ConfigStore::new(directory.path());
+    assert_eq!(Config::default().theme, ThemeMode::Light);
+    for (theme, value) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        let config = Config {
+            theme,
+            quick_pick: true,
+            ..Config::default()
+        };
+        store.save(&config).unwrap();
+        let restored = store.load();
+        assert!(restored.warning.is_none() && restored.save_allowed);
+        assert_eq!(restored.config, config);
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+        assert_eq!(json["theme"], value);
+    }
+
+    let mut unknown = serde_json::to_value(Config::default()).unwrap();
+    unknown["theme"] = "system".into();
+    let unknown_bytes = serde_json::to_vec(&unknown).unwrap();
+    std::fs::write(store.path(), &unknown_bytes).unwrap();
+    let loaded = store.load();
+    assert!(!loaded.save_allowed && loaded.warning.is_some());
+    assert_eq!(loaded.config, Config::default());
+    assert!(store.save(&Config::default()).is_err());
+    assert_eq!(std::fs::read(store.path()).unwrap(), unknown_bytes);
 }
 
 #[test]

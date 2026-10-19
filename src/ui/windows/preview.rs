@@ -20,7 +20,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, Error, PCWSTR, Result, w};
 
 use super::drawing::{Content, Surface, dip, live_preview_height_dip};
-use crate::app::{config::AppearanceConfig, diagnostics, i18n::tr};
+use crate::app::{
+    appearance::{ThemeMode, theme_mode},
+    config::AppearanceConfig,
+    diagnostics,
+    i18n::tr,
+};
 use crate::core::color::Rgb8;
 use crate::core::format::{ColorFormat, format_color};
 use crate::core::geometry::{ScreenPointPx, ScreenRectPx};
@@ -36,6 +41,7 @@ struct State {
     rect: Option<ScreenRectPx>,
     dpi_dirty: bool,
     paint_error: Option<Error>,
+    theme_mode: ThemeMode,
 }
 
 #[derive(Default)]
@@ -195,7 +201,11 @@ impl PreviewWindow {
             state.sample = Some((point, rgb));
             state.content = Some(content);
         }
-        let mut changed = content_changed;
+        let theme_changed = self.state.state.borrow().theme_mode != theme_mode();
+        if theme_changed {
+            self.state.state.borrow_mut().theme_mode = theme_mode();
+        }
+        let mut changed = content_changed || theme_changed;
         // Moving between mixed-DPI monitors may deliver WM_DPICHANGED during
         // SetWindowPos. A second pass then uses the actual target-window DPI.
         for _ in 0..2 {

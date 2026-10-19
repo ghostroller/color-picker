@@ -10,9 +10,14 @@ use windows::{
 };
 
 use super::super::drawing::{
-    OwnedFont, dip, draw_bottom_right_border, draw_text, live_preview_height_dip, palette,
+    OwnedFont, bgr, dip, draw_bottom_right_border, draw_text, live_preview_height_dip,
 };
-use crate::app::{config::AppearanceConfig, i18n::tr};
+use super::super::theme::palette_for;
+use crate::app::{
+    appearance::{ThemeMode, theme_mode},
+    config::AppearanceConfig,
+    i18n::tr,
+};
 use crate::platform::windows::gdi::SavedDc;
 use crate::ui::pixel_effects::blur_and_tint;
 
@@ -25,6 +30,7 @@ const OVERLAY_WIDTH: i32 = 168;
 pub(super) struct AppearancePreview {
     dpi: u32,
     appearance: AppearanceConfig,
+    theme_mode: ThemeMode,
     pixels: Vec<u8>,
     heading: OwnedFont,
     body: OwnedFont,
@@ -32,20 +38,23 @@ pub(super) struct AppearancePreview {
 
 impl AppearancePreview {
     pub(super) fn new(dpi: u32, appearance: AppearanceConfig) -> Result<Self> {
+        let theme_mode = theme_mode();
         Ok(Self {
             dpi,
             appearance,
-            pixels: example_pixels(dpi, appearance),
+            theme_mode,
+            pixels: example_pixels(dpi, appearance, theme_mode),
             heading: OwnedFont::new(13, 600, dpi)?,
             body: OwnedFont::new(10, 400, dpi)?,
         })
     }
 
     pub(super) fn matches(&self, dpi: u32, appearance: AppearanceConfig) -> bool {
-        self.dpi == dpi && self.appearance == appearance
+        self.dpi == dpi && self.appearance == appearance && self.theme_mode == theme_mode()
     }
 
     pub(super) fn paint(&self, dc: HDC, bounds: RECT) -> Result<()> {
+        let palette = palette_for(self.theme_mode);
         let width = dip(WIDTH, self.dpi);
         let height = dip(HEIGHT, self.dpi);
         let visible_width = (bounds.right - bounds.left).min(width);
@@ -111,14 +120,14 @@ impl AppearancePreview {
                 dc,
                 &self.heading,
                 rect(44, 2, 164, 21),
-                palette::TEXT,
+                palette.ink,
                 &"#49A7C6".encode_utf16().collect::<Vec<_>>(),
             )?;
             draw_text(
                 dc,
                 &self.body,
                 rect(44, 21, 164, 37),
-                palette::SECONDARY,
+                palette.muted,
                 &"X 1280  Y 720".encode_utf16().collect::<Vec<_>>(),
             )?;
             draw_bottom_right_border(
@@ -134,7 +143,7 @@ impl AppearancePreview {
     }
 }
 
-fn example_pixels(dpi: u32, appearance: AppearanceConfig) -> Vec<u8> {
+fn example_pixels(dpi: u32, appearance: AppearanceConfig, theme_mode: ThemeMode) -> Vec<u8> {
     let width = dip(WIDTH, dpi) as usize;
     let height = dip(HEIGHT, dpi) as usize;
     let mut pixels = vec![0xff; width * height * 4];
@@ -170,6 +179,7 @@ fn example_pixels(dpi: u32, appearance: AppearanceConfig) -> Vec<u8> {
         overlay_height,
         dip(8, dpi).max(1) as usize,
         appearance.background_transparency_percent,
+        bgr(palette_for(theme_mode).panel),
     )
     .expect("validated appearance and locally allocated exact BGRX fixture dimensions");
     for y in 0..overlay_height {
@@ -190,41 +200,75 @@ mod tests {
 
     #[test]
     fn example_transparency_only_changes_the_information_panel() {
-        for dpi in [96, 144, 192] {
-            let opaque = example_pixels(
-                dpi,
-                AppearanceConfig {
-                    background_transparency_percent: 0,
-                    ..AppearanceConfig::default()
-                },
-            );
-            let transparent = example_pixels(
-                dpi,
-                AppearanceConfig {
-                    background_transparency_percent: 80,
-                    ..AppearanceConfig::default()
-                },
-            );
-            let width = dip(WIDTH, dpi) as usize;
-            let height = dip(HEIGHT, dpi) as usize;
-            let left = (width - dip(OVERLAY_WIDTH, dpi) as usize) / 2;
-            let top = (height
-                - dip(
-                    live_preview_height_dip(AppearanceConfig::default().border_width_dip),
+        for theme_mode in [ThemeMode::Light, ThemeMode::Dark] {
+            for dpi in [96, 144, 192] {
+                let opaque = example_pixels(
                     dpi,
-                ) as usize)
-                / 2;
-            let at = |x, y| (y * width + x) * 4;
-            let swatch = at(left + dip(10, dpi) as usize, top + dip(10, dpi) as usize);
-            assert_eq!(&opaque[swatch..swatch + 4], &[0xc6, 0xa7, 0x49, 255]);
-            assert_eq!(
-                &opaque[swatch..swatch + 4],
-                &transparent[swatch..swatch + 4]
-            );
-            assert_eq!(&opaque[..width * 4], &transparent[..width * 4]);
-            let info = at(left + dip(50, dpi) as usize, top + dip(10, dpi) as usize);
-            assert_eq!(&opaque[info..info + 4], &[51, 32, 23, 255]);
-            assert_ne!(&opaque[info..info + 4], &transparent[info..info + 4]);
+                    AppearanceConfig {
+                        background_transparency_percent: 0,
+                        ..AppearanceConfig::default()
+                    },
+                    theme_mode,
+                );
+                let transparent = example_pixels(
+                    dpi,
+                    AppearanceConfig {
+                        background_transparency_percent: 80,
+                        ..AppearanceConfig::default()
+                    },
+                    theme_mode,
+                );
+                let width = dip(WIDTH, dpi) as usize;
+                let height = dip(HEIGHT, dpi) as usize;
+                let left = (width - dip(OVERLAY_WIDTH, dpi) as usize) / 2;
+                let top = (height
+                    - dip(
+                        live_preview_height_dip(AppearanceConfig::default().border_width_dip),
+                        dpi,
+                    ) as usize)
+                    / 2;
+                let at = |x, y| (y * width + x) * 4;
+                let swatch = at(left + dip(10, dpi) as usize, top + dip(10, dpi) as usize);
+                assert_eq!(&opaque[swatch..swatch + 4], &[0xc6, 0xa7, 0x49, 255]);
+                assert_eq!(
+                    &opaque[swatch..swatch + 4],
+                    &transparent[swatch..swatch + 4]
+                );
+                assert_eq!(&opaque[..width * 4], &transparent[..width * 4]);
+                let info = at(left + dip(50, dpi) as usize, top + dip(10, dpi) as usize);
+                assert_eq!(&opaque[info..info + 3], &bgr(palette_for(theme_mode).panel));
+                assert_eq!(opaque[info + 3], 255);
+                assert_ne!(&opaque[info..info + 4], &transparent[info..info + 4]);
+            }
         }
+    }
+
+    #[test]
+    fn theme_only_changes_the_information_panel() {
+        let appearance = AppearanceConfig::default();
+        let light = example_pixels(96, appearance, ThemeMode::Light);
+        let dark = example_pixels(96, appearance, ThemeMode::Dark);
+        let width = WIDTH as usize;
+        let left = (width - OVERLAY_WIDTH as usize) / 2;
+        let overlay_height = live_preview_height_dip(appearance.border_width_dip) as usize;
+        let top = (HEIGHT as usize - overlay_height) / 2;
+        let panel_left = left + 38;
+        let mut changed = 0;
+        for (index, (light, dark)) in light.chunks_exact(4).zip(dark.chunks_exact(4)).enumerate() {
+            assert_eq!(light[3], dark[3]);
+            let x = index % width;
+            let y = index / width;
+            if (panel_left..left + OVERLAY_WIDTH as usize).contains(&x)
+                && (top..top + overlay_height).contains(&y)
+            {
+                changed += usize::from(light != dark);
+            } else {
+                assert_eq!(
+                    light, dark,
+                    "theme changed a fixture or swatch pixel at ({x}, {y})"
+                );
+            }
+        }
+        assert!(changed > 0);
     }
 }

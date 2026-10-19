@@ -16,8 +16,8 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{
-            COLORREF, E_FAIL, ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT,
-            POINT, RECT, WPARAM,
+            E_FAIL, ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT,
+            WPARAM,
         },
         Graphics::{
             Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute},
@@ -51,6 +51,7 @@ use super::{
 };
 use crate::{
     app::{
+        appearance::{ThemeMode, theme_mode},
         config::{
             AppearanceConfig, Config, HotkeyConfig, MAX_BACKGROUND_TRANSPARENCY_PERCENT,
             MAX_BORDER_WIDTH_DIP,
@@ -63,6 +64,11 @@ use crate::{
 #[path = "settings_preview.rs"]
 mod settings_preview;
 use settings_preview::AppearancePreview;
+
+#[path = "scrollbar.rs"]
+mod scrollbar;
+#[path = "settings_selectors.rs"]
+mod settings_selectors;
 
 pub const WM_SETTINGS_WAKE: u32 = WM_APP + 12;
 const CLASS: PCWSTR = w!("ColorPicker.Settings.v1");
@@ -83,6 +89,8 @@ const BACKGROUND_TRANSPARENCY: usize = 108;
 const QUICK_PICK: usize = 109;
 const LANGUAGE: usize = 110;
 const LANGUAGE_LABEL: usize = 28;
+const THEME: usize = 111;
+const THEME_LABEL: usize = 30;
 const TITLE: usize = 15;
 const SUBTITLE: usize = 16;
 const COPY_HEADING: usize = 17;
@@ -155,6 +163,7 @@ struct CallbackState {
     viewport: Cell<HWND>,
     content: Cell<HWND>,
     scroll_offset: Cell<i32>,
+    scrollbar: scrollbar::Scrollbar,
     viewport_height: Cell<i32>,
     content_height: Cell<i32>,
     content_panels: RefCell<Vec<RECT>>,
@@ -163,8 +172,8 @@ struct CallbackState {
 }
 
 impl CallbackState {
-    /// Pure scrolling never remeasures or moves individual controls. Run synchronously
-    /// so native scrollbar tracking also works inside USER32's modal tracking loop.
+    /// Pure scrolling never remeasures or moves individual controls. Run
+    /// synchronously so captured scrollbar dragging updates each visible frame.
     fn scroll_to(&self, offset: i32) -> Result<()> {
         let offset = offset.clamp(
             0,
@@ -196,7 +205,8 @@ impl CallbackState {
         // SAFETY: This owned viewport's range was established by layout. USER32 copies
         // the scalar scroll state and paints the clipped, composited content subtree.
         unsafe {
-            SetScrollInfo(self.viewport.get(), SB_VERT, &info, true);
+            SetScrollInfo(self.viewport.get(), SB_VERT, &info, false);
+            self.scrollbar.paint(self.viewport.get(), &self.theme);
             let _ = RedrawWindow(
                 Some(self.viewport.get()),
                 None,
@@ -269,6 +279,8 @@ struct Controls {
     subtitle: HWND,
     language_label: HWND,
     language: HWND,
+    theme_label: HWND,
+    theme: HWND,
     hotkey_label: HWND,
     ctrl: HWND,
     alt: HWND,
@@ -300,12 +312,14 @@ struct Controls {
 }
 
 impl Controls {
-    fn handles(&self) -> [HWND; 32] {
+    fn handles(&self) -> [HWND; 34] {
         [
             self.title,
             self.subtitle,
             self.language_label,
             self.language,
+            self.theme_label,
+            self.theme,
             self.hotkey_label,
             self.ctrl,
             self.alt,
@@ -432,6 +446,7 @@ impl SettingsWindow {
             viewport: Cell::new(HWND::default()),
             content: Cell::new(HWND::default()),
             scroll_offset: Cell::new(0),
+            scrollbar: scrollbar::Scrollbar::default(),
             viewport_height: Cell::new(0),
             content_height: Cell::new(0),
             content_panels: RefCell::new(Vec::new()),
@@ -538,6 +553,7 @@ impl SettingsWindow {
         };
         window.callback.content.set(content);
         window.create_controls(config)?;
+        theme::configure_window(hwnd, &window.callback.theme);
         window.place_initially(cursor)?;
         window.refresh_language()?;
         let default_notice = if save_allowed {
@@ -582,6 +598,28 @@ impl SettingsWindow {
         self.hwnd
     }
 
+    /// Repaint an accepted theme without rebuilding the draft or its layout.
+    pub fn refresh_theme(&self) -> Result<()> {
+        let mode = theme_mode();
+        if self.callback.theme.mode() == mode {
+            return self.update_appearance_preview();
+        }
+        self.callback.theme.set_mode(mode)?;
+        theme::configure_window(self.hwnd, &self.callback.theme);
+        self.update_appearance_preview()?;
+        // SAFETY: This owner retains the entire native window tree on this UI thread;
+        // invalidation carries no pointers and does not change its draft or geometry.
+        unsafe {
+            let _ = RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME,
+            );
+        }
+        Ok(())
+    }
+
     /// Relabel the existing draft only after the host successfully applies it.
     /// Controls, selections and scroll position stay intact during the switch.
     /// An unchanged language leaves fonts, preview and layout untouched.
@@ -611,6 +649,7 @@ impl SettingsWindow {
                 ),
             ),
             (self.controls.language_label, tr("语言", "Language")),
+            (self.controls.theme_label, tr("主题", "Theme")),
             (
                 self.controls.hotkey_label,
                 tr("取色快捷键", "Picking shortcut"),
@@ -672,6 +711,13 @@ impl SettingsWindow {
             // lives until SetWindowTextW finishes copying it; no text pointer is retained.
             unsafe { SetWindowTextW(hwnd, PCWSTR(wide(text).as_ptr()))? };
         }
+        let selected_theme = selected_choice(self.controls.theme)?;
+        // SAFETY: This owner retains the combo and item strings are copied synchronously.
+        unsafe { SendMessageW(self.controls.theme, CB_RESETCONTENT, None, None) };
+        for text in [tr("亮色", "Light"), tr("暗色", "Dark")] {
+            append_choice(self.controls.theme, text)?;
+        }
+        set_choice(self.controls.theme, selected_theme)?;
         self.update_capture_text()?;
         self.font.borrow_mut().dpi = 0;
         self.callback.preview.replace(None);
@@ -857,7 +903,9 @@ impl SettingsWindow {
         }
         let label = WINDOW_STYLE(SS_NOPREFIX.0);
         let check = WS_TABSTOP | WINDOW_STYLE((BS_AUTOCHECKBOX | BS_MULTILINE) as u32);
-        let combo = WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32);
+        let combo = WS_TABSTOP
+            | WS_VSCROLL
+            | WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32);
         let button = WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32);
         let slider = WS_TABSTOP | WINDOW_STYLE(TBS_NOTICKS);
         self.controls.title = self.control(w!("STATIC"), "", TITLE, label)?;
@@ -869,6 +917,7 @@ impl SettingsWindow {
             label | WINDOW_STYLE(SS_CENTERIMAGE.0),
         )?;
         self.controls.language = self.control(w!("COMBOBOX"), "", LANGUAGE, combo)?;
+        settings_selectors::install(self.controls.language, &self.callback)?;
         for language in ["简体中文", "English"] {
             append_choice(self.controls.language, language)?;
         }
@@ -877,6 +926,24 @@ impl SettingsWindow {
             match config.language {
                 Language::SimplifiedChinese => 0,
                 Language::English => 1,
+            },
+        )?;
+        self.controls.theme_label = self.control(
+            w!("STATIC"),
+            "",
+            THEME_LABEL,
+            label | WINDOW_STYLE(SS_CENTERIMAGE.0),
+        )?;
+        self.controls.theme = self.control(w!("COMBOBOX"), "", THEME, combo)?;
+        settings_selectors::install(self.controls.theme, &self.callback)?;
+        for text in [tr("亮色", "Light"), tr("暗色", "Dark")] {
+            append_choice(self.controls.theme, text)?;
+        }
+        set_choice(
+            self.controls.theme,
+            match config.theme {
+                ThemeMode::Light => 0,
+                ThemeMode::Dark => 1,
             },
         )?;
         self.controls.hotkey_label = self.control(w!("STATIC"), "", 10, label)?;
@@ -909,6 +976,7 @@ impl SettingsWindow {
         self.controls.copy_heading = self.control(w!("STATIC"), "", COPY_HEADING, label)?;
         self.controls.format_label = self.control(w!("STATIC"), "", 13, label)?;
         self.controls.format = self.control(w!("COMBOBOX"), "", FORMAT, combo)?;
+        settings_selectors::install(self.controls.format, &self.callback)?;
         self.controls.quick_pick = self.control(w!("BUTTON"), "", QUICK_PICK, check)?;
         self.controls.auto_copy = self.control(w!("BUTTON"), "", AUTO_COPY, check)?;
         self.controls.appearance_heading =
@@ -1062,9 +1130,20 @@ impl SettingsWindow {
                 ));
             }
         };
+        let theme = match selected_choice(self.controls.theme)? {
+            0 => ThemeMode::Light,
+            1 => ThemeMode::Dark,
+            _ => {
+                return Err(Error::new(
+                    E_FAIL,
+                    tr("请选择有效的主题", "Choose a valid theme"),
+                ));
+            }
+        };
         Ok(Config {
             schema_version: self.schema_version,
             language,
+            theme,
             hotkey: HotkeyConfig {
                 ctrl: checked(self.controls.ctrl),
                 alt: checked(self.controls.alt),
@@ -1299,6 +1378,7 @@ impl SettingsWindow {
     }
 
     fn layout(&self) -> Result<()> {
+        self.callback.scrollbar.cancel(self.callback.viewport.get());
         let result = self.layout_content();
         // Native placement can fail after part of a SWP_NOREDRAW batch has been
         // applied. Always invalidate the complete tree, including error paths,
@@ -1425,7 +1505,11 @@ impl SettingsWindow {
         // passed by value and no callback-state RefMut spans synchronous layout reentry.
         unsafe { MoveWindow(viewport, 0, 0, client.right, viewport_height, true)? };
         self.callback.viewport_height.set(viewport_height);
-        for combo in [self.controls.language, self.controls.format] {
+        for combo in [
+            self.controls.language,
+            self.controls.theme,
+            self.controls.format,
+        ] {
             // SAFETY: These owned COMBOBOX controls synchronously copy scalar item heights.
             // Set the selection height before measuring and arranging their form rows.
             unsafe {
@@ -1433,13 +1517,15 @@ impl SettingsWindow {
                     combo,
                     CB_SETITEMHEIGHT,
                     Some(WPARAM(usize::MAX)),
-                    Some(LPARAM(dip(24, dpi) as isize)),
+                    Some(LPARAM(
+                        dip(settings_selectors::SELECTION_HEIGHT, dpi) as isize
+                    )),
                 );
                 SendMessageW(
                     combo,
                     CB_SETITEMHEIGHT,
                     Some(WPARAM(0)),
-                    Some(LPARAM(dip(24, dpi) as isize)),
+                    Some(LPARAM(dip(settings_selectors::ITEM_HEIGHT, dpi) as isize)),
                 );
             }
         }
@@ -1500,7 +1586,10 @@ impl SettingsWindow {
         // SAFETY: scroll is an initialized, correctly sized local SCROLLINFO for the owned
         // viewport; USER32 copies it synchronously and retains no Rust reference.
         unsafe {
-            SetScrollInfo(viewport, SB_VERT, &scroll, true);
+            SetScrollInfo(viewport, SB_VERT, &scroll, false);
+            self.callback
+                .scrollbar
+                .paint(viewport, &self.callback.theme);
         }
         let mut positions = Vec::with_capacity(geometry.controls.len());
         for (id, rect) in geometry.controls {
@@ -1508,7 +1597,7 @@ impl SettingsWindow {
             // existing child HWND and transfers no ownership.
             let control = unsafe { GetDlgItem(Some(self.callback.content.get()), id as i32)? };
             // COMBOBOX uses the requested height for its opened dropdown.
-            let height = if matches!(id, LANGUAGE | FORMAT) {
+            let height = if matches!(id, LANGUAGE | THEME | FORMAT) {
                 160
             } else {
                 rect.bottom - rect.top
@@ -1616,6 +1705,7 @@ impl SettingsWindow {
         };
         Ok(FieldMetrics {
             language_height: height(self.controls.language)?,
+            theme_height: height(self.controls.theme)?,
             format_height: height(self.controls.format)?,
         })
     }
@@ -1814,6 +1904,7 @@ struct TextExtent {
 #[derive(Clone, Copy)]
 struct FieldMetrics {
     language_height: i32,
+    theme_height: i32,
     format_height: i32,
 }
 
@@ -1841,7 +1932,7 @@ fn settings_content_layout(
         return Err(layout::unavailable());
     }
     let editor_width = 180.min(inner);
-    let label_width = [LANGUAGE_LABEL, 11, 13]
+    let label_width = [LANGUAGE_LABEL, THEME_LABEL, 11, 13]
         .into_iter()
         .map(|id| measure(id, inner, false).map(|text| text.width))
         .collect::<Result<Vec<_>>>()?
@@ -1868,6 +1959,19 @@ fn settings_content_layout(
         inner,
         editor_width,
         fields.language_height,
+        inline_fields,
+    )?;
+    y += 16;
+    y += place_field(
+        &mut form,
+        measure,
+        THEME_LABEL,
+        THEME,
+        left,
+        y,
+        inner,
+        editor_width,
+        fields.theme_height,
         inline_fields,
     )?;
     y += 16;
@@ -2077,7 +2181,7 @@ fn place_checkbox(
     Ok(height)
 }
 
-fn paint_content(hwnd: HWND, panels: &[RECT]) -> LRESULT {
+fn paint_content(hwnd: HWND, panels: &[RECT], theme: &Theme) -> LRESULT {
     // SAFETY: native WM_PAINT; establish its DC before any mutable state borrow.
     if let Ok(paint) = unsafe { PaintSession::begin(hwnd) } {
         let dc = paint.dc;
@@ -2093,10 +2197,10 @@ fn paint_content(hwnd: HWND, panels: &[RECT]) -> LRESULT {
                 let _ = GetClientRect(hwnd, &mut client);
                 SelectObject(dc, GetStockObject(DC_BRUSH));
                 SelectObject(dc, GetStockObject(DC_PEN));
-                SetDCBrushColor(dc, COLORREF(0xfaf7f5));
+                SetDCBrushColor(dc, theme.palette().canvas);
                 FillRect(dc, &client, HBRUSH(GetStockObject(DC_BRUSH).0));
-                SetDCBrushColor(dc, COLORREF(0xffffff));
-                SetDCPenColor(dc, COLORREF(0xf0e8e2));
+                SetDCBrushColor(dc, theme.palette().panel);
+                SetDCPenColor(dc, theme.palette().border);
                 for panel in panels {
                     let _ = RoundRect(
                         dc,
@@ -2433,12 +2537,28 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         // this callback; the default procedure does not gain Rust-state ownership.
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     };
+    if hwnd == state.root.get()
+        && ((message == WM_SHOWWINDOW && wparam.0 == 0)
+            || (message == WM_SIZE && wparam.0 == SIZE_MINIMIZED as usize)
+            || (message == WM_ACTIVATE && wparam.0 as u32 & 0xffff == WA_INACTIVE))
+    {
+        state.scrollbar.cancel(state.viewport.get());
+    }
+    if hwnd == state.viewport.get()
+        // SAFETY: this callback owns the live viewport and forwards its original
+        // native message parameters without retaining them.
+        && let Some(result) = unsafe {
+            scrollbar::handle_message(hwnd, message, wparam, lparam, state)
+        }
+    {
+        return result;
+    }
     match message {
         WM_PAINT if hwnd == state.content.get() => {
             // Snapshot the completed layout before GDI calls; paint never measures
             // text or changes geometry while the window tree is being scrolled.
             let panels = state.content_panels.borrow().clone();
-            paint_content(hwnd, &panels)
+            paint_content(hwnd, &panels, &state.theme)
         }
         WM_PAINT => state.theme.paint(hwnd, &[]),
         WM_ERASEBKGND => LRESULT(1),
@@ -2449,7 +2569,7 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             let (panel, tone) = match id {
                 TITLE => (false, Tone::Text),
                 SUBTITLE => (false, Tone::Muted),
-                LANGUAGE_LABEL | LANGUAGE => (true, Tone::Text),
+                LANGUAGE_LABEL | LANGUAGE | THEME_LABEL | THEME => (true, Tone::Text),
                 STATUS | STATUS_DETAILS => (false, state.status_tone.get()),
                 10 => (true, Tone::Accent),
                 12 => (
@@ -2481,6 +2601,21 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             // this callback; the default procedure does not gain Rust-state ownership.
             .flatten()
             .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) })
+        }
+        WM_MEASUREITEM => {
+            // SAFETY: Owner-draw creation supplies writable native measurement
+            // storage; the decoder never queries a not-yet-returned combo HWND.
+            unsafe { settings_selectors::measure(hwnd, lparam) }.unwrap_or_else(|| {
+                // SAFETY: Unchanged native payload is valid throughout dispatch.
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            })
+        }
+        WM_DRAWITEM if matches!(wparam.0, LANGUAGE | THEME | FORMAT) => {
+            // SAFETY: Native owner draw is validated before borrowing its DC.
+            unsafe { settings_selectors::draw(hwnd, lparam, state) }.unwrap_or_else(|| {
+                // SAFETY: Unchanged native payload is valid throughout dispatch.
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            })
         }
         WM_DRAWITEM if wparam.0 == APPEARANCE_PREVIEW => {
             // SAFETY: native owner draw is decoded once; the preview borrows its DC only here.
@@ -2619,6 +2754,96 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
 #[cfg(test)]
 mod responsive_layout_tests {
     use super::*;
+
+    #[test]
+    fn theme_draft_requires_apply_and_refresh_preserves_draft_fonts_and_scroll() {
+        use super::super::window_lifetime::with_hidden_windows;
+        use crate::app::{appearance::set_theme_mode, i18n::set_language};
+
+        let previous_language = language();
+        let previous_theme = theme_mode();
+        set_language(Language::SimplifiedChinese);
+        set_theme_mode(ThemeMode::Light);
+        with_hidden_windows(|| {
+            let config = Config {
+                language: Language::SimplifiedChinese,
+                theme: ThemeMode::Light,
+                ..Config::default()
+            };
+            let window = SettingsWindow::new(&config, HWND::default(), None, true).unwrap();
+            window.process_pending().unwrap();
+            set_choice(window.controls.theme, 1).unwrap();
+            set_choice(window.controls.format, 2).unwrap();
+            set_checked(window.controls.quick_pick, true);
+            set_slider(window.controls.border_width, MAX_BORDER_WIDTH_DIP, 5, 1);
+            window.update_appearance_preview().unwrap();
+            window.callback.scroll_to(100).unwrap();
+            let offset = window.callback.scroll_offset.get();
+            assert!(offset > 0, "fixture must exercise a retained scroll offset");
+            let font = |control| {
+                // SAFETY: This fixture owns every queried control through window teardown.
+                unsafe { SendMessageW(control, WM_GETFONT, None, None) }.0
+            };
+            let fonts = [font(window.controls.title), font(window.controls.ctrl)];
+            assert_eq!(theme_mode(), ThemeMode::Light);
+            assert_eq!(window.callback.theme.mode(), ThemeMode::Light);
+
+            // SAFETY: Apply carries only scalar values to this test-owned root.
+            unsafe { SendMessageW(window.hwnd, WM_COMMAND, Some(WPARAM(APPLY)), None) };
+            let Some(SettingsAction::Apply(draft)) = window.process_pending().unwrap() else {
+                panic!("Apply must return the complete validated draft");
+            };
+            assert_eq!(draft.theme, ThemeMode::Dark);
+            assert_eq!(theme_mode(), ThemeMode::Light);
+            assert_eq!(window.callback.theme.mode(), ThemeMode::Light);
+            window.show_status("保存失败", false).unwrap();
+            assert_eq!(window.read_config().unwrap(), draft);
+            assert_eq!(window.callback.theme.mode(), ThemeMode::Light);
+
+            // Follow the host's accepted-save path without registering a hotkey or writing disk.
+            let preview_matches = || {
+                window
+                    .callback
+                    .preview
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .matches(window.dpi().unwrap(), draft.appearance)
+            };
+            assert!(preview_matches());
+            set_theme_mode(draft.theme);
+            assert!(
+                !preview_matches(),
+                "preview still contains the old theme pixels"
+            );
+            window.refresh_theme().unwrap();
+            window.refresh_theme().unwrap();
+            assert_eq!(window.callback.theme.mode(), ThemeMode::Dark);
+            assert!(
+                preview_matches(),
+                "accepted theme must rebuild preview pixels"
+            );
+            assert_eq!(window.callback.scroll_offset.get(), offset);
+            assert_eq!(
+                [font(window.controls.title), font(window.controls.ctrl)],
+                fonts
+            );
+            assert_eq!(window.read_config().unwrap(), draft);
+
+            // Language relabeling must keep the uncommitted theme selection intact, too.
+            set_language(Language::English);
+            window.refresh_language().unwrap();
+            assert_eq!(selected_choice(window.controls.theme).unwrap(), 1);
+            assert_eq!(window.read_config().unwrap(), draft);
+            set_theme_mode(ThemeMode::Light);
+            window.refresh_theme().unwrap();
+            assert_eq!(window.callback.theme.mode(), ThemeMode::Light);
+            assert!(preview_matches());
+            assert_eq!(window.read_config().unwrap(), draft);
+        });
+        set_language(previous_language);
+        set_theme_mode(previous_theme);
+    }
 
     #[test]
     fn minimized_settings_defer_broadcast_geometry_but_keep_apply_and_restore_layout() {
@@ -2770,6 +2995,7 @@ mod responsive_layout_tests {
                 width,
                 FieldMetrics {
                     language_height: 28,
+                    theme_height: 28,
                     format_height: 28,
                 },
                 &mut measure,
@@ -2832,6 +3058,8 @@ mod responsive_layout_tests {
                             .unwrap()
                             .height
                             + 6,
+                        theme_height: window.measure_text(THEME, 180, false, dpi).unwrap().height
+                            + 6,
                         format_height: window.measure_text(FORMAT, 180, false, dpi).unwrap().height
                             + 6,
                     };
@@ -2862,7 +3090,11 @@ mod responsive_layout_tests {
                                 let available = r.right - r.left - if check { 24 } else { 0 };
                                 let wrap = !matches!(
                                     id,
-                                    KEY | LANGUAGE | FORMAT | BORDER_VALUE | TRANSPARENCY_VALUE
+                                    KEY | LANGUAGE
+                                        | THEME
+                                        | FORMAT
+                                        | BORDER_VALUE
+                                        | TRANSPARENCY_VALUE
                                 );
                                 let text = window.measure_text(id, available, wrap, dpi).unwrap();
                                 assert!(
@@ -2891,7 +3123,7 @@ mod responsive_layout_tests {
     }
 
     fn assert_geometry_fits(geometry: &SettingsContentLayout, width: i32) {
-        assert_eq!(geometry.controls.len(), 28);
+        assert_eq!(geometry.controls.len(), 30);
         assert_eq!(geometry.panels.len(), 4);
         for &(id, r) in &geometry.controls {
             assert!(
@@ -2906,6 +3138,7 @@ mod responsive_layout_tests {
                     | KEY
                     | FORMAT
                     | LANGUAGE
+                    | THEME
                     | QUICK_PICK
                     | AUTO_COPY
                     | BORDER_WIDTH

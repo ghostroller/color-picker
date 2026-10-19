@@ -5,6 +5,7 @@ mod pixel_fixture;
 
 use color_picker::{
     app::{
+        appearance::{ThemeMode, set_theme_mode, theme_mode},
         config::Config,
         i18n::{self, Language},
     },
@@ -29,6 +30,8 @@ use windows::{
 #[ignore = "requires an interactive Windows desktop; creates and resizes only its own settings window"]
 fn settings_header_and_content_recover_after_scrollbar_reflow() {
     i18n::set_language(Language::SimplifiedChinese);
+    let original_theme = theme_mode();
+    set_theme_mode(ThemeMode::Light);
     let _dpi = ScopedPmv2::enter().unwrap();
     // SAFETY: The class/title strings remain live and terminated during creation; this
     // thread owns the returned fixture window and any callback data.
@@ -134,7 +137,9 @@ fn settings_header_and_content_recover_after_scrollbar_reflow() {
     let original_client = client_on_screen(hwnd);
     // SAFETY: Query only the live fixture HWND while its window owner remains in scope.
     let dpi = unsafe { GetDpiForWindow(hwnd) };
-    eprintln!("native HWND/font coverage: DPI={dpi}, CJK/English, client widths 500/360/280 DIP");
+    eprintln!(
+        "native HWND/font coverage: DPI={dpi}, CJK/English, client widths 500/360/280 DIP, Light/Dark/Light switches"
+    );
     let nonclient_width =
         original.right - original.left - (original_client.right - original_client.left);
     let nonclient_height =
@@ -162,7 +167,8 @@ fn settings_header_and_content_recover_after_scrollbar_reflow() {
                 .unwrap();
             }
             settings.process_pending().unwrap();
-            assert_form_layout(
+            assert_theme_switches_preserve_layout(
+                &settings,
                 content,
                 match width {
                     500 => Some(false),
@@ -170,8 +176,6 @@ fn settings_header_and_content_recover_after_scrollbar_reflow() {
                     _ => None,
                 },
             );
-            assert_controls_inside_client(content);
-            assert_native_text_fits(content);
         }
     }
     i18n::set_language(Language::SimplifiedChinese);
@@ -257,6 +261,53 @@ fn settings_header_and_content_recover_after_scrollbar_reflow() {
     assert_form_layout(content, Some(false));
     assert_native_text_fits(content);
     assert_controls_inside_client(content);
+    set_theme_mode(original_theme);
+    settings.refresh_theme().unwrap();
+}
+
+fn assert_theme_switches_preserve_layout(
+    settings: &SettingsWindow,
+    content: HWND,
+    expected_stacked: Option<bool>,
+) {
+    let controls = [
+        15, 16, 28, 110, 30, 111, 10, 101, 102, 103, 11, 104, 12, 17, 13, 105, 109, 106, 20, 21,
+        107, 22, 23, 108, 24, 25, 26, 27, 18, 19,
+    ];
+    let original: Vec<_> = controls
+        .into_iter()
+        .map(|id| {
+            let control = child(content, id);
+            (id, window_rect(control), window_text(control))
+        })
+        .collect();
+    let content_bounds = window_rect(content);
+    for mode in [ThemeMode::Light, ThemeMode::Dark, ThemeMode::Light] {
+        set_theme_mode(mode);
+        settings.refresh_theme().unwrap();
+        settings.process_pending().unwrap();
+        assert_eq!(
+            window_rect(content),
+            content_bounds,
+            "{mode:?} must preserve the content and its scroll position"
+        );
+        for (id, bounds, text) in &original {
+            let control = child(content, *id);
+            assert_eq!(
+                window_rect(control),
+                *bounds,
+                "{mode:?} must preserve control {id}, including native collapsed combo heights"
+            );
+            assert_eq!(
+                window_text(control),
+                *text,
+                "{mode:?} must preserve localized text and the draft selection for control {id}"
+            );
+        }
+        assert_form_layout(content, expected_stacked);
+        assert_controls_inside_client(content);
+        assert_native_text_fits(content);
+    }
 }
 
 fn assert_form_layout(content: HWND, expected_stacked: Option<bool>) {
@@ -265,6 +316,8 @@ fn assert_form_layout(content: HWND, expected_stacked: Option<bool>) {
     let subtitle = bounds(16);
     let language_label = bounds(28);
     let language_combo = bounds(110);
+    let theme_label = bounds(30);
+    let theme_combo = bounds(111);
     let format_label = bounds(13);
     let format_combo = bounds(105);
     let key_label = bounds(11);
@@ -279,6 +332,8 @@ fn assert_form_layout(content: HWND, expected_stacked: Option<bool>) {
         "the language card must follow the separate heading and subtitle"
     );
     assert_eq!(language_combo.right, format_combo.right);
+    assert_eq!(language_combo.right, theme_combo.right);
+    assert_eq!(language_combo.left, theme_combo.left);
     assert_eq!(language_combo.right, key.right);
     assert_eq!(
         language_combo.right - language_combo.left,
@@ -289,6 +344,8 @@ fn assert_form_layout(content: HWND, expected_stacked: Option<bool>) {
         key.right - key.left
     );
     assert_eq!(language_label.left, format_label.left);
+    assert_eq!(language_label.left, theme_label.left);
+    assert!(language_combo.bottom <= theme_label.top);
     assert_eq!(language_label.left, key_label.left);
     assert!(
         ((language_label.left - client.left) - (client.right - bounds(107).right)).abs() <= 2,
@@ -296,6 +353,7 @@ fn assert_form_layout(content: HWND, expected_stacked: Option<bool>) {
     );
     for (id, label, editor) in [
         (28, language_label, language_combo),
+        (30, theme_label, theme_combo),
         (13, format_label, format_combo),
         (11, key_label, key),
     ] {
@@ -353,8 +411,8 @@ fn child(parent: HWND, id: i32) -> HWND {
 fn assert_controls_inside_client(content: HWND) {
     let client = client_on_screen(content);
     for id in [
-        15, 16, 28, 110, 10, 101, 102, 103, 11, 104, 12, 17, 13, 105, 109, 106, 20, 21, 107, 22,
-        23, 108, 24, 25, 26, 27, 18, 19,
+        15, 16, 28, 110, 30, 111, 10, 101, 102, 103, 11, 104, 12, 17, 13, 105, 109, 106, 20, 21,
+        107, 22, 23, 108, 24, 25, 26, 27, 18, 19,
     ] {
         // SAFETY: The parent belongs to this test-owned live window tree; the returned
         // child handle is borrowed only while its owner survives.
@@ -372,8 +430,8 @@ fn assert_controls_inside_client(content: HWND) {
 
 fn assert_native_text_fits(content: HWND) {
     let ids = [
-        15, 16, 28, 110, 10, 101, 102, 103, 11, 104, 12, 17, 13, 105, 109, 106, 20, 21, 107, 22,
-        23, 108, 24, 25, 26, 27, 18, 19,
+        15, 16, 28, 110, 30, 111, 10, 101, 102, 103, 11, 104, 12, 17, 13, 105, 109, 106, 20, 21,
+        107, 22, 23, 108, 24, 25, 26, 27, 18, 19,
     ];
     // Check the actual native window rectangles independently of the layout plan.
     // The cards are painted by the parent and are intentionally not child HWNDs.
@@ -392,7 +450,7 @@ fn assert_native_text_fits(content: HWND) {
     }
 
     for id in [
-        15, 16, 28, 10, 11, 12, 17, 13, 20, 21, 22, 23, 24, 25, 27, 18, 19,
+        15, 16, 28, 30, 10, 11, 12, 17, 13, 20, 21, 22, 23, 24, 25, 27, 18, 19,
     ] {
         let control = child(content, id);
         let client = client_on_screen(control);
@@ -436,7 +494,7 @@ fn assert_native_text_fits(content: HWND) {
 
     let key = child(content, 104);
     assert_text_extent(key, 104, &window_text(key), client_on_screen(key), true);
-    for id in [110, 105] {
+    for id in [110, 111, 105] {
         let combo = child(content, id);
         let mut info = COMBOBOXINFO {
             cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,

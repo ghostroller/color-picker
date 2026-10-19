@@ -11,7 +11,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::i18n::{Language, tr};
+use super::{
+    appearance::ThemeMode,
+    i18n::{Language, tr},
+};
 use crate::core::format::ColorFormat;
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -30,6 +33,8 @@ pub struct Config {
     #[serde(default)]
     pub language: Language,
     #[serde(default)]
+    pub theme: ThemeMode,
+    #[serde(default)]
     pub appearance: AppearanceConfig,
 }
 
@@ -42,6 +47,7 @@ impl Default for Config {
             auto_copy_on_pick: false,
             quick_pick: false,
             language: Language::default(),
+            theme: ThemeMode::default(),
             appearance: AppearanceConfig::default(),
         }
     }

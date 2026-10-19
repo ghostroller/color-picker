@@ -177,6 +177,22 @@ impl WindowDc {
             })
         }
     }
+    /// # Safety
+    /// hwnd must remain alive on this thread until the returned guard is dropped.
+    /// The DC includes the nonclient area, with coordinates relative to the window.
+    pub unsafe fn including_nonclient(hwnd: HWND) -> Result<Self> {
+        // SAFETY: caller keeps the window alive throughout this DC lease.
+        let dc = unsafe { GetWindowDC(Some(hwnd)) };
+        if dc.is_invalid() {
+            Err(failure("Could not obtain nonclient window DC"))
+        } else {
+            Ok(Self {
+                hwnd,
+                dc,
+                _thread: PhantomData,
+            })
+        }
+    }
     pub fn raw(&self) -> HDC {
         self.dc
     }

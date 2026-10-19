@@ -5,6 +5,7 @@ mod pixel_fixture;
 
 use color_picker::{
     app::{
+        appearance::{ThemeMode, set_theme_mode, theme_mode},
         config::Config,
         i18n::{self, Language},
     },
@@ -15,11 +16,13 @@ use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, RECT, WPARAM},
         Graphics::Gdi::{
-            GGI_MARK_NONEXISTING_GLYPHS, GetDC, GetGlyphIndicesW, HGDIOBJ, ReleaseDC, SelectObject,
-            UpdateWindow,
+            GGI_MARK_NONEXISTING_GLYPHS, GetDC, GetGlyphIndicesW, GetPixel, HGDIOBJ, ReleaseDC,
+            SelectObject, UpdateWindow,
         },
         UI::{
             Controls::{COMBOBOXINFO, GetComboBoxInfo},
+            HiDpi::GetDpiForWindow,
+            Input::KeyboardAndMouse::{VK_DOWN, VK_END, VK_HOME, VK_UP},
             WindowsAndMessaging::*,
         },
     },
@@ -163,6 +166,155 @@ fn language_choices_are_visible_on_the_first_open_after_applying() {
             SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(0)), None);
         }
     }
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop; opens only its own native settings selectors"]
+fn themed_selectors_preserve_keyboard_strings_and_first_popup_after_theme_roundtrips() {
+    let original_theme = theme_mode();
+    let original_language = i18n::language();
+    set_theme_mode(ThemeMode::Light);
+    i18n::set_language(Language::SimplifiedChinese);
+    let _dpi = ScopedPmv2::enter().unwrap();
+    let settings = SettingsWindow::new(&Config::default(), HWND::default(), None, true).unwrap();
+    settings.process_pending().unwrap();
+    // SAFETY: The settings owner retains these two native container levels.
+    let content = unsafe {
+        let viewport = GetDlgItem(Some(settings.hwnd()), 200).unwrap();
+        GetDlgItem(Some(viewport), 201).unwrap()
+    };
+    for mode in [
+        ThemeMode::Dark,
+        ThemeMode::Light,
+        ThemeMode::Dark,
+        ThemeMode::Light,
+    ] {
+        set_theme_mode(mode);
+        settings.refresh_theme().unwrap();
+        for id in [110, 111, 105] {
+            // SAFETY: These IDs identify the fixture's live native combo controls.
+            let combo = unsafe { GetDlgItem(Some(content), id) }.unwrap();
+            // SAFETY: All messages below synchronously query/change scalar native
+            // state; string storage is validated before its bounded retrieval.
+            let count = unsafe { SendMessageW(combo, CB_GETCOUNT, None, None) }.0;
+            assert!(count >= 2);
+            // SAFETY: Native style is a scalar query for this retained child.
+            let style = unsafe { GetWindowLongW(combo, GWL_STYLE) };
+            assert_eq!(style & CBS_DROPDOWNLIST, CBS_DROPDOWNLIST);
+            assert_ne!(
+                style & CBS_HASSTRINGS,
+                0,
+                "owner draw must retain native strings"
+            );
+            assert_ne!(style & CBS_OWNERDRAWFIXED, 0);
+            // SAFETY: Only test-owned controls receive these keyboard messages;
+            // they do not inject keyboard input into any other application.
+            unsafe {
+                SendMessageW(combo, WM_KEYDOWN, Some(WPARAM(VK_HOME.0 as usize)), None);
+                assert_eq!(SendMessageW(combo, CB_GETCURSEL, None, None).0, 0);
+                SendMessageW(combo, WM_KEYDOWN, Some(WPARAM(VK_DOWN.0 as usize)), None);
+                assert_eq!(SendMessageW(combo, CB_GETCURSEL, None, None).0, 1);
+                SendMessageW(combo, WM_KEYDOWN, Some(WPARAM(VK_END.0 as usize)), None);
+                assert_eq!(SendMessageW(combo, CB_GETCURSEL, None, None).0, count - 1);
+                SendMessageW(combo, WM_KEYDOWN, Some(WPARAM(VK_UP.0 as usize)), None);
+                assert_eq!(SendMessageW(combo, CB_GETCURSEL, None, None).0, count - 2);
+            }
+            let mut info = COMBOBOXINFO {
+                cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: The output descriptor and all subsequent RECT/text buffers
+            // are initialized local storage retained through synchronous dispatch.
+            unsafe { GetComboBoxInfo(combo, &mut info).unwrap() };
+            for index in 0..count as usize {
+                // SAFETY: Each index belongs to the known current item range.
+                let length =
+                    unsafe { SendMessageW(combo, CB_GETLBTEXTLEN, Some(WPARAM(index)), None) }.0;
+                assert!(length > 0 && length < 128);
+                let mut text = vec![0_u16; length as usize + 1];
+                // SAFETY: CBS_HASSTRINGS and the preceding length query establish
+                // the writable UTF-16 capacity; no callback can mutate the list.
+                let copied = unsafe {
+                    SendMessageW(
+                        combo,
+                        CB_GETLBTEXT,
+                        Some(WPARAM(index)),
+                        Some(LPARAM(text.as_mut_ptr() as isize)),
+                    )
+                }
+                .0;
+                assert_eq!(copied, length);
+                assert!(
+                    !String::from_utf16(&text[..copied as usize])
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            // Inspect the first language popup after each accepted theme change.
+            // Format can be below the viewport, so opening it would not exercise
+            // the same visible native-popup path.
+            if id == 110 {
+                // SAFETY: This live fixture combo owns its native popup HWND.
+                unsafe {
+                    SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(1)), None);
+                    assert_ne!(SendMessageW(combo, CB_GETDROPPEDSTATE, None, None).0, 0);
+                    let _ = UpdateWindow(info.hwndList);
+                }
+                let mut row = RECT::default();
+                let mut list = RECT::default();
+                // SAFETY: This test owns the popup; both local output rectangles
+                // remain writable during these synchronous listbox queries.
+                unsafe {
+                    GetClientRect(info.hwndList, &mut list).unwrap();
+                    assert_ne!(
+                        SendMessageW(
+                            info.hwndList,
+                            LB_GETITEMRECT,
+                            Some(WPARAM(1)),
+                            Some(LPARAM((&raw mut row) as isize))
+                        )
+                        .0,
+                        LB_ERR as isize
+                    );
+                }
+                // SAFETY: DPI belongs to this live UI-thread combo.
+                let dpi = unsafe { GetDpiForWindow(combo) }.max(96);
+                assert!(row.bottom - row.top >= (30 * dpi / 96) as i32);
+                assert!(
+                    row.bottom <= list.bottom,
+                    "both language rows must fit on first open"
+                );
+                // SAFETY: Borrow this live popup's DC for one pixel query; the
+                // paired ReleaseDC occurs before either popup or settings dies.
+                let dc = unsafe { GetDC(Some(info.hwndList)) };
+                // SAFETY: The sampled point lies inside a full visible item and
+                // outside its label; this is the popup's actual rendered fill.
+                let pixel = unsafe { GetPixel(dc, list.right - 8, (row.top + row.bottom) / 2) };
+                // SAFETY: Release exactly the popup/DC pair borrowed above.
+                unsafe { ReleaseDC(Some(info.hwndList), dc) };
+                let red = pixel.0 & 0xff;
+                let green = (pixel.0 >> 8) & 0xff;
+                let blue = (pixel.0 >> 16) & 0xff;
+                match mode {
+                    ThemeMode::Dark => assert!(
+                        red < 80 && green < 90 && blue < 110,
+                        "dark popup rows must not retain the white system fill: {pixel:?}"
+                    ),
+                    ThemeMode::Light => assert!(
+                        red > 220 && green > 220 && blue > 220,
+                        "light popup rows must recover their light fill: {pixel:?}"
+                    ),
+                }
+                assert_chinese_glyphs_available(combo);
+                assert_chinese_glyphs_available(info.hwndList);
+                // SAFETY: Close only the popup created by this fixture combo.
+                unsafe { SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(0)), None) };
+            }
+        }
+    }
+    drop(settings);
+    set_theme_mode(original_theme);
+    i18n::set_language(original_language);
 }
 
 fn assert_chinese_glyphs_available(hwnd: HWND) {
