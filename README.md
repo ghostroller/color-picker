@@ -12,7 +12,7 @@ A native Windows color picker that stays in your system tray. Pick a pixel anywh
 2. Run the installer, or extract the entire ZIP and open `color-picker.exe`. No administrator privileges are required.
 3. On your first manual launch, read the short guide, then find Color Picker in the system tray, including the hidden-icons area. Startup at Windows sign-in stays quiet.
 4. Press **Ctrl + Alt + C**, move over the color you want, and **left-click** to select it.
-5. In the result window, copy HEX, RGB, CSS RGB, or HSL. Choose **Pick again** to select another color.
+5. In the result window, copy HEX, RGB, CSS RGB, or HSL, or choose a nearby color from the palette first. Choose **Pick again** to sample another pixel.
 
 The app and installer support **English and Simplified Chinese**. The app initially follows your Windows display language: Chinese uses Simplified Chinese; other languages use English. Change **Language** in Settings and click **Apply** to switch immediately, without restarting.
 
@@ -21,6 +21,8 @@ The target platform is **Windows 11 x64**. Windows 10 22H2 x64 compatibility has
 ## Pick precisely
 
 The live preview follows your pointer and shows the color, HEX value, and physical screen coordinates. It also refreshes when the content under a stationary pointer changes.
+
+![Compact live preview with a color swatch, HEX value, and screen coordinates](docs/images/ui-live-en.png)
 
 | Action | Control |
 | --- | --- |
@@ -39,13 +41,19 @@ The frozen window keeps the same size at screen edges as at the center, unless t
 
 Starting again during an active pick does not create another session. The tray menu shows your current shortcut and whether Windows registered it successfully. Closing a result window leaves the app in the tray. To quit completely, right-click the tray icon and choose **Exit**.
 
-## Copy the format you need
+## Adjust and copy a color
 
-The left half of the top swatch always shows the original picked color; the right half shows the current adjusted color, without visible labels. Directly below, a gapless 3 × 7 color grid offers lightness, neighboring hues, and saturation in its three rows, from top to bottom.
+The result window puts the color preview and palette above the four format rows. The left half of the top swatch always shows the original picked color; the right half shows the current adjusted color, without visible labels. The upper-right controls minimize or close the window; drag the right half of the swatch to move it.
 
-Click the original-color half to restore the first picked RGB, reset all three candidate rows and their scroll positions, and restore all four format values without copying; the right half still lets you drag the window.
+![Result window with original and adjusted swatches, a three-row palette, and four copy formats](docs/images/ui-result-en.png)
 
-Hover over a row and use the mouse wheel to browse candidates without changing the current color or clipboard. Click a color to select it: that row centers on the selection, and the other two regenerate from the new color. All four formats and **Copy** buttons use the adjusted color. Original coordinates and the live or frozen source remain visible. Values are selectable, and each format row has its own **Copy** button.
+Directly below the swatch, a gapless **3 × 7 palette** offers **lightness**, **hue**, and **chroma** in its three rows, from top to bottom. Candidates use OKLCH color adjustments and are mapped to displayable RGB colors. Hue and chroma rows stay unchanged for neutral grays.
+
+Hover over a row and use the mouse wheel to browse its candidates without changing the current color or clipboard. Click a color to select it: all three rows regenerate around the selected RGB, with that color at the center. All four formats and **Copy** buttons use the adjusted color. Original coordinates and the live or frozen source remain visible.
+
+Click the left, original-color half of the swatch to restore the first picked RGB, reset all three candidate rows and their scroll positions, and restore all four format values. Selecting a candidate or restoring the original does not copy it automatically.
+
+Use **Tab** to reach the palette or original-color swatch. Within the palette, **arrow keys** move focus without changing the color; **Enter** or **Space** selects the focused candidate. Enter or Space on the original-color swatch restores the original. The format values support mouse and keyboard selection, and each row has its own **Copy** button.
 
 | Format | Example |
 | --- | --- |
@@ -54,29 +62,29 @@ Hover over a row and use the mouse wheel to browse candidates without changing t
 | CSS RGB | `rgb(255 0 0)` |
 | HSL | `hsl(0 100% 50%)` |
 
-The main Copy button uses your default format, initially HEX. A successful copy briefly changes that button to **Copied**, keeping the normal window layout stable. Only failures expand an error message. The result window supports **Tab**, **Enter**, and **Esc** for keyboard navigation and closing.
+The main Copy button uses your default format, initially HEX. A successful copy briefly changes the activated button to **Copied**, keeping the normal window layout stable. Only failures expand an error message; a successful retry hides it again. Use **Tab** to move between controls, **Enter** to activate the focused button, and **Esc** to close the result window. On a small display, the format list can scroll and labels move above the values when space is narrow.
 
 **Automatic copying and Quick pick are off by default.** Ordinary automatic copying still opens the result window. Enable **Quick pick** to always copy the default format and continue in your current app, without a result popup or focus change on success. If copying fails, the result window appears so you can retry. Your ordinary automatic-copy preference is retained while Quick pick is on and resumes when you turn it off.
 
-![Color result with selectable values and copy controls](docs/images/ui-result-en.png)
-
 ## Make it yours
 
-Right-click the tray icon and open **Settings** (设置 in Chinese).
+Right-click the tray icon and open **Settings** (设置 in Chinese). The **Preferences** page groups language, picking shortcut, copying, and picker appearance in separate white cards on a light-gray background.
+
+![English Preferences page with language, shortcut, copying, and appearance controls](docs/images/ui-settings-en.png)
 
 | Setting | Options | Default |
 | --- | --- | --- |
 | Language | English / 简体中文 | Matches Windows; English fallback |
-| Global shortcut | Ctrl and/or Alt, optional Shift, plus A–Z, 0–9, or F1–F11 | Ctrl + Alt + C |
-| Default copy format | HEX, RGB, CSS RGB, HSL | HEX |
-| Copy automatically after picking | On / off | Off |
-| Quick pick: copy without opening a result | On / off; always copies the default format | Off |
+| Picking shortcut | Ctrl and/or Alt, optional Shift, plus A–Z, 0–9, or F1–F11 | Ctrl + Alt + C |
+| Default format | HEX, RGB, CSS RGB, HSL | HEX |
+| Automatically copy after a normal pick | On / off; unavailable while Quick pick is on | Off |
+| Quick pick (copy without opening the result) | On / off; always copies the default format | Off |
 | Border width | 0–6 DIP; 0 hides the border | 2 DIP |
-| Picker background transparency | 0–80%; 0 is opaque | 35% |
+| Transparency | 0–80%; 0 is opaque | 35% |
 
 To change the shortcut, select its modifiers, click the main-key button, and press the new letter, digit, or function key. **Esc** or moving focus away cancels key recording. F12 is reserved and cannot be used.
 
-Settings fits the monitor's available height. On a small display or at high scaling, scroll the content; **Apply** stays visible at the bottom. The sample-color preview updates immediately as you drag the border and transparency sliders. It uses synthetic colors and saves nothing until you click Apply.
+Settings fits the monitor's available height. On a small display or at high scaling, scroll the content; the status message, **Close**, and **Apply** stay visible at the bottom. Tab navigation brings the focused control into view. The **Live preview · Sample colors** area updates immediately as you drag the border and transparency sliders. It uses synthetic colors and saves nothing until you click Apply.
 
 Click **Apply** (应用 in Chinese) to save, then close Settings before picking again. A saved language change updates Settings, the tray menu, and subsequent picking windows immediately, while preserving your scroll position. A pick request while Settings is open restores that window and explains why picking is paused, preserving your edits. Closing without applying discards your edits. If a new shortcut is unavailable or saving fails, the previous settings and language remain active. Picking previews and the result window share a right and bottom border. Transparency affects the picking previews' information backgrounds; color swatches and magnified pixels stay opaque.
 

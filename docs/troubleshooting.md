@@ -13,7 +13,7 @@ On first use, Chinese Windows display languages select Simplified Chinese; other
 1. Check the system tray, including hidden icons, to confirm the app is running.
 2. Check the current shortcut and registration status in the tray menu. If Settings is open, a pick request restores that window and explains that picking is paused; apply any edits you want to keep, then close it.
 3. Activate the tray icon or choose **开始取色** (Start picking) from its menu. This works even when the global shortcut could not be registered, once Settings is closed.
-4. Open **设置** (Settings), choose an unused shortcut, and click **应用** (Apply). A shortcut needs Ctrl and/or Alt, optionally Shift, and one of A–Z, 0–9, or F1–F11. You can also click Apply to retry registering the existing shortcut.
+4. Open **设置** (Settings), select Ctrl and/or Alt (optionally Shift), then click the **主键** (Key) button and press A–Z, 0–9, or F1–F11. Esc, Tab, or leaving the button cancels key recording. Click **应用** (Apply) to save and register the shortcut. You can also click Apply to retry registering the existing shortcut.
 
 Windows notification settings can suppress error notifications. If the issue persists, enable the optional file log below.
 
@@ -40,6 +40,14 @@ The result window expands to report clipboard errors. If another application is 
 Check **快速取色** (Quick pick) in Settings. It is off by default. When enabled, every pick copies the default format and leaves your current app focused, without a result popup on success. A failed copy reveals the result and its error so you can retry.
 
 Quick pick temporarily disables the ordinary automatic-copy checkbox while preserving its value. Turn Quick pick off to resume ordinary results and your previous automatic-copy preference.
+
+## Using the result palette
+
+The result has two color blocks at the top: the left keeps the original sampled color, and the right shows the current color. The three rows below offer lightness, hue, and chroma variations, with seven candidates per row. Hover over a row and scroll to browse its candidates; scrolling alone does not change the current color or clipboard. Click a candidate to select it and rebuild all three rows around that color. The four format values and Copy buttons then use the selected color.
+
+Click the left color block to restore the original sampled color and reset all three rows. Selecting a candidate or restoring the original does not automatically copy it; use a Copy button afterward. The source and screen coordinates still describe the original pick.
+
+For keyboard use, Tab to a palette cell, use the arrow keys to move focus, then press Enter or Space to select. Arrow keys alone do not select a color. Near-neutral colors can show identical hue and chroma candidates; this avoids introducing an arbitrary hue into a gray color.
 
 ## The welcome guide appears or is missing
 

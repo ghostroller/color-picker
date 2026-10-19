@@ -1,4 +1,4 @@
-# 当前预览版边界
+# 当前版本边界
 
 - 目标为 Windows 11 x64；Windows 10 22H2、干净机器启动尚未验证。
 - 普通 SDR 桌面 8 位 RGB；不承诺 HDR/WCG、原始 alpha、ICC 前原始颜色或受保护内容。
@@ -11,6 +11,7 @@
   保存前及写入临时文件后的字节比较不能排除最后比较与替换之间的外部写入竞态。
 - 软件及安装包尚未签名；安装版支持可选登录启动和手动覆盖升级，
   不含后台自动更新、历史记录或网络请求。便携 ZIP 不注册启动项。
-- 当前是本地预览包。项目分发许可证尚未选定，详见 `LICENSE-STATUS.md`。
+- 项目采用 [MIT 许可证](../LICENSE)；正式版本的安装包与便携包见
+  [GitHub Releases](https://github.com/ghostroller/color-picker/releases)。发布不代表上述实机验收项目已全部完成。
 
 完整证据和未测项目见 [验证记录](validation.md)。
